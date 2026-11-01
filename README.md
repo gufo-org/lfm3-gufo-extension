@@ -38,6 +38,38 @@ Replace the filename with `LFM3-1.7B-BF16.gguf` for reference weights. Model
 weights use the [LFM Open License](https://huggingface.co/LiquidAI/LFM3-1.7B/blob/main/LICENSE)
 and are downloaded separately.
 
+## Build with Gufo
+
+Pass this repository to Gufo via `GUFO_EXTENSION_DIRS` (CMake) or `override { extensions = [ ... ]; }` (Nix).
+
+### From source (CMake)
+
+```sh
+cmake --preset release -DGUFO_EXTENSION_DIRS=/path/to/lfm3-gufo-extension
+cmake --build --preset release --parallel 4
+./build/release/gufo diagnose --section extensions
+```
+
+### With Nix
+
+```sh
+nix build --impure --expr '
+  let flake = builtins.getFlake (toString ./.);
+  in flake.packages.x86_64-linux.default.override {
+    extensions = [ /path/to/lfm3-gufo-extension ];
+  }
+'
+./result/bin/gufo diagnose --section extensions
+```
+
+Or in a flake-based configuration:
+
+```nix
+gufo.packages.x86_64-linux.default.override {
+  extensions = [ inputs.lfm3-gufo-extension ];
+}
+```
+
 ## Usage
 
 ```sh
