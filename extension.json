@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "name": "lfm3",
+  "api_version": ">= 0.1.8",
+  "version": "0.1.0",
+  "depends": [],
+  "platforms": ["linux"],
+  "entry": "lfm3_register",
+  "registration_target": "gufo_lfm3",
+  "targets": {
+    "gufo_lfm3": { "requires": [] },
+    "gufo_lfm3_hip": { "requires": ["hip"] },
+    "lfm3_config_test": { "requires": ["testing"], "role": "test" },
+    "lfm3_ops_test": { "requires": ["hip", "testing"], "role": "test" },
+    "lfm3_session_test": { "requires": ["hip", "testing"], "role": "test" },
+    "lfm3_probe": { "requires": ["testing"], "role": "test" }
+  },
+  "providers": [
+    {
+      "id": "lfm3",
+      "capability": "text_generation",
+      "keys": ["gguf:lfm3"],
+      "model_ids": ["LFM3-1.7B", "lfm3-1.7b"],
+      "target": "gufo_lfm3_hip",
+      "entry": "lfm3_provider_register"
+    }
+  ]
+}
