@@ -1,4 +1,4 @@
-# LFM3 1.7B external model extension.
+# LFM3 1.7B, LFM3-VL 2B and LFM3-Audio 2B external model extension.
 
 gufo_extension_target(
   NAME gufo_lfm3
@@ -10,6 +10,8 @@ gufo_extension_target(
     reference.cpp
     probe.cpp
     extension.cpp
+    vl/image.cpp
+    vl/prompt.cpp
   LINK_LIBRARIES
     gufo_ext_runtime
     ICU::uc
@@ -30,9 +32,6 @@ gufo_extension_target(
   NAME gufo_lfm3_hip
   SOURCES
     engine.cpp
-    runner.cpp
-    drivers.cpp
-    provider.cpp
   LINK_LIBRARIES
     gufo_lfm3
     gufo_ext_runtime
@@ -88,6 +87,52 @@ if(TARGET gufo_lfm3_audio)
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-command-line-argument>
   )
+endif()
+
+# LFM3-VL vision tower; shares the audio encoder's operators. HIP keeps the
+# in-tree port's -O3 without fast math.
+gufo_extension_target(
+  NAME gufo_lfm3_vl
+  SOURCES
+    vl/vision.cpp
+  LINK_LIBRARIES
+    gufo_lfm3_audio
+    gufo_lfm3_hip
+    gufo_lfm3
+    gufo_ext_runtime
+    hip::host
+)
+
+if(TARGET gufo_lfm3_vl)
+  gufo_extension_hip_sources(gufo_lfm3_vl
+    SOURCES
+      vl/hip/ops.hip
+  )
+  target_compile_options(gufo_lfm3_vl PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3>
+    $<$<COMPILE_LANGUAGE:HIP>:-O3>
+    $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-command-line-argument>
+  )
+endif()
+
+# Text and image generation runner, CLI drivers and the text provider.
+gufo_extension_target(
+  NAME gufo_lfm3_text
+  SOURCES
+    runner.cpp
+    drivers.cpp
+    provider.cpp
+  LINK_LIBRARIES
+    gufo_lfm3_vl
+    gufo_lfm3_hip
+    gufo_lfm3
+    gufo_ext_runtime
+    hip::host
+    Threads::Threads
+)
+
+if(TARGET gufo_lfm3_text)
+  target_compile_options(gufo_lfm3_text PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
 endif()
 
 gufo_extension_target(
@@ -190,4 +235,37 @@ gufo_extension_target(
     gufo_lfm3
     gufo_ext_runtime
     hip::host
+)
+
+# LFM3-VL template placement and image preprocessing; no weights.
+gufo_extension_target(
+  NAME lfm3_vl_contract_test
+  SOURCES
+    tests/vl_contract_test.cpp
+  LINK_LIBRARIES
+    gufo_lfm3
+    gufo_ext_runtime
+)
+
+if(TARGET lfm3_vl_contract_test)
+  add_test(NAME lfm3_vl.contract COMMAND lfm3_vl_contract_test)
+  set_tests_properties(lfm3_vl.contract PROPERTIES LABELS "lfm3-vl;cpu")
+endif()
+
+# Writes native prompt IDs, image embeddings and logits for the reference;
+# see tests/vl_reference/README.md.
+gufo_extension_target(
+  NAME lfm3_vl_probe
+  SOURCES
+    tests/vl_probe.cpp
+  LINK_LIBRARIES
+    gufo_lfm3_vl
+    gufo_lfm3_audio
+    gufo_lfm3_hip
+    gufo_lfm3
+    gufo_ext_runtime
+    hip::host
+    PNG::PNG
+    JPEG::JPEG
+    PkgConfig::WEBP
 )

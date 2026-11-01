@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <gufo/ext/image.hpp>
 #include <gufo/ext/text.hpp>
 #include <iostream>
 #include <limits>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include "engine.hpp"
+#include "vl/prompt.hpp"
 
 namespace gufo::models::lfm3 {
 namespace {
@@ -28,10 +30,8 @@ void Require(bool ok, const std::string& error) {
 int RunLfm3PromptImpl(const ext::TextPromptOptions& opt, bool interactive,
                       Clock::time_point load_start) {
   try {
-    if (opt.force_cpu || !opt.image_paths.empty() ||
-        !opt.vision_model_path.empty() || !opt.speculative_backend.empty())
-      throw std::runtime_error(
-          "LFM3 supports autoregressive HIP text inference");
+    if (opt.force_cpu || !opt.speculative_backend.empty())
+      throw std::runtime_error("LFM3 supports autoregressive HIP inference");
     if (opt.reasoning_mode != "auto" && opt.reasoning_mode != "on" &&
         opt.reasoning_mode != "off")
       throw std::runtime_error("LFM3 reasoning must be auto, on, or off");
@@ -44,6 +44,15 @@ int RunLfm3PromptImpl(const ext::TextPromptOptions& opt, bool interactive,
         load_start == Clock::time_point{} ? Clock::now() : load_start;
     auto model = Model::Load(opt.model_path, &error);
     Require(bool(model), error);
+    auto vision =
+        lfm3_vl::LoadMatchingVision(opt.model_path, opt.vision_model_path);
+    if (!vision && !opt.image_paths.empty())
+      throw std::invalid_argument(
+          "image input requires an LFM3-VL backbone and matching --mmproj");
+    if (vision && opt.add_vision_id)
+      throw std::invalid_argument("LFM3-VL does not use --add-vision-id");
+    if (vision && !opt.use_chat_template)
+      throw std::invalid_argument("LFM3-VL requires chat framing");
     std::cerr << "[ModelLoad]: " << Seconds(load) << " s\n";
     auto session = model->CreateSession(
         std::min<std::uint32_t>(8192, model->config().context), &error);
@@ -52,6 +61,10 @@ int RunLfm3PromptImpl(const ext::TextPromptOptions& opt, bool interactive,
     std::vector<std::pair<std::string, std::string>> history;
     if (!opt.system_prompt.empty())
       history.emplace_back("system", opt.system_prompt);
+    std::vector<ext::ChatMessage> visual_history;
+    if (!opt.system_prompt.empty())
+      visual_history.emplace_back(ext::ChatRole::kSystem, opt.system_prompt);
+    bool attach_images = true;
     std::vector<std::uint32_t> processed;
     std::vector<float> logits(model->config().vocab);
     std::string input = opt.prompt_text;
@@ -66,7 +79,25 @@ int RunLfm3PromptImpl(const ext::TextPromptOptions& opt, bool interactive,
           opt.use_chat_template
               ? Tokenizer::Render(history, opt.reasoning_mode != "off")
               : input;
-      auto tokens = tokenizer.Encode(rendered);
+      auto tokens =
+          vision ? std::vector<std::uint32_t>{} : tokenizer.Encode(rendered);
+      lfm3_vl::Prompt visual;
+      if (vision) {
+        ext::ChatMessage message(ext::ChatRole::kUser, input);
+        if (attach_images)
+          for (const auto& path : opt.image_paths)
+            message.images.push_back(
+                {0, std::make_shared<const std::vector<std::uint8_t>>(
+                        core::ReadImageFile(path))});
+        attach_images = false;
+        visual_history.push_back(std::move(message));
+        ReasoningOptions reasoning;
+        reasoning.enabled = opt.reasoning_mode != "off";
+        visual = lfm3_vl::Prepare(
+            tokenizer, visual_history, {}, reasoning,
+            std::min<std::uint32_t>(8192, model->config().context));
+        tokens = visual.tokens;
+      }
       if (tokens.empty())
         tokens.push_back(tokenizer.Bos());
       const bool prefix =
@@ -77,9 +108,31 @@ int RunLfm3PromptImpl(const ext::TextPromptOptions& opt, bool interactive,
         processed.clear();
       }
       const auto prefill = Clock::now();
-      Require(session->Forward(std::span(tokens).subspan(processed.size()),
-                               logits, &error),
-              error);
+      std::size_t cursor = processed.size();
+      for (const auto& image : visual.images) {
+        const auto rows =
+            std::size_t(image.picture.height) * image.picture.width / 4;
+        if (cursor >= image.offset + rows)
+          continue;
+        if (cursor < image.offset) {
+          Require(session->Forward(
+                      std::span(tokens).subspan(cursor, image.offset - cursor),
+                      {}, &error),
+                  error);
+          cursor = image.offset;
+        }
+        auto embeddings = vision->Encode(image.picture);
+        const auto hidden = model->config().hidden;
+        Require(
+            session->ForwardEmbeddings(
+                std::span(embeddings).subspan((cursor - image.offset) * hidden),
+                false, {}, &error),
+            error);
+        cursor = image.offset + rows;
+      }
+      Require(
+          session->Forward(std::span(tokens).subspan(cursor), logits, &error),
+          error);
       const auto pp = Seconds(prefill);
       processed = tokens;
       sampling::SamplerState sampler(opt.sampling, tokens);
@@ -104,6 +157,9 @@ int RunLfm3PromptImpl(const ext::TextPromptOptions& opt, bool interactive,
                   << " s; tg " << generated.size() << " tokens " << tg << " s ("
                   << generated.size() / tg << " tok/s)\n";
       history.emplace_back("assistant", tokenizer.Decode(generated));
+      if (vision)
+        visual_history.emplace_back(ext::ChatRole::kAssistant,
+                                    tokenizer.Decode(generated));
     } while (interactive);
     return 0;
   } catch (const std::exception& e) {
@@ -136,6 +192,12 @@ int RunLfm3Bench(const ext::TextBenchOptions& opt,
     std::string error;
     auto model = Model::Load(opt.model_path, &error);
     Require(bool(model), error);
+    auto metadata = core::GgufReader::OpenFile(opt.model_path, &error);
+    Require(bool(metadata), error);
+    const std::string model_name =
+        metadata->GetMetadataString("general.basename") == "LFM3-VL"
+            ? "LFM3-VL-2B"
+            : "LFM3-1.7B";
     auto max = [](const auto& v) {
       return v.empty() ? std::size_t(0) : *std::max_element(v.begin(), v.end());
     };
@@ -184,8 +246,8 @@ int RunLfm3Bench(const ext::TextBenchOptions& opt,
           const auto start = Clock::now();
           Require(session->Forward(prompt, {}, &error), error);
           const auto dt = Seconds(start);
-          std::cout << "| LFM3-1.7B | pp" << n << " | " << depth << " | " << r
-                    << " | " << n / dt << " | " << dt << " |\n";
+          std::cout << "| " << model_name << " | pp" << n << " | " << depth
+                    << " | " << r << " | " << n / dt << " | " << dt << " |\n";
         }
         for (auto n : opt.n_gens) {
           if (!n)
@@ -202,8 +264,8 @@ int RunLfm3Bench(const ext::TextBenchOptions& opt,
                     error);
           }
           const auto dt = Seconds(start);
-          std::cout << "| LFM3-1.7B | tg" << n << " | " << depth << " | " << r
-                    << " | " << n / dt << " | " << dt << " |\n";
+          std::cout << "| " << model_name << " | tg" << n << " | " << depth
+                    << " | " << r << " | " << n / dt << " | " << dt << " |\n";
         }
       }
     }

@@ -4,21 +4,29 @@
 #include <cstring>
 #include <gufo/ext/gguf_identity.hpp>
 #include <gufo/ext/host_budget.hpp>
+#include <gufo/ext/sha256.hpp>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 #include "chat_template.hpp"
+#include "vl/prompt.hpp"
 
 namespace gufo::models::lfm3 {
 namespace {
 using namespace gufo::ext;
+
+struct ImageContext final : TextPromptContext {
+  lfm3_vl::Prompt prompt;
+};
 
 class State final : public TextRunnerState {
 public:
   std::unique_ptr<Session> session;
   std::vector<float> logits;
   bool logits_ready{};
+  std::shared_ptr<const ImageContext> input;
+  std::vector<std::vector<float>> image_rows;
   void Invalidate() noexcept override {
     (void)session->Reset();
     logits_ready = false;
@@ -48,14 +56,17 @@ public:
 class Runner final : public HipTextModelRunner {
 public:
   Runner(std::shared_ptr<Model> model, std::uint32_t context,
-         std::string artifact_fingerprint)
-      : model_(std::move(model)), context_(context) {
+         std::string artifact_fingerprint,
+         std::shared_ptr<lfm3_vl::Vision> vision)
+      : model_(std::move(model)),
+        vision_(std::move(vision)),
+        context_(context) {
     if (!artifact_fingerprint.empty()) {
       if (artifact_fingerprint.size() != 64 ||
           artifact_fingerprint.find_first_not_of("0123456789abcdef") !=
               std::string::npos)
         throw std::invalid_argument("invalid LFM3 artifact fingerprint");
-      const auto identity =
+      auto identity =
           "schema=gufo-text-continuation-v2\nmodel_kind=lfm3\nartifact_id=" +
           std::string(core::kGgufIdentityScheme) + ':' + artifact_fingerprint +
           "\nstate_abi=lfm3-fp32-v2\npayload_layout=lfm3-fp32-compact-v1\n" +
@@ -65,15 +76,18 @@ public:
           "tokens=" +
           std::to_string(context_) +
           "\nposition_policy=absolute-ring-v1\nadapters=none\n";
+      if (vision_)
+        identity += "vision=lfm3-vl-image-v1:" + vision_->Identity() + "\n";
       persistence_ = TextRunnerPersistenceDescriptor{
           {identity.begin(), identity.end()}, 1};
     }
   }
   TextRunnerDescriptor Descriptor() const override {
-    return {.model_id = "LFM3-1.7B",
+    return {.model_id = vision_ ? "LFM3-VL-2B" : "LFM3-1.7B",
             .state_abi = "lfm3-fp32-v2",
             .max_context = context_,
-            .capabilities = {.incremental_prefill = true,
+            .capabilities = {.supports_vision = vision_ != nullptr,
+                             .incremental_prefill = true,
                              .snapshot = true,
                              .fork = true,
                              .final_token_advance_required = true,
@@ -123,15 +137,23 @@ public:
   }
   std::optional<std::string> RenderPrompt(
       const ChatRequest& request) const override {
+    if (vision_)
+      return std::nullopt;
     return RenderChat(request.messages, Tools(request), request.reasoning);
   }
   std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
+    if (vision_)
+      return lfm3_vl::Prepare(model_->tokenizer(), request.messages,
+                              Tools(request), request.reasoning, context_)
+          .tokens;
     return EncodeChat(model_->tokenizer(), request.messages, Tools(request),
                       request.reasoning);
   }
   std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
+    if (vision_)
+      return PrepareImagePrompt(request);
     auto tokens = RenderAndTokenize(request);
     if (!tokens)
       return std::nullopt;
@@ -143,6 +165,26 @@ public:
         !std::equal(history.begin(), history.end(), tokens->begin()))
       throw std::logic_error("LFM3 history is not a prompt prefix");
     return TextPreparedPrompt{std::move(*tokens), {}, history.size()};
+  }
+  std::optional<std::size_t> CountPromptTokens(
+      const ChatRequest& request) const override {
+    if (vision_)
+      return lfm3_vl::Prepare(model_->tokenizer(), request.messages,
+                              Tools(request), request.reasoning,
+                              model_->config().context)
+          .tokens.size();
+    return TextModelRunner::CountPromptTokens(request);
+  }
+  void SetPromptContext(
+      TextRunnerState& state,
+      std::shared_ptr<const TextPromptContext> context) const override {
+    auto& s = Get(state);
+    s.input = std::dynamic_pointer_cast<const ImageContext>(context);
+    if (context && (!vision_ || !s.input))
+      throw std::invalid_argument("invalid LFM3-VL prompt context");
+    s.image_rows.clear();
+    if (s.input)
+      s.image_rows.resize(s.input->prompt.images.size());
   }
   ext::InitialOutputState InitialOutputState(
       const ChatRequest& r) const override {
@@ -172,12 +214,41 @@ public:
     if (!count)
       throw std::invalid_argument("LFM3 prefill budget must be positive");
     std::string error;
-    Require(
-        s.session->Forward(prompt.subspan(offset, count),
-                           offset + count == prompt.size() ? std::span(s.logits)
-                                                           : std::span<float>{},
-                           &error),
-        error);
+    bool visual = false;
+    if (s.input)
+      for (std::size_t i = 0; i < s.input->prompt.images.size(); ++i) {
+        const auto& image = s.input->prompt.images[i];
+        const auto rows =
+            std::size_t(image.picture.height) * image.picture.width / 4;
+        if (offset < image.offset) {
+          count = std::min(count, image.offset - offset);
+          break;
+        }
+        if (offset >= image.offset + rows)
+          continue;
+        if (s.image_rows[i].empty())
+          s.image_rows[i] = vision_->Encode(image.picture);
+        count = std::min(count, image.offset + rows - offset);
+        const auto hidden = model_->config().hidden;
+        Require(
+            s.session->ForwardEmbeddings(
+                std::span(s.image_rows[i])
+                    .subspan((offset - image.offset) * hidden, count * hidden),
+                false,
+                offset + count == prompt.size() ? std::span(s.logits)
+                                                : std::span<float>{},
+                &error),
+            error);
+        visual = true;
+        break;
+      }
+    if (!visual)
+      Require(s.session->Forward(prompt.subspan(offset, count),
+                                 offset + count == prompt.size()
+                                     ? std::span(s.logits)
+                                     : std::span<float>{},
+                                 &error),
+              error);
     s.logits_ready = offset + count == prompt.size();
     return {count, s.logits_ready};
   }
@@ -277,6 +348,36 @@ private:
       throw std::invalid_argument("LFM3 snapshot belongs to a different model");
     return *value;
   }
+  // Images extend the cache identity at their first token, with the
+  // projector identity, placement, grid and processed pixels.
+  std::optional<TextPreparedPrompt> PrepareImagePrompt(
+      const ChatRequest& request) const {
+    auto context = std::make_shared<ImageContext>();
+    context->prompt =
+        lfm3_vl::Prepare(model_->tokenizer(), request.messages, Tools(request),
+                         request.reasoning, context_);
+    crypto::Sha256Hasher hash;
+    const auto& identity = vision_->Identity();
+    hash.Update({reinterpret_cast<const std::uint8_t*>(identity.data()),
+                 identity.size()});
+    for (const auto& image : context->prompt.images) {
+      context->cache_prefixes.push_back(
+          {image.offset, context->cache_identity});
+      const std::uint64_t geometry[] = {image.offset,
+                                        std::uint64_t(image.picture.height),
+                                        std::uint64_t(image.picture.width)};
+      hash.Update(
+          {reinterpret_cast<const std::uint8_t*>(geometry), sizeof(geometry)});
+      const auto& patches = image.picture.patches;
+      hash.Update({reinterpret_cast<const std::uint8_t*>(patches.data()),
+                   patches.size() * sizeof(float)});
+      const auto digest = hash.Digest();
+      context->cache_identity.assign(digest.begin(), digest.end());
+    }
+    const auto stable = context->prompt.stable_prefix;
+    auto tokens = context->prompt.tokens;
+    return TextPreparedPrompt{std::move(tokens), std::move(context), stable};
+  }
   static std::span<const ChatTool> Tools(const ChatRequest& r) {
     return r.tool_choice == ChatRequest::ToolChoice::kNone
                ? std::span<const ChatTool>{}
@@ -284,6 +385,7 @@ private:
   }
 
   std::shared_ptr<Model> model_;
+  std::shared_ptr<lfm3_vl::Vision> vision_;
   std::uint32_t context_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
@@ -291,18 +393,14 @@ private:
 
 std::shared_ptr<ext::TextModelRunner> CreateLfm3Runner(
     std::shared_ptr<Model> model, std::uint32_t context,
-    std::string artifact_fingerprint) {
+    std::string artifact_fingerprint, std::shared_ptr<lfm3_vl::Vision> vision) {
   return std::make_shared<Runner>(std::move(model), context,
-                                  std::move(artifact_fingerprint));
+                                  std::move(artifact_fingerprint),
+                                  std::move(vision));
 }
 
 std::shared_ptr<ext::TextModelRunner> CreateLfm3TextRunner(
     const ext::TextRunnerOptions& options, std::string* error) {
-  if (!options.vision_model_path.empty()) {
-    if (error)
-      *error = "LFM3 supports text input only";
-    return nullptr;
-  }
   if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled) {
     if (error)
       *error = "LFM3 does not support speculative decoding";
@@ -311,6 +409,15 @@ std::shared_ptr<ext::TextModelRunner> CreateLfm3TextRunner(
   auto model = Model::Load(options.model_path, error);
   if (!model)
     return nullptr;
+  std::shared_ptr<lfm3_vl::Vision> vision;
+  try {
+    vision = lfm3_vl::LoadMatchingVision(options.model_path,
+                                         options.vision_model_path);
+  } catch (const std::exception& e) {
+    if (error)
+      *error = e.what();
+    return nullptr;
+  }
   std::uint32_t max_context = options.max_context;
   if (max_context == 0)
     max_context = model->config().context;
@@ -339,7 +446,7 @@ std::shared_ptr<ext::TextModelRunner> CreateLfm3TextRunner(
   }
   try {
     return CreateLfm3Runner(std::move(model), max_context,
-                            std::move(model_fingerprint));
+                            std::move(model_fingerprint), std::move(vision));
   } catch (const std::exception& e) {
     if (error)
       *error = e.what();

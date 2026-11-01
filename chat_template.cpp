@@ -20,6 +20,8 @@ constexpr std::string_view kFunctionOpen = "<function=";
 constexpr std::string_view kFunctionClose = "</function>";
 constexpr std::string_view kParameterOpen = "<parameter=";
 constexpr std::string_view kParameterClose = "</parameter>";
+constexpr std::string_view kVisionStart = "<|vision_start|>";
+constexpr std::string_view kVisionEnd = "<|vision_end|>";
 
 constexpr std::string_view ToString(ChatRole role) noexcept {
   switch (role) {
@@ -96,16 +98,20 @@ void Calls(Rendered& out, std::span<const ext::ChatMessage::ToolCall> calls) {
 }
 Rendered Render(std::span<const ext::ChatMessage> messages,
                 std::span<const ext::ChatTool> tools,
-                const ReasoningOptions& reasoning, bool generation) {
+                const ReasoningOptions& reasoning, bool generation,
+                std::span<const ImageExpansion> images) {
   Rendered out;
   std::size_t first = 0;
   std::optional<std::size_t> last_user;
   for (std::size_t i = 0; i < messages.size(); ++i) {
-    if (!messages[i].images.empty())
-      throw std::invalid_argument("LFM3 supports text input only");
+    if (!messages[i].images.empty() && images.empty())
+      throw std::invalid_argument("image input requires an LFM3-VL projector");
+    if (!messages[i].images.empty() && messages[i].role != ChatRole::kUser)
+      throw std::invalid_argument("LFM3-VL images require a user message");
     if (messages[i].role == ChatRole::kUser)
       last_user = i;
   }
+  std::size_t image_index = 0;
   std::string system;
   if (!messages.empty() && messages.front().role == ChatRole::kSystem) {
     system = messages.front().content + messages.front().framing_suffix;
@@ -173,12 +179,31 @@ Rendered Render(std::span<const ext::ChatMessage> messages,
         out.text += "\n</tool_response>";
       }
     } else {
-      out.Literal(m.content);
+      std::size_t cursor = 0;
+      for (const auto& image : m.images) {
+        if (image.offset < cursor || image.offset > m.content.size() ||
+            image_index >= images.size())
+          throw std::invalid_argument("invalid LFM3-VL image placement");
+        out.Literal(
+            std::string_view(m.content).substr(cursor, image.offset - cursor));
+        const auto& expansion = images[image_index++];
+        if (!expansion.count || expansion.count > 16384 ||
+            expansion.token.empty())
+          throw std::invalid_argument("invalid LFM3-VL image expansion");
+        out.text += kVisionStart;
+        for (std::size_t j = 0; j < expansion.count; ++j)
+          out.text += expansion.token;
+        out.text += kVisionEnd;
+        cursor = image.offset;
+      }
+      out.Literal(std::string_view(m.content).substr(cursor));
       out.Literal(m.framing_suffix);
     }
     out.text += kImEnd;
     out.text += '\n';
   }
+  if (image_index != images.size())
+    throw std::invalid_argument("LFM3-VL image expansion count mismatch");
   if (generation) {
     out.text += kImStart;
     out.text += "assistant\n";
@@ -192,14 +217,15 @@ bool ThinkingEnabled(const ReasoningOptions& reasoning) {
 }
 std::string RenderChat(std::span<const ext::ChatMessage> messages,
                        std::span<const ext::ChatTool> tools,
-                       const ReasoningOptions& reasoning, bool generation) {
-  return Render(messages, tools, reasoning, generation).text;
+                       const ReasoningOptions& reasoning, bool generation,
+                       std::span<const ImageExpansion> images) {
+  return Render(messages, tools, reasoning, generation, images).text;
 }
 std::vector<std::uint32_t> EncodeChat(
     const Tokenizer& tokenizer, std::span<const ext::ChatMessage> messages,
     std::span<const ext::ChatTool> tools, const ReasoningOptions& reasoning,
-    bool generation) {
-  const auto rendered = Render(messages, tools, reasoning, generation);
+    bool generation, std::span<const ImageExpansion> images) {
+  const auto rendered = Render(messages, tools, reasoning, generation, images);
   return tokenizer.EncodeFramed(rendered.text, rendered.literals);
 }
 }  // namespace gufo::models::lfm3

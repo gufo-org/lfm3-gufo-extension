@@ -7,12 +7,14 @@
 #include <string>
 
 #include "engine.hpp"
+#include "vl/vision.hpp"
 
 namespace gufo::models::lfm3 {
 
 std::shared_ptr<ext::TextModelRunner> CreateLfm3Runner(
     std::shared_ptr<Model> model, std::uint32_t context,
-    std::string artifact_fingerprint = {});
+    std::string artifact_fingerprint = {},
+    std::shared_ptr<lfm3_vl::Vision> vision = {});
 
 std::shared_ptr<ext::TextModelRunner> CreateLfm3TextRunner(
     const ext::TextRunnerOptions& options, std::string* error);
