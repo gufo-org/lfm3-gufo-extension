@@ -1,5 +1,7 @@
+#include <gufo/ext/asr.hpp>
 #include <gufo/ext/registry.hpp>
 #include <gufo/ext/text.hpp>
+#include <gufo/ext/tts.hpp>
 
 #include "probe.hpp"
 
@@ -15,6 +17,18 @@ void RegisterLfm3Cpu(ext::Registry& registry) {
       .bench_driver = nullptr,
       .prompt_driver = nullptr,
       .chat_driver = nullptr,
+  });
+  registry.AddAsrProvider({
+      .id = "lfm3-audio-asr",
+      .probe = &ProbeLfm3Audio,
+      .resolve = &ResolveLfm3Audio,
+      .create = nullptr,
+  });
+  registry.AddTtsProvider({
+      .id = "lfm3-audio-tts",
+      .probe = &ProbeLfm3Audio,
+      .resolve = &ResolveLfm3Audio,
+      .create = nullptr,
   });
 }
 #endif

@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "lfm3",
   "api_version": ">= 0.1.8",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "depends": [],
   "platforms": ["linux"],
   "entry": "lfm3_register",
@@ -10,10 +10,14 @@
   "targets": {
     "gufo_lfm3": { "requires": [] },
     "gufo_lfm3_hip": { "requires": ["hip"] },
+    "gufo_lfm3_audio": { "requires": ["hip"] },
     "lfm3_config_test": { "requires": ["testing"], "role": "test" },
     "lfm3_ops_test": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_session_test": { "requires": ["hip", "testing"], "role": "test" },
-    "lfm3_probe": { "requires": ["testing"], "role": "test" }
+    "lfm3_probe": { "requires": ["testing"], "role": "test" },
+    "lfm3_audio_test": { "requires": ["hip", "testing"], "role": "test" },
+    "lfm3_audio_probe": { "requires": ["hip", "testing"], "role": "test" },
+    "lfm3_audio_batch_bench": { "requires": ["hip", "testing"], "role": "test" }
   },
   "providers": [
     {
@@ -23,6 +27,22 @@
       "model_ids": ["LFM3-1.7B", "lfm3-1.7b"],
       "target": "gufo_lfm3_hip",
       "entry": "lfm3_provider_register"
+    },
+    {
+      "id": "lfm3-audio-asr",
+      "capability": "speech_recognition",
+      "keys": ["gguf:lfm3"],
+      "model_ids": ["LFM3-Audio-2B", "lfm3-audio-2b"],
+      "target": "gufo_lfm3_audio",
+      "entry": "lfm3_asr_provider_register"
+    },
+    {
+      "id": "lfm3-audio-tts",
+      "capability": "speech_synthesis",
+      "keys": ["gguf:lfm3"],
+      "model_ids": ["LFM3-Audio-2B", "lfm3-audio-2b"],
+      "target": "gufo_lfm3_audio",
+      "entry": "lfm3_tts_provider_register"
     }
   ]
 }

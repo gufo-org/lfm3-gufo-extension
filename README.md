@@ -1,7 +1,8 @@
 # LFM3 1.7B
 
 Native text inference for LiquidAI LFM3-1.7B on Linux x86-64 / Strix Halo
-`gfx1151`.
+`gfx1151`. The same extension serves speech recognition and synthesis for
+LFM3-Audio-2B, whose backbone is LFM3; see [LFM3-Audio](docs/audio/README.md).
 
 The 24-layer backbone mixes 13 gated width-seven convolutions, five sliding
 attention layers (256 tokens) and six global attention layers. Attention has
@@ -103,4 +104,4 @@ override them. Historical assistant thoughts are stripped as in the official
 text-only template. The tokenizer uses LFM2's Unicode split and byte-level BPE,
 including three-digit number groups.
 
-[Quality](docs/QUALITY.md) · [Benchmarks](docs/BENCHMARKS.md) · [Experiments](docs/EXPERIMENTS.md)
+[Quality](docs/QUALITY.md) · [Benchmarks](docs/BENCHMARKS.md) · [Experiments](docs/EXPERIMENTS.md) · [LFM3-Audio](docs/audio/README.md)
