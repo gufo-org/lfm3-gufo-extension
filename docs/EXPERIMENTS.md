@@ -39,7 +39,7 @@ single-run observations; retained repeated measurements belong in BENCHMARKS.md.
 | Combine digit products per K block | Rejected in standalone measurements: integer reconstruction and FP32 merging did not improve the three-accumulator route. |
 | Shared KV attention tile across four queries and four heads | Rejected. Operator/state checks passed, but complete prefill was 2323 versus 2361 tok/s. |
 
-The standalone [matrix experiment](../../../tools/lfm3/prefill_bench.hip) rotates
+The standalone matrix experiment (`tools/lfm3/prefill_bench.hip`) rotates
 four weight buffers beyond MALL capacity and compares sampled outputs with an
 independent FP64 product. It supports tile exploration; its kernel time is not
 a complete-model throughput claim. Raw rejected trials remain in local artifacts.

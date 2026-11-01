@@ -1,7 +1,7 @@
 # LFM3 1.7B
 
 Native text inference for LiquidAI LFM3-1.7B on Linux x86-64 / Strix Halo
-`gfx1151`. Implementation: [src/models/lfm3](../../../src/models/lfm3).
+`gfx1151`.
 
 The 24-layer backbone mixes 13 gated width-seven convolutions, five sliding
 attention layers (256 tokens) and six global attention layers. Attention has

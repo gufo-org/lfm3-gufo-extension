@@ -1,7 +1,7 @@
 # LFM3 1.7B
 
 Native text inference for LiquidAI LFM3-1.7B on Linux x86-64 / Strix Halo
-`gfx1151`. Implementation: [src/models/lfm3](../../../src/models/lfm3).
+`gfx1151`.
 
 The 24-layer backbone mixes 13 gated width-seven convolutions, five sliding
 attention layers (256 tokens) and six global attention layers. Attention has
@@ -60,7 +60,7 @@ through the shared serving cache. Speculative decoding and image inputs remain
 unsupported. CLI chat retains its live prefix when framing permits.
 
 The full release API matrix still fails: several prompts produce unfinished
-reasoning or fail exact-answer/tool expectations. See [quality](QUALITY.md) for
+reasoning or fail exact-answer/tool expectations. See [quality](docs/QUALITY.md) for
 retained failures and the bounded checks that pass; API wiring is not a claim
 that this checkpoint meets the release quality bar.
 
@@ -71,4 +71,4 @@ override them. Historical assistant thoughts are stripped as in the official
 text-only template. The tokenizer uses LFM2's Unicode split and byte-level BPE,
 including three-digit number groups.
 
-[Quality](QUALITY.md) · [Benchmarks](BENCHMARKS.md) · [Experiments](EXPERIMENTS.md)
+[Quality](docs/QUALITY.md) · [Benchmarks](docs/BENCHMARKS.md) · [Experiments](docs/EXPERIMENTS.md)

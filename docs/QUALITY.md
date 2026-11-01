@@ -33,7 +33,7 @@ rows, high RoPE positions, zero-tail frequencies and sliding-cache wrap.
 
 [Retained metrics](artifacts/quality.json). Full logits and process logs are
 kept locally under ignored `artifacts/lfm3/logits-wired-fp32kv/`. Reproduction commands are
-in [tools/lfm3](../../../tools/lfm3/README.md).
+in `tools/lfm3/README.md`.
 
 ## State and API checks
 
@@ -48,7 +48,7 @@ Tokenizer IDs match independently generated Hugging Face `tokenizers` goldens
 for ASCII, contractions, Unicode, whitespace, numbers and control framing.
 Fixed template byte goldens are independent of production constants.
 
-The focused [HTTP suite](../../../tests/functional/lfm3.py) passes greedy and
+The focused HTTP suite (`tests/functional/lfm3.py`) passes greedy and
 streaming equality, seeded sampled replay, multi-turn fresh replay, a prompt crossing the 512-token
 prefill boundary and two-session output isolation. Every response and its per-phase
 latency are retained in local `artifacts/lfm3/http-optimized.json` (historical
