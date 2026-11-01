@@ -13,7 +13,8 @@ void lfm3_asr_provider_register(gufo::ext::Registry& registry) {
       .id = "lfm3-audio-asr",
       .probe = &gufo::models::lfm3::ProbeLfm3Audio,
       .resolve = &gufo::models::lfm3::ResolveLfm3Audio,
-      .create = &gufo::models::lfm3_audio::CreateLfm3AsrRunner,
+      .create = nullptr,
+      .create_with_options = &gufo::models::lfm3_audio::CreateLfm3AsrRunner,
   });
 }
 
@@ -24,6 +25,8 @@ void lfm3_tts_provider_register(gufo::ext::Registry& registry) {
       .id = "lfm3-audio-tts",
       .probe = &gufo::models::lfm3::ProbeLfm3Audio,
       .resolve = &gufo::models::lfm3::ResolveLfm3Audio,
-      .create = &gufo::models::lfm3_audio::CreateLfm3TtsRunner,
+      .create = nullptr,
+      .create_with_options = &gufo::models::lfm3_audio::CreateLfm3TtsRunner,
+      .speak_driver = &gufo::models::lfm3_audio::RunLfm3Speak,
   });
 }

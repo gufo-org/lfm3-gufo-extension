@@ -1,4 +1,5 @@
 #include <gufo/ext/asr.hpp>
+#include <gufo/ext/decision.hpp>
 #include <gufo/ext/registry.hpp>
 #include <gufo/ext/text.hpp>
 #include <gufo/ext/tts.hpp>
@@ -28,6 +29,12 @@ void RegisterLfm3Cpu(ext::Registry& registry) {
       .id = "lfm3-audio-tts",
       .probe = &ProbeLfm3Audio,
       .resolve = &ResolveLfm3Audio,
+      .create = nullptr,
+  });
+  registry.AddDecisionProvider({
+      .id = "d1",
+      .probe = &ProbeD1,
+      .resolve = &ResolveD1,
       .create = nullptr,
   });
 }

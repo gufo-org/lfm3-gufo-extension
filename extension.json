@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "name": "lfm3",
-  "api_version": ">= 0.1.8",
-  "version": "0.3.0",
+  "api_version": ">= 0.1.12",
+  "version": "0.4.0",
   "depends": [],
   "platforms": ["linux"],
   "entry": "lfm3_register",
@@ -13,6 +13,7 @@
     "gufo_lfm3_audio": { "requires": ["hip"] },
     "gufo_lfm3_vl": { "requires": ["hip"] },
     "gufo_lfm3_text": { "requires": ["hip"] },
+    "gufo_lfm3_d1": { "requires": ["hip"] },
     "lfm3_config_test": { "requires": ["testing"], "role": "test" },
     "lfm3_ops_test": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_session_test": { "requires": ["hip", "testing"], "role": "test" },
@@ -21,7 +22,10 @@
     "lfm3_audio_probe": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_audio_batch_bench": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_vl_contract_test": { "requires": ["testing"], "role": "test" },
-    "lfm3_vl_probe": { "requires": ["hip", "testing"], "role": "test" }
+    "lfm3_vl_probe": { "requires": ["hip", "testing"], "role": "test" },
+    "d1_contract_test": { "requires": ["testing"], "role": "test" },
+    "d1_ops_test": { "requires": ["hip", "testing"], "role": "test" },
+    "d1_forward_probe": { "requires": ["hip", "testing"], "role": "test" }
   },
   "providers": [
     {
@@ -47,6 +51,14 @@
       "model_ids": ["LFM3-Audio-2B", "lfm3-audio-2b"],
       "target": "gufo_lfm3_audio",
       "entry": "lfm3_tts_provider_register"
+    },
+    {
+      "id": "d1",
+      "capability": "decision",
+      "keys": ["gguf:lfm3"],
+      "model_ids": ["d1-Omni-2B", "d1-omni-2b"],
+      "target": "gufo_lfm3_d1",
+      "entry": "lfm3_d1_provider_register"
     }
   ]
 }

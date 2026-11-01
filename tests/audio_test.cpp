@@ -157,6 +157,51 @@ int main() {
            "tool framing: " + framed);
   }
 
+  // Reply parsing: reasoning, content and calls, with tags split anywhere.
+  {
+    const std::string reply =
+        "Let me think.</think>\n\nSure.<tool_call>\n<function=set_volume>\n"
+        "<parameter=volume>\n30\n</parameter>\n<parameter=room>\nkitchen\n"
+        "</parameter>\n</function>\n</tool_call>\n\n<tool_call>\n"
+        "<function=mute>\n</function>\n</tool_call>";
+    for (std::size_t step : {1U, 2U, 5U, 1000U}) {
+      audio::ReplyParser parser(true);
+      std::string reasoning, content;
+      for (std::size_t at = 0; at < reply.size(); at += step) {
+        auto delta = parser.Feed(reply.substr(at, step));
+        reasoning += delta.reasoning;
+        content += delta.content;
+      }
+      std::vector<audio::ToolCall> calls;
+      auto delta = parser.Finish(&calls);
+      reasoning += delta.reasoning;
+      content += delta.content;
+      Expect(reasoning == "Let me think." && content == "Sure.",
+             "reply split at " + std::to_string(step) + ": [" + reasoning +
+                 "] [" + content + "]");
+      Expect(calls.size() == 2 && calls[0].name == "set_volume" &&
+                 calls[0].arguments.size() == 2 &&
+                 calls[0].arguments[0].value == "30" &&
+                 !calls[0].arguments[0].is_string &&
+                 calls[0].arguments[1].value == "kitchen" &&
+                 calls[0].arguments[1].is_string && calls[1].name == "mute" &&
+                 calls[1].arguments.empty(),
+             "tool calls at " + std::to_string(step));
+    }
+    // A reply may open its own reasoning; plain replies pass through.
+    audio::ReplyParser opened;
+    auto a = opened.Feed("<think>hm</think>Yes");
+    std::vector<audio::ToolCall> calls;
+    auto b = opened.Finish(&calls);
+    Expect(a.reasoning + b.reasoning == "hm" &&
+               a.content + b.content == "Yes" && calls.empty(),
+           "self-opened reasoning");
+    audio::ReplyParser plain;
+    auto c = plain.Feed("Hello <tool");
+    auto d = plain.Finish(&calls);
+    Expect(c.content == "Hello " && d.content == "<tool" && calls.empty(),
+           "partial tag released at the end");
+  }
   std::printf(failures ? "FAILED %d\n" : "PASSED\n", failures);
   return failures ? 1 : 0;
 }

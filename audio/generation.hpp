@@ -76,6 +76,9 @@ struct GenerateOptions {
   bool suppress_mixed{false}, suppress_audio_out{false};
   // When set, the first generated token is one of these.
   std::vector<std::uint32_t> first_tokens;
+  // Text tokens never generated (for example <think> and </think> once the
+  // prompt closed reasoning).
+  std::vector<std::uint32_t> suppress_tokens;
   std::uint64_t seed{0};
   // Frames per codec decode once speech has started; the first chunk is
   // shorter so the first audio leaves sooner.
@@ -220,5 +223,37 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+// Splits streamed reply text into reasoning (up to </think>, when the reply
+// started inside <think>), visible content and tool calls. Text after an
+// opening <tool_call> is held back; Finish parses the calls.
+struct ToolArgument {
+  std::string name;
+  std::string value;  // as written; JSON unless is_string
+  bool is_string{true};
+};
+struct ToolCall {
+  std::string name;
+  std::vector<ToolArgument> arguments;
+};
+class ReplyParser {
+public:
+  explicit ReplyParser(bool thinking = false) : thinking_(thinking) {}
+  struct Delta {
+    std::string reasoning, content;
+  };
+  Delta Feed(std::string_view text);
+  // Remaining deltas; tool calls written after the content.
+  Delta Finish(std::vector<ToolCall>* calls);
+  bool thinking() const { return thinking_; }
+  // A tool call has started: content is held back from here on.
+  bool calling() const { return calling_; }
+  const std::string& reasoning() const { return reasoning_; }
+  const std::string& content() const { return content_; }
+
+private:
+  Delta Drain(bool final);
+  bool thinking_, calling_{false};
+  std::string pending_, reasoning_, content_, calls_;
+};
 }  // namespace gufo::models::lfm3_audio
 #endif

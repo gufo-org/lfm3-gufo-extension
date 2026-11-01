@@ -1,4 +1,4 @@
-# LFM3 1.7B, LFM3-VL 2B and LFM3-Audio 2B external model extension.
+# LFM3 1.7B, LFM3-VL 2B, LFM3-Audio 2B and d1-Omni 2B external model extension.
 
 gufo_extension_target(
   NAME gufo_lfm3
@@ -12,6 +12,9 @@ gufo_extension_target(
     extension.cpp
     vl/image.cpp
     vl/prompt.cpp
+    d1/prompt.cpp
+    d1/packing.cpp
+    d1/boxes.cpp
   LINK_LIBRARIES
     gufo_ext_runtime
     ICU::uc
@@ -67,7 +70,9 @@ gufo_extension_target(
     audio/audio.cpp
     audio/model.cpp
     audio/generation.cpp
+    audio/realtime.cpp
     audio/runner.cpp
+    audio/speak.cpp
     audio/provider.cpp
   LINK_LIBRARIES
     gufo_lfm3_hip
@@ -133,6 +138,27 @@ gufo_extension_target(
 
 if(TARGET gufo_lfm3_text)
   target_compile_options(gufo_lfm3_text PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+endif()
+
+# d1-Omni decisions over text, the LFM3-VL vision tower and the audio
+# encoder.
+gufo_extension_target(
+  NAME gufo_lfm3_d1
+  SOURCES
+    d1/model.cpp
+    d1/runner.cpp
+    d1/provider.cpp
+  LINK_LIBRARIES
+    gufo_lfm3_vl
+    gufo_lfm3_audio
+    gufo_lfm3_hip
+    gufo_lfm3
+    gufo_ext_runtime
+    hip::host
+)
+
+if(TARGET gufo_lfm3_d1)
+  target_compile_options(gufo_lfm3_d1 PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
 endif()
 
 gufo_extension_target(
@@ -268,4 +294,49 @@ gufo_extension_target(
     PNG::PNG
     JPEG::JPEG
     PkgConfig::WEBP
+)
+
+# d1 prompt layout, packing, box readout and calibration; no weights.
+gufo_extension_target(
+  NAME d1_contract_test
+  SOURCES
+    tests/d1_contract_test.cpp
+  LINK_LIBRARIES
+    gufo_lfm3
+    gufo_ext_runtime
+)
+
+if(TARGET d1_contract_test)
+  add_test(NAME d1.contract COMMAND d1_contract_test)
+  set_tests_properties(d1.contract PROPERTIES LABELS "d1;cpu")
+endif()
+
+gufo_extension_target(
+  NAME d1_ops_test
+  SOURCES
+    tests/d1_ops_test.cpp
+  LINK_LIBRARIES
+    gufo_lfm3_vl
+    gufo_lfm3_audio
+    gufo_lfm3_hip
+    gufo_lfm3
+    gufo_ext_runtime
+    hip::host
+)
+
+if(TARGET d1_ops_test)
+  add_test(NAME d1.ops COMMAND d1_ops_test)
+  set_tests_properties(d1.ops PROPERTIES LABELS "d1;hip;gpu;gfx1151")
+endif()
+
+# Writes native logits for the reference; see tests/d1_reference/README.md.
+gufo_extension_target(
+  NAME d1_forward_probe
+  SOURCES
+    tests/d1_forward_probe.cpp
+  LINK_LIBRARIES
+    gufo_lfm3_hip
+    gufo_lfm3
+    gufo_ext_runtime
+    hip::host
 )

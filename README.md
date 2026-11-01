@@ -2,11 +2,17 @@
 
 Native text inference for LiquidAI LFM3-1.7B on Linux x86-64 / Strix Halo
 `gfx1151`. The same extension serves the other checkpoints built on the LFM3
-backbone: text and still-image input for LFM3-VL-2B through the same `lfm3`
-text provider (see [LFM3-VL](docs/vl/README.md)), and speech recognition and
-synthesis for LFM3-Audio-2B (see [LFM3-Audio](docs/audio/README.md)).
-[TODO.md](TODO.md) lists what the in-tree branch has that this extension does
-not.
+backbone:
+
+- LFM3-VL-2B text and still-image input, through the same `lfm3` text
+  provider ([LFM3-VL](docs/vl/README.md)).
+- LFM3-Audio-2B speech recognition, synthesis, live transcription, realtime
+  spoken conversations and `gufo speak` ([LFM3-Audio](docs/audio/README.md)).
+- d1-Omni-2B decisions over text, images and audio, through `gufo decide` and
+  `gufo serve decision` ([d1](docs/d1/README.md)).
+
+The speech and decision providers need a Gufo with extension API 0.1.12 or
+newer. [TODO.md](TODO.md) lists what is left.
 
 The 24-layer backbone mixes 13 gated width-seven convolutions, five sliding
 attention layers (256 tokens) and six global attention layers. Attention has
@@ -108,4 +114,4 @@ override them. Historical assistant thoughts are stripped as in the official
 text-only template. The tokenizer uses LFM2's Unicode split and byte-level BPE,
 including three-digit number groups.
 
-[Quality](docs/QUALITY.md) · [Benchmarks](docs/BENCHMARKS.md) · [Experiments](docs/EXPERIMENTS.md) · [LFM3-VL](docs/vl/README.md) · [LFM3-Audio](docs/audio/README.md)
+[Quality](docs/QUALITY.md) · [Benchmarks](docs/BENCHMARKS.md) · [Experiments](docs/EXPERIMENTS.md) · [LFM3-VL](docs/vl/README.md) · [LFM3-Audio](docs/audio/README.md) · [d1](docs/d1/README.md)

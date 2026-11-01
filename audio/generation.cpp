@@ -9,6 +9,7 @@
 #include <deque>
 #include <future>
 #include <gufo/ext/json.hpp>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <unordered_map>
@@ -487,6 +488,9 @@ bool Generator::Continue(const GenerateOptions& o,
       suppress.push_back(ids.mixed_start);
     if (o.suppress_audio_out)
       suppress.push_back(ids.audio_start);
+    for (auto id : o.suppress_tokens)
+      if (id < config.vocab)
+        suppress.push_back(id);
     constexpr int kTextSlots = 6, kAudioSlots = 12;
     int slots_left = kTextSlots;
     bool speaking = false, text_done = false, finished = false;
@@ -1143,4 +1147,179 @@ bool LiveTranscriber::Finish(const TextCallback& on_text, std::string* error) {
   }
 }
 
+namespace {
+// One native Qwen-format call as LFM3 writes it:
+// <tool_call>\n<function=NAME>\n(<parameter=P>\nVALUE\n</parameter>\n)*
+// </function>\n</tool_call>. A parameter value keeps everything between the
+// framing newlines, including blank lines and literal tags.
+struct ScannedParameter {
+  std::string name, value;
+};
+struct ScannedCall {
+  std::string name;
+  std::vector<ScannedParameter> parameters;
+};
+struct CallScan {
+  std::optional<ScannedCall> call;  // set only for a complete call
+  std::size_t end{};
+};
+std::string_view SkipSpace(std::string_view text) {
+  const auto lead = text.find_first_not_of(" \t\r\n");
+  return lead == std::string_view::npos ? std::string_view{}
+                                        : text.substr(lead);
+}
+CallScan ScanToolCall(std::string_view text) {
+  constexpr std::string_view kOpen = "<tool_call>", kClose = "</tool_call>",
+                             kFunction = "<function=",
+                             kFunctionClose = "</function>",
+                             kParameter = "<parameter=",
+                             kParameterClose = "\n</parameter>";
+  CallScan scan;
+  if (!text.starts_with(kOpen))
+    return scan;
+  auto rest = SkipSpace(text.substr(kOpen.size()));
+  if (!rest.starts_with(kFunction))
+    return scan;
+  rest.remove_prefix(kFunction.size());
+  const auto name_end = rest.find('>');
+  if (name_end == std::string_view::npos || name_end == 0)
+    return scan;
+  ScannedCall call{std::string(rest.substr(0, name_end)), {}};
+  rest.remove_prefix(name_end + 1);
+  while (true) {
+    rest = SkipSpace(rest);
+    if (rest.starts_with(kFunctionClose)) {
+      rest = SkipSpace(rest.substr(kFunctionClose.size()));
+      if (!rest.starts_with(kClose))
+        return scan;
+      rest.remove_prefix(kClose.size());
+      scan.end = text.size() - rest.size();
+      scan.call = std::move(call);
+      return scan;
+    }
+    if (!rest.starts_with(kParameter))
+      return scan;
+    rest.remove_prefix(kParameter.size());
+    const auto parameter_end = rest.find('>');
+    if (parameter_end == std::string_view::npos || parameter_end == 0)
+      return scan;
+    ScannedParameter parameter{std::string(rest.substr(0, parameter_end)), {}};
+    rest.remove_prefix(parameter_end + 1);
+    if (rest.starts_with('\n'))
+      rest.remove_prefix(1);
+    // A closing tag followed by a line break or the next tag ends the value.
+    std::size_t close = rest.find(kParameterClose);
+    while (close != std::string_view::npos) {
+      const auto tail = rest.substr(close + kParameterClose.size());
+      const auto next = SkipSpace(tail);
+      if (tail.empty() || tail.starts_with('\n') ||
+          next.starts_with(kParameter) || next.starts_with(kFunctionClose))
+        break;
+      close = rest.find(kParameterClose, close + 1);
+    }
+    if (close == std::string_view::npos)
+      return scan;
+    parameter.value = std::string(rest.substr(0, close));
+    rest.remove_prefix(close + kParameterClose.size());
+    call.parameters.push_back(std::move(parameter));
+  }
+}
+constexpr std::string_view kThinkOpen = "<think>", kThinkClose = "</think>",
+                           kCallOpen = "<tool_call>";
+// Bytes at the end of text that could start tag.
+std::size_t PartialTag(std::string_view text, std::string_view tag) {
+  for (std::size_t n = std::min(text.size(), tag.size() - 1); n > 0; --n)
+    if (text.substr(text.size() - n) == tag.substr(0, n))
+      return n;
+  return 0;
+}
+}  // namespace
+ReplyParser::Delta ReplyParser::Feed(std::string_view text) {
+  pending_ += text;
+  return Drain(false);
+}
+ReplyParser::Delta ReplyParser::Drain(bool final) {
+  Delta out;
+  // A reply may open its own reasoning.
+  if (!thinking_ && reasoning_.empty() && content_.empty() && !calling_) {
+    const auto lead = pending_.find_first_not_of(" \n");
+    if (lead != std::string::npos &&
+        std::string_view(pending_).substr(lead).starts_with(kThinkOpen)) {
+      pending_.erase(0, lead + kThinkOpen.size());
+      thinking_ = true;
+    } else if (!final && (lead == std::string::npos ||
+                          kThinkOpen.starts_with(
+                              std::string_view(pending_).substr(lead))))
+      return out;
+  }
+  if (thinking_) {
+    const auto close = pending_.find(kThinkClose);
+    if (close == std::string::npos) {
+      const auto keep = final ? 0 : PartialTag(pending_, kThinkClose);
+      out.reasoning = pending_.substr(0, pending_.size() - keep);
+      pending_.erase(0, out.reasoning.size());
+      reasoning_ += out.reasoning;
+      return out;
+    }
+    out.reasoning = pending_.substr(0, close);
+    reasoning_ += out.reasoning;
+    pending_.erase(0, close + kThinkClose.size());
+    thinking_ = false;
+  }
+  if (!calling_) {
+    // Answers follow </think> after whitespace.
+    if (content_.empty()) {
+      const auto lead = pending_.find_first_not_of(" \n");
+      pending_.erase(0, lead == std::string::npos ? pending_.size() : lead);
+    }
+    const auto call = pending_.find(kCallOpen);
+    if (call != std::string::npos) {
+      out.content = pending_.substr(0, call);
+      calls_ = pending_.substr(call);
+      pending_.clear();
+      calling_ = true;
+    } else {
+      const auto keep = final ? 0 : PartialTag(pending_, kCallOpen);
+      out.content = pending_.substr(0, pending_.size() - keep);
+      pending_.erase(0, out.content.size());
+    }
+    content_ += out.content;
+  } else {
+    calls_ += pending_;
+    pending_.clear();
+  }
+  return out;
+}
+ReplyParser::Delta ReplyParser::Finish(std::vector<ToolCall>* calls) {
+  auto out = Drain(true);
+  calls->clear();
+  std::string_view rest = calls_;
+  while (true) {
+    const auto lead = rest.find_first_not_of(" \n");
+    rest.remove_prefix(lead == std::string_view::npos ? rest.size() : lead);
+    if (rest.empty())
+      break;
+    const auto scan = ScanToolCall(rest);
+    if (!scan.call) {
+      // Text that is not a complete call stays visible.
+      out.content += rest;
+      content_ += rest;
+      break;
+    }
+    ToolCall call{scan.call->name, {}};
+    for (const auto& parameter : scan.call->parameters) {
+      ToolArgument argument{parameter.name, parameter.value, true};
+      try {
+        (void)json::parse(parameter.value);
+        argument.is_string = false;
+      } catch (const std::exception&) {
+      }
+      call.arguments.push_back(std::move(argument));
+    }
+    calls->push_back(std::move(call));
+    rest.remove_prefix(scan.end);
+  }
+  calls_.clear();
+  return out;
+}
 }  // namespace gufo::models::lfm3_audio

@@ -987,14 +987,14 @@ __device__ __forceinline__ void Unroll(F f, std::integer_sequence<int, I...>) {
 // lane one key of the tile. Query values stay in registers and reach every
 // lane through DPP broadcasts, so K/V is read once per wave. Scores, the
 // online softmax and P*V accumulate in FP32.
-template<int D>
+template<int D, bool bidirectional = false, bool packed = false>
 __launch_bounds__(256) __global__
     void TiledAttn(const float* __restrict__ q, const float* __restrict__ k,
                    const float* __restrict__ v, const float* __restrict__ gate,
                    const float* __restrict__ ck, const float* __restrict__ cv,
                    float* __restrict__ y, float* __restrict__ partial, int n,
                    int heads, int kh, int position, int capacity, int window,
-                   int span) {
+                   int span, const std::int32_t* groups = nullptr) {
   constexpr int kRows = 8, kKeys = 32, kSlices = D / 16;
   static_assert(D == 128);
   __shared__ float4 sk[kKeys][D / 4 + 1], sv[kKeys][D / 4];
@@ -1026,10 +1026,12 @@ __launch_bounds__(256) __global__
   // Long histories split their keys into spans of span keys, one per
   // blockIdx.y; blocks of one span run together and share its K/V in cache.
   const int last_query =
-      min(position + min(q0 + queries, n) - 1, (split + 1) * span - 1);
+      min(bidirectional ? n - 1 : position + min(q0 + queries, n) - 1,
+          (split + 1) * span - 1);
   const int begin =
       max(window > 0 ? max(0, position + q0 + 1 - window) : 0, split * span);
-  const int wave_last = position + min(wq0 + kRows, n) - 1;
+  const int wave_last =
+      bidirectional ? n - 1 : position + min(wq0 + kRows, n) - 1;
   const int wave_first = window > 0 ? max(0, position + wq0 + 1 - window) : 0;
   for (int base = begin; base <= last_query; base += kKeys) {
     __syncthreads();
@@ -1073,8 +1075,14 @@ __launch_bounds__(256) __global__
     for (int r = 0; r < kRows; ++r) {
       const int query = position + wq0 + r;
       const int first = window > 0 ? max(0, query + 1 - window) : 0;
-      const bool valid =
-          wq0 + r < n && t >= first && t <= query && t <= last_query;
+      bool valid = wq0 + r < n && t >= first && (bidirectional || t <= query) &&
+                   t <= last_query;
+      if constexpr (packed) {
+        if (valid) {
+          const auto own = groups[wq0 + r], key = groups[t];
+          valid = own < 0 || key < 0 || own == key;
+        }
+      }
       float s = valid ? score[r] * scale : -INFINITY, tile_max = s;
 #pragma unroll
       for (int offset = 16; offset; offset /= 2)
@@ -1743,6 +1751,35 @@ void Attention(const float* q, const float* k, const float* v, const float* g,
   }
   Attn<<<dim3(h, n), 32, 0, s>>>(q, k, v, g, ck, cv, out, h, kh, d, p, cap,
                                  win);
+}
+void BidirectionalAttention(const float* q, const float* k, const float* v,
+                            const float* g, float* out, int n, int h, int kh,
+                            hipStream_t s, const std::int32_t* groups) {
+  const int queries = 64 / (h / kh);
+  if (groups) {
+    TiledAttn<128, true, true>
+        <<<dim3((n + queries - 1) / queries, 1, kh), 256, 0, s>>>(
+            q, k, v, g, nullptr, nullptr, out, nullptr, n, h, kh, 0, n, 0, n,
+            groups);
+    return;
+  }
+  TiledAttn<128, true><<<dim3((n + queries - 1) / queries, 1, kh), 256, 0, s>>>(
+      q, k, v, g, nullptr, nullptr, out, nullptr, n, h, kh, 0, n, 0, n);
+}
+namespace {
+__global__ void CopyRows(const unsigned char* source, const std::uint32_t* rows,
+                         unsigned char* out, std::size_t bytes) {
+  const auto row = blockIdx.x;
+  for (std::size_t i = threadIdx.x; i < bytes; i += blockDim.x)
+    out[std::size_t(row) * bytes + i] =
+        source[std::size_t(rows[row]) * bytes + i];
+}
+}  // namespace
+void SelectRows(const Tensor& source, const std::uint32_t* rows, void* out,
+                int count, hipStream_t s) {
+  CopyRows<<<count, 256, 0, s>>>(static_cast<const unsigned char*>(source.data),
+                                 rows, static_cast<unsigned char*>(out),
+                                 source.bytes / source.rows);
 }
 void StoreKV(const float* k, const float* v, float* ck, float* cv, int n,
              int stride, int p, int cap, hipStream_t s) {

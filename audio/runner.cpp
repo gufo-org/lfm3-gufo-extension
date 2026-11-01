@@ -1,6 +1,7 @@
 #include "runner.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <cstdint>
@@ -15,6 +16,7 @@
 
 #include "../probe.hpp"
 #include "generation.hpp"
+#include "realtime.hpp"
 
 namespace gufo::models::lfm3_audio {
 namespace {
@@ -43,9 +45,10 @@ std::string AsrLanguage(const std::string& language) {
 constexpr std::size_t kWindowSamples = 30 * Model::kSampleRate;
 
 std::shared_ptr<Model> LoadModel(const std::string& model_root,
-                                 std::size_t context, std::string* error) {
+                                 const std::string& mmproj, std::size_t context,
+                                 std::string* error) {
   std::string reason;
-  const auto artifacts = lfm3::FindLfm3Audio(model_root, &reason);
+  const auto artifacts = lfm3::FindLfm3Audio(model_root, mmproj, &reason);
   if (!artifacts) {
     *error = reason.empty()
                  ? "no LFM3 GGUF with an LFM3-Audio mmproj at " + model_root
@@ -65,6 +68,18 @@ public:
   Lfm3AsrRunner(std::shared_ptr<Model> model,
                 std::unique_ptr<Generator> generator)
       : model_(std::move(model)), generator_(std::move(generator)) {}
+
+  std::string ModelId() const override { return "lfm3-audio-2b"; }
+  bool SupportsLiveTranscription() const override { return true; }
+  std::unique_ptr<ext::LiveTranscription> CreateLiveTranscription(
+      std::uint32_t rate, std::string* error) override {
+    return CreateLiveStream(model_, sessions_, rate, error);
+  }
+  bool SupportsVoiceConversation() const override { return true; }
+  std::unique_ptr<ext::VoiceConversation> CreateVoiceConversation(
+      std::uint32_t rate, std::string* error) override {
+    return CreateConversation(model_, sessions_, rate, error);
+  }
 
   bool Transcribe(const ext::TranscriptionRequest& request,
                   const ext::CancellationCheck& cancelled,
@@ -148,6 +163,8 @@ private:
   std::shared_ptr<Model> model_;
   std::unique_ptr<Generator> generator_;
   std::mutex mutex_;
+  std::shared_ptr<std::atomic<int>> sessions_ =
+      std::make_shared<std::atomic<int>>(0);
 };
 
 // Synthesis requests join one batch on the speaker thread, so concurrent
@@ -229,6 +246,8 @@ public:
   ext::TtsVariant Variant() const override {
     return ext::TtsVariant::kCustomVoice;
   }
+  std::string ModelId() const override { return "lfm3-audio-2b"; }
+  bool Concurrent() const override { return true; }
 
 private:
   struct Job {
@@ -295,13 +314,13 @@ private:
 }  // namespace
 
 std::unique_ptr<ext::AsrRunner> CreateLfm3AsrRunner(
-    const std::string& model_root, std::size_t maximum_context_tokens,
-    std::string* error) {
-  auto model = LoadModel(model_root, maximum_context_tokens, error);
+    const ext::AsrRunnerOptions& options, std::string* error) {
+  auto model = LoadModel(options.model_root, options.projector_path,
+                         options.maximum_context_tokens, error);
   if (!model)
     return nullptr;
-  auto generator =
-      Generator::Create(model, std::uint32_t(maximum_context_tokens), error);
+  auto generator = Generator::Create(
+      model, std::uint32_t(options.maximum_context_tokens), error);
   if (!generator)
     return nullptr;
   return std::make_unique<Lfm3AsrRunner>(std::move(model),
@@ -309,13 +328,13 @@ std::unique_ptr<ext::AsrRunner> CreateLfm3AsrRunner(
 }
 
 std::unique_ptr<ext::TtsRunner> CreateLfm3TtsRunner(
-    const std::string& model_root, std::size_t maximum_context_tokens,
-    std::string* error) {
-  auto model = LoadModel(model_root, maximum_context_tokens, error);
+    const ext::TtsRunnerOptions& options, std::string* error) {
+  auto model = LoadModel(options.model_root, options.projector_path,
+                         options.maximum_context_tokens, error);
   if (!model)
     return nullptr;
-  return std::make_unique<Lfm3TtsRunner>(std::move(model),
-                                         std::uint32_t(maximum_context_tokens));
+  return std::make_unique<Lfm3TtsRunner>(
+      std::move(model), std::uint32_t(options.maximum_context_tokens));
 }
 
 }  // namespace gufo::models::lfm3_audio
