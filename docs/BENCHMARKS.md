@@ -1,5 +1,21 @@
 # LFM3 benchmarks
 
+## November 2, 2026: extension backbone flags
+
+`gpu-test` build of this extension (Gufo `ext-realtime-decision`, extension
+API 0.1.12), Q8_0, C1, `gufo bench -p 2048 -n 128 -r 3`, two invocations per
+build, alternated. Dropping `-ffast-math -fno-finite-math-only` from the
+backbone kernels, as the in-tree port compiled them:
+
+| Backbone HIP flags | pp2048 tokens/s (6 runs) | tg128 tokens/s (6 runs) |
+| --- | --: | --: |
+| `-O3 -ffast-math` | 4973–5054 (mean 5021, 0.408 s) | 105.69–105.78 |
+| `-O3` | 4938–4994 (mean 4970, 0.412 s) | 105.56–105.74 |
+
+The prompt costs about 4 ms (1%) more, inside the 5% and 10 ms timing gates;
+decode is unchanged. The extension keeps `-O3`: its d1 responses then match
+the in-tree port byte for byte.
+
 ## October 29, 2026: current
 
 Same machine, toolchain, weights and harness as below. Production `release`

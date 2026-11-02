@@ -12,7 +12,9 @@ backbone:
   `gufo serve decision` ([d1](docs/d1/README.md)).
 
 The speech and decision providers need a Gufo with extension API 0.1.12 or
-newer. [TODO.md](TODO.md) lists what is left.
+newer (Gufo [#942](https://github.com/gufo-org/gufo/pull/942)); see
+[TODO.md](TODO.md). Functional suites are in
+[tests/functional](tests/functional/README.md).
 
 The 24-layer backbone mixes 13 gated width-seven convolutions, five sliding
 attention layers (256 tokens) and six global attention layers. Attention has

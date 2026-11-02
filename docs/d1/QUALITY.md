@@ -114,11 +114,19 @@ image, audio, spoken instructions, mixed media, long state) the largest
 numeric difference is 1.3e-6, and every discrete answer and token count
 matches. `d1_packed.py` passes all 26 HTTP checks on both servers with the
 COCO two-cat image (`val2017/000000039769.jpg`); 14 of 26 responses are
-byte-identical and the rest differ by at most 2.0e-7. The extension's text
-backbone compiles with fast math, which accounts for these last-digit
-differences. `gufo decide` answers the same requests from the command line.
-The `d1_contract_test` and `d1_ops_test` binaries pass. The numerical
-teacher was not rerun.
+byte-identical and the rest differ by at most 2.0e-7. Those last-digit
+differences came from the text backbone's fast math; with the backbone
+compiled at `-O3` like the in-tree port, all nine `d1.py` responses are
+byte-identical to the in-tree server. `gufo decide` answers the same
+requests from the command line, and the `d1.contract` and `d1.ops` tests
+pass.
+
+The independent teacher (`tests/d1_reference/reference.py`, LiquidAI
+`431f1d66` source, transformers 5.19.0, PyTorch 2.14.1, gguf-py from
+llama.cpp `8642541b`, CPU FP32) passes all 11 cases against this
+extension's server and `d1_forward_probe`, with the two-cat image: prompt
+IDs, group tags and slots match, selected logits differ by at most 4.7e-5
+(gate 0.002), and API answers by at most 6.6e-7.
 
 ## Reproduction
 

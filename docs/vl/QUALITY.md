@@ -70,9 +70,15 @@ with the same suite, every response carries the same text, reasoning, JSON
 and tool calls; only response IDs and timestamps differ. Per-request times
 agree within run noise (cold red image 117.2 vs 117.9 ms, two images 208.3
 vs 207.5 ms, auto detail 509.3 vs 516.9 ms); the builds differ in type, so
-this is not a matched speed claim. The CPU contract test passes. The
-reference tool was not rerun: it needs transformers 5.21.0 and the pinned
-safetensors snapshot, and the development shell has 5.17.0.
+this is not a matched speed claim. The CPU contract test passes.
+
+The independent teacher (`tests/vl_reference/reference.py`, LiquidAI
+`ba44bd51` source, transformers 5.21.0, PyTorch 2.14.1, gguf-py from
+llama.cpp `8642541b`, CPU FP32) passes all six cases against
+`lfm3_vl_probe`, with the COCO two-cat image (`val2017/000000039769.jpg`)
+for the photograph: grids and prompt IDs match, maximum patch error 5.9e-8,
+image-embedding error 3.8e-5, logit error 1.2e-4, KL below 9.7e-10 and total
+variation below 2.0e-5, with every top-1 equal (gates as above).
 
 ## Limits
 

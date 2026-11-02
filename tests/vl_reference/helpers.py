@@ -3,6 +3,7 @@
 tests/functional/lfm3_logits.py (logit comparison) and
 tests/functional/lfm3_vl.py (PNG fixtures)."""
 import math
+import re
 import struct
 import zlib
 

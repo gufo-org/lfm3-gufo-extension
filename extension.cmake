@@ -52,8 +52,6 @@ if(TARGET gufo_lfm3_hip)
   target_compile_options(gufo_lfm3_hip PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
-    $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
-    $<$<COMPILE_LANGUAGE:HIP>:-fno-finite-math-only>
     $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-command-line-argument>
   )
   target_include_directories(gufo_lfm3_hip PUBLIC
@@ -61,8 +59,7 @@ if(TARGET gufo_lfm3_hip)
   )
 endif()
 
-# LFM3-Audio towers and serving runners over the HIP backbone. HIP keeps the
-# in-tree port's -O3 without fast math.
+# LFM3-Audio towers and serving runners over the HIP backbone.
 gufo_extension_target(
   NAME gufo_lfm3_audio
   SOURCES
@@ -94,8 +91,7 @@ if(TARGET gufo_lfm3_audio)
   )
 endif()
 
-# LFM3-VL vision tower; shares the audio encoder's operators. HIP keeps the
-# in-tree port's -O3 without fast math.
+# LFM3-VL vision tower; shares the audio encoder's operators.
 gufo_extension_target(
   NAME gufo_lfm3_vl
   SOURCES
