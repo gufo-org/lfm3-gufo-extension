@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "lfm3",
-  "api_version": ">= 0.1.12",
+  "api_version": ">= 0.1.19",
   "version": "0.4.0",
   "depends": [],
   "platforms": ["linux"],
@@ -16,6 +16,8 @@
     "gufo_lfm3_d1": { "requires": ["hip"] },
     "lfm3_config_test": { "requires": ["testing"], "role": "test" },
     "lfm3_ops_test": { "requires": ["hip", "testing"], "role": "test" },
+    "lfm3_continuation_layout_test": { "requires": ["testing"], "role": "test" },
+    "lfm3_continuation_adapter_test": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_session_test": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_probe": { "requires": ["testing"], "role": "test" },
     "lfm3_audio_test": { "requires": ["hip", "testing"], "role": "test" },

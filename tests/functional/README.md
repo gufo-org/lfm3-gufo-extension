@@ -3,7 +3,7 @@
 Model-owned HTTP and CLI checks for this extension, from the Gufo `lfm3`
 branch (`500df164`) with a reduced harness ([run.py](run.py) keeps only the
 owned-server lifecycle and provenance of Gufo's `tests/functional/run.py`).
-They need a Gufo built with this extension (extension API 0.1.12 or newer),
+They need a Gufo built with this extension (extension API 0.1.19 or newer),
 real weights and a GPU; missing weights are failures, not skips. Run them
 with the Gufo development shell's Python (`nix develop -c python3 ...` in a
 Gufo checkout). Each creates a fresh evidence directory.
