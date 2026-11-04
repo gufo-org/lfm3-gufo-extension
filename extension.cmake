@@ -4,6 +4,7 @@ gufo_extension_target(
   NAME gufo_lfm3
   SOURCES
     config.cpp
+    continuation_layout.cpp
     weights.cpp
     tokenizer.cpp
     chat_template.cpp
@@ -120,6 +121,7 @@ endif()
 gufo_extension_target(
   NAME gufo_lfm3_text
   SOURCES
+    continuation_adapter.cpp
     runner.cpp
     drivers.cpp
     provider.cpp
@@ -127,6 +129,7 @@ gufo_extension_target(
     gufo_lfm3_vl
     gufo_lfm3_hip
     gufo_lfm3
+    gufo_ext_cache
     gufo_ext_runtime
     hip::host
     Threads::Threads
@@ -186,6 +189,28 @@ if(TARGET lfm3_ops_test)
   add_test(NAME lfm3.ops COMMAND lfm3_ops_test)
   set_tests_properties(lfm3.ops PROPERTIES LABELS "lfm3;hip;gpu;gfx1151")
 endif()
+
+gufo_extension_target(
+  NAME lfm3_continuation_layout_test
+  SOURCES
+    tests/continuation_layout_test.cpp
+  LINK_LIBRARIES
+    gufo_lfm3
+    gufo_ext_runtime
+)
+
+gufo_extension_target(
+  NAME lfm3_continuation_adapter_test
+  SOURCES
+    tests/continuation_adapter_test.cpp
+  LINK_LIBRARIES
+    gufo_lfm3_text
+    gufo_lfm3_hip
+    gufo_lfm3
+    gufo_ext_cache
+    gufo_ext_runtime
+    hip::host
+)
 
 gufo_extension_target(
   NAME lfm3_session_test

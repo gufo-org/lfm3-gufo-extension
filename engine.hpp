@@ -5,7 +5,15 @@
 #include "tokenizer.hpp"
 #include "weights.hpp"
 namespace gufo::models::lfm3 {
+class ContinuationHooks;
 class Session;
+enum class ContinuationTensor {
+  kLogits,
+  kFrontier,
+  kConvolution,
+  kKey,
+  kValue
+};
 class Model : public std::enable_shared_from_this<Model> {
 public:
   ~Model();
@@ -82,9 +90,23 @@ public:
                        std::string* error = nullptr);
   bool ReadLogits(std::span<float> logits, std::string* error = nullptr) const;
 
+  // Continuation components. A session with hooks is owned by the cache
+  // adapter, which reads device state directly instead of through a snapshot.
+  void SetContinuationHooks(ContinuationHooks* hooks);
+  void* ContinuationData(ContinuationTensor tensor,
+                         std::size_t layer = 0) const;
+  std::uint32_t RingCapacity(std::size_t layer) const;
+  // False after a device error, until Reset.
+  bool IsCoherent() const;
+  // Completes the frontier's logits on this session's stream.
+  void PrepareLogits();
+  void BeginRestore();
+  void FinishRestore(std::uint32_t position);
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  ContinuationHooks* hooks_{};
   Session(std::shared_ptr<Model> model, std::uint32_t context);
   friend class Model;
 };

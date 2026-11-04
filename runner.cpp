@@ -2,14 +2,17 @@
 
 #include <algorithm>
 #include <cstring>
+#include <gufo/ext/component_cache_resources.hpp>
 #include <gufo/ext/gguf_identity.hpp>
 #include <gufo/ext/host_budget.hpp>
 #include <gufo/ext/sha256.hpp>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 #include "chat_template.hpp"
+#include "continuation_adapter.hpp"
 #include "vl/prompt.hpp"
 
 namespace gufo::models::lfm3 {
@@ -22,15 +25,25 @@ struct ImageContext final : TextPromptContext {
 
 class State final : public TextRunnerState {
 public:
-  std::unique_ptr<Session> session;
+  State(Session& session, cache::Adapter& adapter, cache::Slot& slot,
+        std::size_t vocabulary)
+      : session(&session),
+        logits(vocabulary),
+        adapter_(&adapter),
+        slot_(&slot) {}
+  Session* session;
   std::vector<float> logits;
   bool logits_ready{};
   std::shared_ptr<const ImageContext> input;
   std::vector<std::vector<float>> image_rows;
   void Invalidate() noexcept override {
-    (void)session->Reset();
+    (void)adapter_->Invalidate(*slot_);
     logits_ready = false;
   }
+
+private:
+  cache::Adapter* adapter_;
+  cache::Slot* slot_;
 };
 
 State& Get(TextRunnerState& state) {
@@ -43,15 +56,6 @@ void Require(bool ok, const std::string& error) {
   if (!ok)
     throw std::runtime_error(error);
 }
-
-class Lfm3Snapshot final : public TextRunnerSnapshot {
-public:
-  Lfm3Snapshot(std::shared_ptr<Model> owner, std::vector<std::uint8_t> payload)
-      : owner(std::move(owner)), payload(std::move(payload)) {}
-  std::size_t PayloadBytes() const noexcept override { return payload.size(); }
-  std::shared_ptr<Model> owner;
-  std::vector<std::uint8_t> payload;
-};
 
 class Runner final : public HipTextModelRunner {
 public:
@@ -80,7 +84,37 @@ public:
         identity += "vision=lfm3-vl-image-v1:" + vision_->Identity() + "\n";
       persistence_ = TextRunnerPersistenceDescriptor{
           {identity.begin(), identity.end()}, 1};
+      component_identity_ = persistence_->compatibility_identity;
+    } else {
+      // Without a file fingerprint the loaded model is the identity; durable
+      // caches require the validated artifact identity above.
+      std::ostringstream identity;
+      identity << "schema=gufo-process-text-continuation-v1\nmodel_instance="
+               << model_.get() << "\ncontext_tokens=" << context_ << '\n';
+      const auto canonical = identity.str();
+      component_identity_.assign(canonical.begin(), canonical.end());
     }
+  }
+  bool UsesComponentCache() const override { return true; }
+  std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+      cache::ResourceLedger& ledger, std::size_t) const override {
+    return hip::CreateHipComponentCacheResources(
+        std::make_unique<ContinuationAdapter>(model_, context_,
+                                              component_identity_),
+        ledger,
+        {[] { return HostSnapshotCeilingBytes(); }, [](std::string_view) {},
+         [](std::string_view) {}});
+  }
+  std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    auto& lfm3 = dynamic_cast<ContinuationAdapter&>(adapter);
+    return std::make_unique<State>(lfm3.GetSession(slot), adapter, slot,
+                                   model_->config().vocab);
+  }
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t) const override {
+    // The frontier changed under this state; read its logits on demand.
+    Get(state).logits_ready = false;
   }
   TextRunnerDescriptor Descriptor() const override {
     return {.model_id = vision_ ? "LFM3-VL-2B" : "LFM3-1.7B",
@@ -195,12 +229,8 @@ public:
     return model_->tokenizer().Decode(tokens);
   }
   std::unique_ptr<TextRunnerState> CreateState() const override {
-    std::string error;
-    auto s = std::make_unique<State>();
-    s->session = model_->CreateSession(context_, &error);
-    Require(bool(s->session), error);
-    s->logits.resize(model_->config().vocab);
-    return s;
+    throw std::logic_error(
+        "LFM3 execution slots are owned by the component cache");
   }
   TextPrefillStep Prefill(TextRunnerState& state,
                           std::span<const TextRunnerToken> prompt,
@@ -285,7 +315,7 @@ public:
     std::vector<std::span<float>> outputs;
     for (const auto& advance : advances) {
       auto& state = Get(advance.state.get());
-      sessions.push_back(state.session.get());
+      sessions.push_back(state.session);
       tokens.push_back(advance.token);
       outputs.emplace_back(state.logits);
     }
@@ -298,56 +328,7 @@ public:
     return Get(state).session->Position();
   }
 
-  std::size_t SnapshotPayloadBytes(
-      const TextRunnerState& state) const override {
-    return Get(state).session->SnapshotBytes();
-  }
-  std::unique_ptr<TextRunnerSnapshot> Snapshot(
-      const TextRunnerState& state) const override {
-    return std::make_unique<Lfm3Snapshot>(model_,
-                                          Get(state).session->SaveSnapshot());
-  }
-  void RestoreOrFork(TextRunnerState& state,
-                     const TextRunnerSnapshot& value) const override {
-    const auto& snapshot = CheckedSnapshot(value);
-    RestorePersistentSnapshot(state, snapshot.payload);
-  }
-  std::size_t PersistentSnapshotPayloadBytes(
-      const TextRunnerSnapshot& value) const override {
-    return CheckedSnapshot(value).payload.size();
-  }
-  std::size_t SerializePersistentSnapshot(
-      const TextRunnerSnapshot& value,
-      std::span<std::uint8_t> destination) const override {
-    const auto& payload = CheckedSnapshot(value).payload;
-    if (payload.size() != destination.size())
-      throw std::invalid_argument("invalid LFM3 snapshot destination");
-    std::copy(payload.begin(), payload.end(), destination.begin());
-    return payload.size();
-  }
-  void StreamPersistentSnapshot(const TextRunnerSnapshot& value,
-                                const SnapshotSink& sink) const override {
-    sink(CheckedSnapshot(value).payload);
-  }
-  void RestorePersistentSnapshot(
-      TextRunnerState& state,
-      std::span<const std::uint8_t> payload) const override {
-    auto& s = Get(state);
-    std::string error;
-    Require(s.session->RestoreSnapshot(payload, &error), error);
-    s.logits_ready = s.session->Position() != 0;
-    if (s.logits_ready)
-      Require(s.session->ReadLogits(s.logits, &error), error);
-  }
-
 private:
-  const Lfm3Snapshot& CheckedSnapshot(
-      const TextRunnerSnapshot& snapshot) const {
-    const auto* value = dynamic_cast<const Lfm3Snapshot*>(&snapshot);
-    if (!value || value->owner != model_)
-      throw std::invalid_argument("LFM3 snapshot belongs to a different model");
-    return *value;
-  }
   // Images extend the cache identity at their first token, with the
   // projector identity, placement, grid and processed pixels.
   std::optional<TextPreparedPrompt> PrepareImagePrompt(
@@ -388,6 +369,7 @@ private:
   std::shared_ptr<lfm3_vl::Vision> vision_;
   std::uint32_t context_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
+  cache::Identity component_identity_;
 };
 }  // namespace
 

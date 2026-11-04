@@ -11,8 +11,8 @@ backbone:
 - d1-Omni-2B decisions over text, images and audio, through `gufo decide` and
   `gufo serve decision` ([d1](docs/d1/README.md)).
 
-The speech and decision providers need a Gufo with extension API 0.1.12 or
-newer (Gufo [#942](https://github.com/gufo-org/gufo/pull/942)); see
+The extension needs a Gufo with extension API 0.1.19 or
+newer (Gufo [#1006](https://github.com/gufo-org/gufo/pull/1006)); see
 [TODO.md](TODO.md). Functional suites are in
 [tests/functional](tests/functional/README.md).
 
@@ -100,8 +100,9 @@ The native limit is a loader limit, not a qualification of maximum-depth quality
 or speed. HTTP supports Chat Completions, Responses and Messages, custom stops,
 structured JSON and native tool calls. Sessions have independent FP32 state;
 the scheduler batches up to eight autoregressive decode rows. RAM checkpoints,
-prefix reuse, cancellation recovery and restart-safe disk snapshots are wired
-through the shared serving cache. Speculative decoding and image inputs remain
+prefix reuse, cancellation recovery and restart-safe disk checkpoints use the
+component cache: full-attention rows are shared between checkpoints, while
+convolution state and sliding windows are private. Speculative decoding and image inputs remain
 unsupported. CLI chat retains its live prefix when framing permits.
 
 The full release API matrix still fails: several prompts produce unfinished

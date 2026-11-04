@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "continuation_hooks.hpp"
 #include "hip/ops.hpp"
 namespace gufo::models::lfm3 {
 namespace {
@@ -167,6 +168,15 @@ struct Session::Impl {
       }
       states.push_back(std::move(s));
     }
+  }
+  void EnsureLogits() {
+    if (logits_ready)
+      return;
+    gpu::Dense(model->impl_->weights.output, frontier.floats(), logits.floats(),
+               1, stream.value);
+    Check(hipGetLastError());
+    Check(hipStreamSynchronize(stream.value));
+    logits_ready = true;
   }
   // Rows of embeddings replace the token lookup when embeddings is set; it
   // holds n * hidden floats on the host, or on the device when on_device.
@@ -506,6 +516,9 @@ bool Session::Forward(std::span<const std::uint32_t> tokens,
     for (auto t : tokens)
       if (t >= c.vocab)
         throw std::invalid_argument("LFM3 token out of range");
+    if (hooks_)
+      hooks_->BeforeWrite(impl_->position,
+                          impl_->position + std::uint32_t(tokens.size()));
     for (std::size_t offset = 0; offset < tokens.size();
          offset += Impl::kChunk) {
       auto count = std::min(Impl::kChunk, tokens.size() - offset);
@@ -541,6 +554,9 @@ bool Session::ForwardEmbeddings(std::span<const float> rows, bool on_device,
         (!logits.empty() && logits.size() != c.vocab))
       throw std::invalid_argument(
           "invalid LFM3 embedding/logit count or context exhausted");
+    if (hooks_)
+      hooks_->BeforeWrite(impl_->position,
+                          impl_->position + std::uint32_t(n));
     for (std::size_t offset = 0; offset < n; offset += Impl::kChunk) {
       const auto count = std::min(Impl::kChunk, n - offset);
       try {
@@ -604,6 +620,10 @@ bool Session::ForwardBatch(std::span<Session* const> sessions,
         throw std::invalid_argument("incompatible LFM3 batch session");
       batch.push_back(state);
     }
+    for (auto* session : sessions)
+      if (session->hooks_)
+        session->hooks_->BeforeWrite(session->impl_->position,
+                                     session->impl_->position + 1);
     try {
       batch.front()->Run(tokens, true, batch);
       for (std::size_t i = 0; i < batch.size(); ++i)
@@ -643,6 +663,10 @@ bool Session::ForwardBatchInputs(std::span<Session* const> sessions,
         throw std::invalid_argument("incompatible LFM3 batch session");
       batch.push_back(state);
     }
+    for (auto* session : sessions)
+      if (session->hooks_)
+        session->hooks_->BeforeWrite(session->impl_->position,
+                                     session->impl_->position + 1);
     auto& front = *batch.front();
     const auto& w = front.model->impl_->weights;
     const auto H = w.config.hidden;
@@ -676,6 +700,8 @@ bool Session::ForwardBatchInputs(std::span<Session* const> sessions,
 }
 bool Session::Reset(std::string* error) {
   try {
+    if (hooks_)
+      hooks_->BeforeReset();
     Check(hipStreamSynchronize(impl_->stream.value));
     const auto& c = impl_->model->config();
     for (std::size_t i = 0; i < impl_->states.size(); ++i)
@@ -696,6 +722,43 @@ bool Session::Reset(std::string* error) {
 }
 std::uint32_t Session::Position() const {
   return impl_->position;
+}
+void Session::SetContinuationHooks(ContinuationHooks* hooks) {
+  hooks_ = hooks;
+}
+void* Session::ContinuationData(ContinuationTensor tensor,
+                                std::size_t layer) const {
+  switch (tensor) {
+    case ContinuationTensor::kLogits:
+      return impl_->logits.data;
+    case ContinuationTensor::kFrontier:
+      return impl_->frontier.data;
+    case ContinuationTensor::kConvolution:
+      return impl_->states[layer].conv.data;
+    case ContinuationTensor::kKey:
+      return impl_->states[layer].k.data;
+    case ContinuationTensor::kValue:
+      return impl_->states[layer].v.data;
+  }
+  return nullptr;
+}
+std::uint32_t Session::RingCapacity(std::size_t layer) const {
+  return impl_->states[layer].capacity;
+}
+bool Session::IsCoherent() const {
+  return !impl_->poisoned;
+}
+void Session::PrepareLogits() {
+  impl_->EnsureLogits();
+}
+void Session::BeginRestore() {
+  Check(hipStreamSynchronize(impl_->stream.value));
+  impl_->poisoned = true;
+}
+void Session::FinishRestore(std::uint32_t position) {
+  impl_->position = position;
+  impl_->logits_ready = true;
+  impl_->poisoned = false;
 }
 namespace {
 constexpr std::uint32_t kSnapshotMagic = 0x334d464c, kSnapshotVersion = 1;
@@ -752,13 +815,7 @@ bool Session::ReadLogits(std::span<float> output, std::string* error) const {
     const auto& c = impl_->model->config();
     if (impl_->poisoned || !impl_->position || output.size() != c.vocab)
       throw std::invalid_argument("invalid LFM3 logit frontier");
-    if (!impl_->logits_ready) {
-      gpu::Dense(impl_->model->impl_->weights.output, impl_->frontier.floats(),
-                 impl_->logits.floats(), 1, impl_->stream.value);
-      Check(hipGetLastError());
-      Check(hipStreamSynchronize(impl_->stream.value));
-      impl_->logits_ready = true;
-    }
+    impl_->EnsureLogits();
     Check(hipMemcpy(output.data(), impl_->logits.data, output.size_bytes(),
                     hipMemcpyDeviceToHost));
     return true;
@@ -816,6 +873,8 @@ std::vector<std::uint8_t> Session::SaveSnapshot() const {
 bool Session::RestoreSnapshot(std::span<const std::uint8_t> bytes,
                               std::string* error) {
   try {
+    if (hooks_)
+      hooks_->BeforeRestore();
     const auto& c = impl_->model->config();
     // Validate the complete header and size before touching the existing state.
     if (bytes.size() < kSnapshotHeaderBytes ||
