@@ -160,6 +160,13 @@ if(TARGET gufo_lfm3_d1)
   target_compile_options(gufo_lfm3_d1 PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
 endif()
 
+# gufo_ext_runtime only declares the public services; these link their
+# implementations into executables that stand apart from `gufo`.
+set(_gufo_lfm3_test_libs gufo_ext_core gufo_ext_cache)
+if(ENGINE_ENABLE_HIP)
+  list(APPEND _gufo_lfm3_test_libs gufo_ext_hip)
+endif()
+
 gufo_extension_target(
   NAME lfm3_config_test
   SOURCES
@@ -167,6 +174,7 @@ gufo_extension_target(
   LINK_LIBRARIES
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
 )
 
 if(TARGET lfm3_config_test)
@@ -182,6 +190,7 @@ gufo_extension_target(
     gufo_lfm3_hip
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
     hip::host
 )
 
@@ -197,6 +206,7 @@ gufo_extension_target(
   LINK_LIBRARIES
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
 )
 
 gufo_extension_target(
@@ -207,8 +217,8 @@ gufo_extension_target(
     gufo_lfm3_text
     gufo_lfm3_hip
     gufo_lfm3
-    gufo_ext_cache
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
     hip::host
 )
 
@@ -220,13 +230,15 @@ gufo_extension_target(
     gufo_lfm3_hip
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
     hip::host
 )
 
 if(ENGINE_ENABLE_HIP)
-  set(_gufo_lfm3_probe_libs gufo_lfm3_hip gufo_lfm3 gufo_ext_runtime hip::host)
+  set(_gufo_lfm3_probe_libs gufo_lfm3_hip gufo_lfm3 gufo_ext_runtime
+    ${_gufo_lfm3_test_libs} hip::host)
 else()
-  set(_gufo_lfm3_probe_libs gufo_lfm3 gufo_ext_runtime)
+  set(_gufo_lfm3_probe_libs gufo_lfm3 gufo_ext_runtime ${_gufo_lfm3_test_libs})
 endif()
 
 gufo_extension_target(
@@ -236,10 +248,6 @@ gufo_extension_target(
   LINK_LIBRARIES
     ${_gufo_lfm3_probe_libs}
 )
-
-if(ENGINE_ENABLE_HIP AND TARGET lfm3_probe)
-  target_compile_definitions(lfm3_probe PRIVATE ENGINE_ENABLE_HIP=1)
-endif()
 
 # LFM3-Audio host helpers: WAV, resampling, prompt framing; no weights.
 gufo_extension_target(
@@ -251,6 +259,7 @@ gufo_extension_target(
     gufo_lfm3_hip
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
     hip::host
 )
 
@@ -269,6 +278,7 @@ gufo_extension_target(
     gufo_lfm3_hip
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
     hip::host
 )
 
@@ -281,6 +291,7 @@ gufo_extension_target(
     gufo_lfm3_hip
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
     hip::host
 )
 
@@ -292,6 +303,7 @@ gufo_extension_target(
   LINK_LIBRARIES
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
 )
 
 if(TARGET lfm3_vl_contract_test)
@@ -311,10 +323,8 @@ gufo_extension_target(
     gufo_lfm3_hip
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
     hip::host
-    PNG::PNG
-    JPEG::JPEG
-    PkgConfig::WEBP
 )
 
 # d1 prompt layout, packing, box readout and calibration; no weights.
@@ -325,6 +335,7 @@ gufo_extension_target(
   LINK_LIBRARIES
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
 )
 
 if(TARGET d1_contract_test)
@@ -342,6 +353,7 @@ gufo_extension_target(
     gufo_lfm3_hip
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
     hip::host
 )
 
@@ -359,5 +371,6 @@ gufo_extension_target(
     gufo_lfm3_hip
     gufo_lfm3
     gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
     hip::host
 )

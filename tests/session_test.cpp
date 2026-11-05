@@ -6,7 +6,6 @@
 
 #include "../chat_template.hpp"
 #include "../engine.hpp"
-#include "gguf_test_shim.hpp"
 namespace l = gufo::models::lfm3;
 void Require(bool ok, const std::string& message) {
   if (!ok)

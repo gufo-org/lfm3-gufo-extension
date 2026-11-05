@@ -4,7 +4,6 @@
 
 #include "../d1/model.hpp"
 #include "../vl/vision.hpp"
-#include "gguf_test_shim.hpp"
 namespace d = gufo::models::d1;
 void Require(bool ok, const char* message) {
   if (!ok)

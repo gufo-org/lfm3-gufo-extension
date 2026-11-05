@@ -7,7 +7,6 @@
 #include <stdexcept>
 #include <vector>
 
-#include "gguf_test_shim.hpp"
 namespace g = gufo::models::lfm3::gpu;
 namespace {
 void Check(hipError_t e) {

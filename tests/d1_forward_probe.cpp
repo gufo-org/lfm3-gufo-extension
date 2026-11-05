@@ -4,7 +4,6 @@
 
 #include "../d1/model.hpp"
 #include "../engine.hpp"
-#include "gguf_test_shim.hpp"
 namespace d = gufo::models::d1;
 namespace l = gufo::models::lfm3;
 using gufo::json::Value;

@@ -9,7 +9,6 @@
 #include <string_view>
 #include <vector>
 
-#include "gguf_test_shim.hpp"
 
 namespace l = gufo::models::lfm3;
 namespace cache = gufo::cache;

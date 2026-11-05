@@ -8,7 +8,6 @@
 
 #include "../hip/ops.hpp"
 #include "../vl/hip/ops.hpp"
-#include "gguf_test_shim.hpp"
 void Check(hipError_t s) {
   if (s != hipSuccess)
     throw std::runtime_error(hipGetErrorString(s));

@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "../audio/generation.hpp"
-#include "gguf_test_shim.hpp"
 namespace audio = gufo::models::lfm3_audio;
 namespace {
 int failures = 0;

@@ -3,7 +3,6 @@
 
 #include "../chat_template.hpp"
 #include "../vl/vision.hpp"
-#include "gguf_test_shim.hpp"
 namespace vl = gufo::models::lfm3_vl;
 namespace l = gufo::models::lfm3;
 using gufo::ext::ChatMessage;

@@ -7,7 +7,6 @@
 #endif
 #include "../reference.hpp"
 #include "../tokenizer.hpp"
-#include "gguf_test_shim.hpp"
 int main(int argc, char** argv) {
   if (argc < 4) {
     std::cerr << "usage: lfm3_probe MODEL cpu|gpu OUTPUT [TOKEN ...]\n";
