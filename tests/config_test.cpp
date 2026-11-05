@@ -9,7 +9,6 @@
 #include "../chat_template.hpp"
 #include "../probe.hpp"
 #include "../tokenizer.hpp"
-#include "gguf_test_shim.hpp"
 
 namespace l = gufo::models::lfm3;
 namespace {

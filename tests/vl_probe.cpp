@@ -1,17 +1,11 @@
 #include <fstream>
+#include <gufo/ext/image.hpp>
 #include <gufo/ext/json.hpp>
 #include <iostream>
 #include <stdexcept>
 
 #include "../engine.hpp"
 #include "../vl/prompt.hpp"
-#include "gguf_test_shim.hpp"
-#include "image_test_shim.hpp"
-// The probe never asks for the projector cache identity, whose hashing lives
-// in the private core target.
-std::string gufo::core::GgufIdentityHex(const GgufReader&) {
-  throw std::logic_error("lfm3_vl_probe does not compute artifact identities");
-}
 namespace vl = gufo::models::lfm3_vl;
 namespace l = gufo::models::lfm3;
 using gufo::json::Value;
