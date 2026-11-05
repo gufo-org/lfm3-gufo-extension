@@ -3,7 +3,7 @@
 
 #include <functional>
 #include <gufo/ext/adapter.hpp>
-#include <gufo/ext/experimental/transfer_pool.hpp>
+#include <gufo/ext/transfer_pool.hpp>
 
 #include "continuation_layout.hpp"
 #include "engine.hpp"
