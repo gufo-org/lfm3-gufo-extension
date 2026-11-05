@@ -11,8 +11,8 @@ backbone:
 - d1-Omni-2B decisions over text, images and audio, through `gufo decide` and
   `gufo serve decision` ([d1](docs/d1/README.md)).
 
-The extension needs a Gufo with extension API 0.1.19 or
-newer (Gufo [#1006](https://github.com/gufo-org/gufo/pull/1006)); see
+The extension needs a Gufo with extension API 0.2.0 or
+newer (Gufo [#1026](https://github.com/gufo-org/gufo/pull/1026)); see
 [TODO.md](TODO.md). Functional suites are in
 [tests/functional](tests/functional/README.md).
 

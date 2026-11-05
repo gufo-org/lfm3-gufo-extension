@@ -82,9 +82,7 @@ public:
           "\nposition_policy=absolute-ring-v1\nadapters=none\n";
       if (vision_)
         identity += "vision=lfm3-vl-image-v1:" + vision_->Identity() + "\n";
-      persistence_ = TextRunnerPersistenceDescriptor{
-          {identity.begin(), identity.end()}, 1};
-      component_identity_ = persistence_->compatibility_identity;
+      component_identity_.assign(identity.begin(), identity.end());
     } else {
       // Without a file fingerprint the loaded model is the identity; durable
       // caches require the validated artifact identity above.
@@ -95,7 +93,6 @@ public:
       component_identity_.assign(canonical.begin(), canonical.end());
     }
   }
-  bool UsesComponentCache() const override { return true; }
   std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
       cache::ResourceLedger& ledger, std::size_t) const override {
     return hip::CreateHipComponentCacheResources(
@@ -122,13 +119,10 @@ public:
             .max_context = context_,
             .capabilities = {.supports_vision = vision_ != nullptr,
                              .incremental_prefill = true,
-                             .snapshot = true,
-                             .fork = true,
                              .final_token_advance_required = true,
                              .incremental_text_is_exact = true,
                              .prefix_reuse = true,
-                             .partial_prefill_retention = true},
-            .persistence = persistence_};
+                             .partial_prefill_retention = true}};
   }
   TextRunnerResourceClaim ResourceClaim() const override {
     return {.resident_weights_bytes = 0,
@@ -227,10 +221,6 @@ public:
   }
   std::string Decode(std::span<const TextRunnerToken> tokens) const override {
     return model_->tokenizer().Decode(tokens);
-  }
-  std::unique_ptr<TextRunnerState> CreateState() const override {
-    throw std::logic_error(
-        "LFM3 execution slots are owned by the component cache");
   }
   TextPrefillStep Prefill(TextRunnerState& state,
                           std::span<const TextRunnerToken> prompt,
@@ -368,7 +358,6 @@ private:
   std::shared_ptr<Model> model_;
   std::shared_ptr<lfm3_vl::Vision> vision_;
   std::uint32_t context_;
-  std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
 };
 }  // namespace
