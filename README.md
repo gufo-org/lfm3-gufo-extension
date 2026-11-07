@@ -118,3 +118,9 @@ text-only template. The tokenizer uses LFM2's Unicode split and byte-level BPE,
 including three-digit number groups.
 
 [Quality](docs/QUALITY.md) · [Benchmarks](docs/BENCHMARKS.md) · [Experiments](docs/EXPERIMENTS.md) · [LFM3-VL](docs/vl/README.md) · [LFM3-Audio](docs/audio/README.md) · [d1](docs/d1/README.md)
+
+## License
+
+The extension source is released under the [MIT License](LICENSE). Model
+weights are not part of this repository; each model keeps its own license
+(the LFM3 family uses the [LFM Open License](https://huggingface.co/LiquidAI/LFM3-1.7B/blob/main/LICENSE)).
