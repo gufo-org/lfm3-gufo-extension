@@ -73,6 +73,7 @@ gufo_extension_target(
     audio/speak.cpp
     audio/provider.cpp
   LINK_LIBRARIES
+    roc::hipblas
     gufo_lfm3_hip
     gufo_lfm3
     gufo_ext_runtime
