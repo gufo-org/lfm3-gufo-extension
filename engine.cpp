@@ -121,7 +121,8 @@ struct Session::Impl {
     std::uint32_t capacity{};
   };
   std::vector<State> states;
-  Buffer quantized, row_max, attention_scratch, frequencies, chunk_k, chunk_v;
+  Buffer quantized, row_max, split_partial, split_tickets, attention_scratch,
+      frequencies, chunk_k, chunk_v;
   Impl(std::shared_ptr<Model> m, std::uint32_t ctx, std::size_t rows = kChunk)
       : model(std::move(m)),
         context(ctx),
@@ -145,6 +146,10 @@ struct Session::Impl {
         std::max({c.hidden * 3, c.intermediate, c.heads * c.head_dim});
     quantized = Buffer(gpu::DenseWorkspaceBytes(rows, width));
     row_max = Buffer(rows * sizeof(unsigned));
+    split_partial = Buffer(gpu::SplitPartialBytes());
+    split_tickets = Buffer(gpu::kMaxSplitUnits * sizeof(unsigned));
+    Check(hipMemsetAsync(split_tickets.data, 0,
+                         gpu::kMaxSplitUnits * sizeof(unsigned), stream.value));
     attention_scratch =
         Buffer(gpu::AttentionScratchBytes(c.heads, c.head_dim, ctx, rows));
     // Global then sliding-window RoPE frequencies.
@@ -206,45 +211,74 @@ struct Session::Impl {
       Check(hipMemcpyAsync(decision_groups.data, groups.data(),
                            groups.size_bytes(), hipMemcpyHostToDevice, s));
     }
+    const gpu::DenseWorkspace workspace{
+        quantized.data, static_cast<unsigned*>(row_max.data),
+        split_partial.floats(), static_cast<unsigned*>(split_tickets.data)};
     auto dense = [&](const Tensor& weight, const float* input, float* output,
                      int count, hipStream_t stream) {
-      gpu::Dense(weight, input, output, count, stream, {quantized.data});
+      gpu::Dense(weight, input, output, count, stream, workspace);
     };
     auto norm = [&](const float* input, const Tensor& weight, float* output,
                     std::size_t count) {
       gpu::LaunchBatchedRMSNorm(input, static_cast<const float*>(weight.data),
                                 output, nullptr, count, weight.cols, c.eps, s);
     };
-    const gpu::DenseWorkspace workspace{quantized.data,
-                                        static_cast<unsigned*>(row_max.data)};
+    // Only the frontier row leaves the last layer, so trailing layers skip
+    // rows nothing reads. Walking back, a convolution needs conv_width - 1
+    // earlier rows for its outputs and history, and an attention layer
+    // needs every row for its K/V cache (a sliding one also for its ring).
+    // Layer i reads the last live_in[i] rows and updates the last
+    // live_out[i] rows of the residual stream.
+    const auto L = c.layers.size();
+    std::vector<std::size_t> live_in(L, n), live_out(L, n);
+    if (batch.empty() && !c.decision) {
+      std::size_t need = 1;
+      for (std::size_t i = L; i-- > 0;) {
+        if (c.layers[i] == LayerType::kSlidingAttention)
+          break;
+        live_out[i] = std::min(n, need);
+        if (c.layers[i] == LayerType::kFullAttention)
+          break;
+        need = std::min(n, need + c.conv_width - 1);
+        live_in[i] = need;
+      }
+    }
     // x += post(branch), then z = norm(x), split for the next projections
-    // when they all read split prompt inputs. Returns whether z was split.
+    // when they all read split prompt inputs, over the last rows rows.
+    // Returns whether z was split.
     auto residual_norm = [&](const float* branch, const Tensor* post,
                              const Tensor* next,
-                             std::span<const gpu::Output> consumers) {
-      const bool split = next && gpu::SharesSplit(consumers, n, workspace);
-      if (gpu::ResidualNorm(branch, post && post->data ? post : nullptr,
-                            x.floats(), next, z.floats(), n, c.hidden, c.eps,
-                            split, s, workspace))
+                             std::span<const gpu::Output> consumers,
+                             std::size_t rows) {
+      const auto o = (n - rows) * c.hidden;
+      if (branch)
+        branch += o;
+      float *xr = x.floats() + o, *zr = z.floats() + o;
+      const bool split = next && gpu::SharesSplit(consumers, rows, workspace);
+      if (gpu::ResidualNorm(branch, post && post->data ? post : nullptr, xr,
+                            next, zr, rows, c.hidden, c.eps, split, s,
+                            workspace))
         return split;
       if (branch) {
         if (post && post->data)
-          norm(branch, *post, out.floats(), n);
+          norm(branch, *post, out.floats() + o, rows);
         gpu::LaunchBatchedResidualAdd(
-            x.floats(), post && post->data ? out.floats() : branch, x.floats(),
-            n, c.hidden, s);
+            xr, post && post->data ? out.floats() + o : branch, xr, rows,
+            c.hidden, s);
       }
       if (next)
-        norm(x.floats(), *next, z.floats(), n);
+        norm(xr, *next, zr, rows);
       return false;
     };
-    // Projections reading the normalized input of layer i's mixer.
+    // Projections reading the normalized input of layer i's mixer, into its
+    // last live_in[i] rows.
     std::array<gpu::Output, 4> mixer;
     std::span<const gpu::Output> inputs;
     const auto mixer_inputs = [&](std::size_t i) {
       const auto& l = w.layers[i];
+      const auto o = n - live_in[i];
       if (c.layers[i] == LayerType::kConvolution) {
-        mixer[0] = {&l.in_proj, p.floats()};
+        mixer[0] = {&l.in_proj, p.floats() + o * 3 * c.hidden};
         return std::span<const gpu::Output>(mixer.data(), 1);
       }
       mixer = {{{&l.q, q.floats()},
@@ -254,15 +288,22 @@ struct Session::Impl {
       return std::span<const gpu::Output>(mixer);
     };
     inputs = mixer_inputs(0);
-    bool split = residual_norm(nullptr, nullptr, &w.layers[0].norm, inputs);
+    bool split =
+        residual_norm(nullptr, nullptr, &w.layers[0].norm, inputs, live_in[0]);
     for (std::size_t i = 0; i < c.layers.size(); ++i) {
       const auto& l = w.layers[i];
+      const auto rows_in = live_in[i], rows_out = live_out[i];
+      const auto o_in = n - rows_in, o = n - rows_out;
       if (c.layers[i] == LayerType::kConvolution) {
-        gpu::Project(inputs, z.floats(), n, s, workspace, split);
+        gpu::Project(inputs, z.floats() + o_in * c.hidden, rows_in, s,
+                     workspace, split);
         if (batch.empty()) {
-          gpu::ShortConv(p.floats(), static_cast<const float*>(l.conv.data),
-                         states[i].conv.floats(), a.floats(), n, c.hidden,
-                         c.conv_width, s);
+          // Rows before the first live one are not read: outputs that
+          // would need them are not live either.
+          gpu::ShortConv(p.floats() + o_in * 3 * c.hidden,
+                         static_cast<const float*>(l.conv.data),
+                         states[i].conv.floats(), a.floats() + o_in * c.hidden,
+                         rows_in, c.hidden, c.conv_width, s);
         } else
           for (std::size_t row = 0; row < batch.size(); ++row) {
             gpu::ShortConv(p.floats() + row * 3 * c.hidden,
@@ -271,19 +312,13 @@ struct Session::Impl {
                            a.floats() + row * c.hidden, 1, c.hidden,
                            c.conv_width, s);
           }
-        dense(l.out_proj, a.floats(), out.floats(), n, s);
+        dense(l.out_proj, a.floats() + o * c.hidden,
+              out.floats() + o * c.hidden, rows_out, s);
       } else {
         gpu::Project(inputs, z.floats(), n, s, workspace, split);
-        // Decode rows normalize, rotate and cache in one launch per row.
+        // Rows normalize, rotate and store K/V in one launch (per decode
+        // row).
         const bool rows = !batch.empty() || (n == 1 && !c.decision);
-        if (!rows) {
-          gpu::LaunchBatchedPerHeadRMSNorm(
-              q.floats(), static_cast<const float*>(l.q_norm.data), q.floats(),
-              n, c.heads, c.head_dim, c.eps, s);
-          gpu::LaunchBatchedPerHeadRMSNorm(
-              k.floats(), static_cast<const float*>(l.k_norm.data), k.floats(),
-              n, c.kv_heads[i], c.head_dim, c.eps, s);
-        }
         const bool swa = c.layers[i] == LayerType::kSlidingAttention;
         const auto* factors =
             swa ? nullptr : static_cast<const float*>(w.rope_freqs.data);
@@ -313,24 +348,30 @@ struct Session::Impl {
                            owner.attention_scratch.floats());
             return;
           }
-          gpu::Rope(qr, table, factors, count, c.heads, c.head_dim,
-                    owner.position, s);
-          gpu::Rope(kr, table, factors, count, c.kv_heads[i], c.head_dim,
-                    owner.position, s);
           // Full-attention rows never wrap, so the chunk is packed in place.
           // A sliding ring is written only after attention read its history.
           gpu::Half* kc = swa ? chunk_k.halves() : ck + owner.position * stride;
           gpu::Half* vc = swa ? chunk_v.halves() : cv + owner.position * stride;
-          gpu::PackKV(kr, vr, kc, vc, count * stride, s);
+          gpu::PromptHeads(qr, kr, vr, static_cast<const float*>(l.q_norm.data),
+                           static_cast<const float*>(l.k_norm.data), table,
+                           factors, kc, vc, count, c.heads, c.kv_heads[i],
+                           c.head_dim, owner.position, c.eps, s);
           if (c.decision && !swa)
             gpu::BidirectionalAttention(
                 qr, kc, vc, gr, ar, count, c.heads, c.kv_heads[i], s,
                 static_cast<const std::int32_t*>(decision_groups.data));
-          else
-            gpu::Attention(qr, kc, vc, gr, ck, cv, ar, count, c.heads,
-                           c.kv_heads[i], c.head_dim, owner.position,
-                           state.capacity, swa ? c.window : 0, s,
+          else {
+            // Only the last rows_out queries are live; the earlier chunk rows
+            // are already in the (full-attention) cache.
+            const auto skip = count - std::min(count, rows_out);
+            gpu::Attention(qr + skip * c.heads * c.head_dim, kc + skip * stride,
+                           vc + skip * stride, gr + skip * c.heads, ck, cv,
+                           ar + skip * c.heads * c.head_dim, count - skip,
+                           c.heads, c.kv_heads[i], c.head_dim,
+                           owner.position + skip, state.capacity,
+                           swa ? c.window : 0, s,
                            owner.attention_scratch.floats());
+          }
           if (swa)
             gpu::StoreKV(kc, vc, ck, cv, count, stride, owner.position,
                          state.capacity, s);
@@ -340,18 +381,23 @@ struct Session::Impl {
         else
           for (std::size_t row = 0; row < batch.size(); ++row)
             attend(*batch[row], row, 1);
-        dense(l.attn_out, a.floats(), out.floats(), n, s);
+        dense(l.attn_out, a.floats() + o * c.heads * c.head_dim,
+              out.floats() + o * c.hidden, rows_out, s);
       }
       const gpu::Output ffn[] = {{&l.gate, ff_gate.floats()},
                                  {&l.up, ff_up.floats()}};
-      split = residual_norm(out.floats(), &l.post_norm, &l.ffn_norm, ffn);
-      gpu::ProjectFfn(l.gate, l.up, l.down, z.floats(), ff_gate.floats(),
-                      ff_up.floats(), out.floats(), n, s, workspace, split);
+      split =
+          residual_norm(out.floats(), &l.post_norm, &l.ffn_norm, ffn, rows_out);
+      gpu::ProjectFfn(l.gate, l.up, l.down, z.floats() + o * c.hidden,
+                      ff_gate.floats(), ff_up.floats(),
+                      out.floats() + o * c.hidden, rows_out, s, workspace,
+                      split);
       const bool last = i + 1 == c.layers.size();
       if (!last)
         inputs = mixer_inputs(i + 1);
       split = residual_norm(out.floats(), &l.post_ffn_norm,
-                            last ? nullptr : &w.layers[i + 1].norm, inputs);
+                            last ? nullptr : &w.layers[i + 1].norm, inputs,
+                            rows_out);
     }
     if (batch.empty()) {
       norm(x.floats() + (n - 1) * c.hidden, w.output_norm, frontier.floats(),

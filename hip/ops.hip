@@ -919,6 +919,45 @@ __global__ void Convolution(const float* p, const float* w,
   }
   y[std::size_t(row) * H + ch] = sum * p[std::size_t(row) * 3 * H + H + ch];
 }
+// Convolution for a fixed width: a thread slides one channel's window down
+// kConvRows rows, forming each B*x product once; every output keeps the
+// per-row FMA order.
+constexpr int kConvRows = 16;
+template<int L>
+__global__ void ConvolutionWindow(const float* p, const float* w,
+                                  const float* history, float* y, int n,
+                                  int H) {
+  const int ch = blockIdx.x * blockDim.x + threadIdx.x,
+            first = blockIdx.y * kConvRows;
+  if (ch >= H)
+    return;
+  float taps[L], window[L];
+#pragma unroll
+  for (int t = 0; t < L; ++t)
+    taps[t] = w[ch * L + t];
+  const auto bx = [&](int source) {
+    return source >= 0 ? p[std::size_t(source) * 3 * H + ch] *
+                             p[std::size_t(source) * 3 * H + 2 * H + ch]
+                       : history[ch * (L - 1) + (L - 1) + source];
+  };
+  // window[t] holds the product of row - (L - 1) + t.
+#pragma unroll
+  for (int t = 0; t < L - 1; ++t)
+    window[t + 1] = bx(first - (L - 1) + t);
+  const int last = min(first + kConvRows, n);
+#pragma unroll 4
+  for (int row = first; row < last; ++row) {
+#pragma unroll
+    for (int t = 0; t < L - 1; ++t)
+      window[t] = window[t + 1];
+    window[L - 1] = bx(row);
+    float sum = 0;
+#pragma unroll
+    for (int t = 0; t < L; ++t)
+      sum = fmaf(taps[t], window[t], sum);
+    y[std::size_t(row) * H + ch] = sum * p[std::size_t(row) * 3 * H + H + ch];
+  }
+}
 // Runs after Convolution: keeps the last L - 1 B*x products.
 __global__ void ConvolutionHistory(const float* p, float* history, int n, int H,
                                    int L) {
@@ -962,11 +1001,13 @@ __global__ void Rotary(float* x, const float* frequencies, const float* factors,
     x[head * D + pair + D / 2] = b * cs + a * sn;
   }
 }
-// One decode row: per-head Q/K RMSNorm, RoPE and the K/V cache store in one
-// launch. A block of D / 2 threads owns a head and a thread owns one RoPE
-// pair, which are also the two elements it normalizes. The squares, their
-// tree reduction and every later expression repeat
+// Per-head Q/K RMSNorm, RoPE and the F16 K/V store of rows in one launch.
+// A block of D / 2 threads owns a head of row blockIdx.y and a thread owns
+// one RoPE pair, which are also the two elements it normalizes. The
+// squares, their tree reduction and every later expression repeat
 // BatchedPerHeadRMSNormKernel and Rotary exactly, so results are unchanged.
+// With capacity, the one decode row goes to ring slot position % capacity;
+// without, row r goes to row r of ck and cv.
 template<int D>
 __launch_bounds__(D / 2) __global__ void DecodeHeadsKernel(
     float* __restrict__ q, float* __restrict__ k, const float* __restrict__ v,
@@ -974,9 +1015,13 @@ __launch_bounds__(D / 2) __global__ void DecodeHeadsKernel(
     const float* __restrict__ frequencies, const float* __restrict__ factors,
     Half* __restrict__ ck, Half* __restrict__ cv, int heads, int kv_heads,
     int position, int capacity, float eps) {
-  const int head = blockIdx.x, pair = threadIdx.x;
+  const int head = blockIdx.x, pair = threadIdx.x, row = blockIdx.y;
   const bool is_key = head >= heads;
   const int kvh = head - heads;
+  q += std::size_t(row) * heads * D;
+  k += std::size_t(row) * kv_heads * D;
+  v += std::size_t(row) * kv_heads * D;
+  position += row;
   float* x = is_key ? k + kvh * D : q + head * D;
   const float* weight = is_key ? k_norm : q_norm;
   const float x0 = x[pair], x1 = x[pair + D / 2];
@@ -1009,7 +1054,8 @@ __launch_bounds__(D / 2) __global__ void DecodeHeadsKernel(
   if (!is_key)
     return;
   const std::size_t slot =
-      std::size_t(position % capacity) * kv_heads * D + kvh * D;
+      std::size_t(capacity ? position % capacity : row) * kv_heads * D +
+      kvh * D;
   const auto f16 = [](float x) {
     return __builtin_bit_cast(Half, static_cast<_Float16>(x));
   };
@@ -1243,6 +1289,8 @@ __launch_bounds__(256) __global__
   const int h = g * kGroup + wave % kGroup, w0 = q0 + wave / kGroup * 16;
   const int row = w0 + col, stride = kh * D;
   const bool live = row < n;
+  // Q carries the softmax scale in base-2 units before its split.
+  const float scale = rsqrtf(float(D)) * 1.44269504088896341F;
   v16h qf[kSteps], ql[kSteps];
   {
     const float* qr = q + (std::size_t(live ? row : 0) * heads + h) * D;
@@ -1250,8 +1298,12 @@ __launch_bounds__(256) __global__
     for (int s = 0; s < kSteps; ++s)
 #pragma unroll
       for (int c = 0; c < 4; ++c) {
-        const float4 f = live ? reinterpret_cast<const float4*>(qr)[s * 4 + c]
-                              : make_float4(0, 0, 0, 0);
+        float4 f = live ? reinterpret_cast<const float4*>(qr)[s * 4 + c]
+                        : make_float4(0, 0, 0, 0);
+        f.x *= scale;
+        f.y *= scale;
+        f.z *= scale;
+        f.w *= scale;
         qf[s][c * 4 + 0] = static_cast<_Float16>(f.x);
         qf[s][c * 4 + 1] = static_cast<_Float16>(f.y);
         qf[s][c * 4 + 2] = static_cast<_Float16>(f.z);
@@ -1272,7 +1324,9 @@ __launch_bounds__(256) __global__
   const int block_last = min(position + min(q0 + kQueries, n) - 1, span_last);
   const int wave_first = first_key(position + w0);
   const int wave_last = min(position + min(w0 + 16, n) - 1, span_last);
-  const float scale = rsqrtf(float(D)) * 1.44269504088896341F;
+  // Keys every query of the wave sees: tiles inside skip the mask.
+  const int open_first = first_key(position + min(w0 + 16, n) - 1);
+  const int open_last = min(position + w0, span_last);
   v8f acc[kSteps] = {};
   float maximum = -INFINITY, sum = 0;
   // K: 32 keys x 16 uint4 per tile, two per thread. V: lane owns a key and
@@ -1327,14 +1381,22 @@ __launch_bounds__(256) __global__
         s[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf, qf[st], s[kb]);
       }
     float tile_max = -INFINITY;
+    if (base >= open_first && base + kKeys - 1 <= open_last) {
 #pragma unroll
-    for (int kb = 0; kb < 2; ++kb)
+      for (int kb = 0; kb < 2; ++kb)
 #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        const int t = base + kb * 16 + 2 * i + half;
-        s[kb][i] = t >= lo && t <= hi ? s[kb][i] * scale : -INFINITY;
-        tile_max = fmaxf(tile_max, s[kb][i]);
-      }
+        for (int i = 0; i < 8; ++i)
+          tile_max = fmaxf(tile_max, s[kb][i]);
+    } else {
+#pragma unroll
+      for (int kb = 0; kb < 2; ++kb)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const int t = base + kb * 16 + 2 * i + half;
+          s[kb][i] = t >= lo && t <= hi ? s[kb][i] : -INFINITY;
+          tile_max = fmaxf(tile_max, s[kb][i]);
+        }
+    }
     tile_max = fmaxf(tile_max, OtherHalf(tile_max));
     const float next = fmaxf(maximum, tile_max);
     const float shift = next == -INFINITY ? 0 : next;
@@ -1357,9 +1419,11 @@ __launch_bounds__(256) __global__
                      unsigned(__builtin_bit_cast(Half, b)) << 16;
       }
     sum = sum * alpha + local;
+    // An unchanged maximum gives alpha == 1 exactly.
+    if (__builtin_amdgcn_ballot_w32(alpha != 1.0F))
 #pragma unroll
-    for (int t = 0; t < kSteps; ++t)
-      acc[t] *= alpha;
+      for (int t = 0; t < kSteps; ++t)
+        acc[t] *= alpha;
 #pragma unroll
     for (int kb = 0; kb < 2; ++kb) {
       // Key 2m comes from the first half's element m, key 2m + 1 from the
@@ -1832,18 +1896,70 @@ void Embed(const Tensor& w, const std::uint32_t* tokens, float* out, int n,
 std::size_t DenseWorkspaceBytes(std::size_t rows, std::size_t K) {
   return SplitActivationBytes(rows, K);
 }
+// The widest tile keeps 64 accumulators in each of 256 threads.
+std::size_t SplitPartialBytes() {
+  return std::size_t(kMaxSplitUnits) * 256 * 64 * sizeof(float);
+}
 namespace {
 bool SplitPrompt(const Tensor& w, int n, DenseWorkspace workspace) {
   return n >= 32 && w.type == core::GgmlType::kQ8_0 && workspace.quantized;
 }
+// Blocks of kernel resident at once on the device.
+template<auto kernel>
+int ResidentBlocks() {
+  static const int count = [] {
+    int device = 0, units = 0, per_unit = 0;
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipDeviceGetAttribute(&units, hipDeviceAttributeMultiprocessorCount,
+                              device) != hipSuccess ||
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_unit, kernel, 256,
+                                                     0) != hipSuccess)
+      return 0;
+    return units * per_unit;
+  }();
+  return count;
+}
+// Splits the tiles of the last, partial wave of resident blocks across K
+// when that shortens the launch. Time is counted in K blocks per wave; a
+// part costs about four more for its prologue and partial sums (measured
+// at LFM3's shapes).
+SplitK PlanSplit(int token_blocks, int tiles, int k_blocks, int resident,
+                 DenseWorkspace workspace) {
+  SplitK plan{token_blocks, tiles};
+  if (!workspace.partial || !workspace.tickets || resident <= 0)
+    return plan;
+  const int rest = tiles % resident;
+  if (!rest)
+    return plan;
+  constexpr double kPartCost = 4;
+  double best = k_blocks;
+  for (int parts = 2; parts <= kMaxSplitParts; ++parts) {
+    if (rest * parts > kMaxSplitUnits || k_blocks / parts < 8)
+      break;
+    const double time = (rest * parts + resident - 1) / resident *
+                        (double(k_blocks) / parts + kPartCost);
+    if (time < best) {
+      best = time;
+      plan.parts = parts;
+    }
+  }
+  if (plan.parts > 1) {
+    plan.split_from = tiles - rest;
+    plan.partial = workspace.partial;
+    plan.tickets = workspace.tickets;
+  }
+  return plan;
+}
 template<bool kSwiGLU = false, bool kRaw = false>
 void LaunchSplit(std::span<const Output> outputs, SplitActivations split, int n,
-                 int K, hipStream_t s) {
+                 int K, hipStream_t s, DenseWorkspace workspace = {}) {
   constexpr int BN = 64;
   Projections jobs{};
   jobs.count = int(outputs.size());
   int row_blocks = 0;
-  const bool wide = outputs[0].weight->rows >= 1024;
+  bool wide = false;
+  for (const auto& o : outputs)
+    wide = wide || o.weight->rows >= 1024;
   const int tile_rows = (wide ? 256 : 64) / (kSwiGLU ? 2 : 1);
   for (int i = 0; i < jobs.count; ++i) {
     const auto& w = *outputs[i].weight;
@@ -1852,15 +1968,20 @@ void LaunchSplit(std::span<const Output> outputs, SplitActivations split, int n,
     if (!kSwiGLU || i == 0)
       row_blocks += (int(w.rows) + tile_rows - 1) / tile_rows;
   }
-  const dim3 grid((n + BN - 1) / BN, row_blocks);
+  const int token_blocks = (n + BN - 1) / BN, tiles = token_blocks * row_blocks;
   if (kSwiGLU)
     jobs.count = 1;  // Both weights belong to every row block.
+  const auto launch = [&]<auto kernel>() {
+    const auto plan = kSwiGLU ? SplitK{token_blocks, tiles}
+                              : PlanSplit(token_blocks, tiles, K / 32,
+                                          ResidentBlocks<kernel>(), workspace);
+    const int units = plan.split_from + (tiles - plan.split_from) * plan.parts;
+    kernel<<<units, 256, 0, s>>>(jobs, split, n, K, plan);
+  };
   if (wide)
-    SplitQ8Gemm<256, BN, 8, 1, kSwiGLU, kRaw>
-        <<<grid, 256, 0, s>>>(jobs, split, n, K);
+    launch.template operator()<RegQ8Gemm<BN / 16, kSwiGLU, kRaw>>();
   else
-    SplitQ8Gemm<64, BN, 4, 2, kSwiGLU, kRaw>
-        <<<grid, 256, 0, s>>>(jobs, split, n, K);
+    launch.template operator()<SplitQ8Gemm<64, BN, 4, 2, kSwiGLU, kRaw>>();
 }
 }  // namespace
 // One-row Q8_0 projections of one input in a single launch; false when the
@@ -1924,15 +2045,9 @@ void Project(std::span<const Output> outputs, const float* x, int n,
   const auto split = SplitActivations::In(workspace.quantized, n, K);
   if (!split_ready)
     SplitRows<<<n, 256, 0, s>>>(x, split, K);
-  // Wide and narrow projections use different tiles.
-  Output wide[Projections::kMax], narrow[Projections::kMax];
-  std::size_t wide_count = 0, narrow_count = 0;
-  for (const auto& o : outputs)
-    (o.weight->rows >= 1024 ? wide[wide_count++] : narrow[narrow_count++]) = o;
-  if (wide_count)
-    LaunchSplit({wide, wide_count}, split, n, K, s);
-  if (narrow_count)
-    LaunchSplit({narrow, narrow_count}, split, n, K, s);
+  // With one wide projection all of them share its tiles; waves past a
+  // narrow projection's rows skip their products.
+  LaunchSplit(outputs, split, n, K, s, workspace);
 }
 void ProjectSwiGLU(const Tensor& gate, const Tensor& up, const float* x,
                    float* out, float* up_scratch, int n, hipStream_t s,
@@ -1970,7 +2085,7 @@ void ProjectFfn(const Tensor& gate, const Tensor& up, const Tensor& down,
     raw.raw = hidden;
     raw.row_max = workspace.row_max;
     const Output second[] = {{&down, out}};
-    LaunchSplit<false, true>(second, raw, n, down.cols, s);
+    LaunchSplit<false, true>(second, raw, n, down.cols, s, workspace);
     return;
   }
   ProjectSwiGLU(gate, up, x, hidden, up_scratch, n, s, workspace, split_ready);
@@ -2002,7 +2117,12 @@ void ShortConv(const float* p, const float* w, float* h, float* out, int n,
     ConvolutionStep<<<(H + 127) / 128, 128, 0, s>>>(p, w, h, out, H, L);
     return;
   }
-  Convolution<<<dim3((H + 127) / 128, n), 128, 0, s>>>(p, w, h, out, n, H, L);
+  if (L == 7)
+    ConvolutionWindow<7>
+        <<<dim3((H + 127) / 128, (n + kConvRows - 1) / kConvRows), 128, 0, s>>>(
+            p, w, h, out, n, H);
+  else
+    Convolution<<<dim3((H + 127) / 128, n), 128, 0, s>>>(p, w, h, out, n, H, L);
   ConvolutionHistory<<<(H + 127) / 128, 128, 0, s>>>(p, h, n, H, L);
 }
 void RopeFrequencies(float* out, int d, float theta, hipStream_t s) {
@@ -2015,7 +2135,7 @@ void Rope(float* x, const float* frequencies, const float* f, int n, int h,
   Rotary<<<(n * h + rows * kRopeRows - 1) / (rows * kRopeRows), threads, 0,
            s>>>(x, frequencies, f, n, h, d, p);
 }
-constexpr int kMinPromptSpan = 2048, kMaxPromptSplits = 16;
+constexpr int kMinPromptSpan = 2048, kMaxPromptSplits = 8;
 int PromptSplits(int keys, int& span) {
   span = std::max(kMinPromptSpan,
                   (keys + kMaxPromptSplits - 1) / kMaxPromptSplits);
@@ -2112,5 +2232,15 @@ void DecodeHeads(float* q, float* k, const float* v, const float* q_norm,
   DecodeHeadsKernel<128><<<heads + kv_heads, 64, 0, s>>>(
       q, k, v, q_norm, k_norm, frequencies, factors, ck, cv, heads, kv_heads, p,
       cap, eps);
+}
+void PromptHeads(float* q, float* k, const float* v, const float* q_norm,
+                 const float* k_norm, const float* frequencies,
+                 const float* factors, Half* k16, Half* v16, int n, int heads,
+                 int kv_heads, int d, int p, float eps, hipStream_t s) {
+  if (d != 128)
+    throw std::invalid_argument("LFM3 prompt heads need dimension 128");
+  DecodeHeadsKernel<128><<<dim3(heads + kv_heads, n), 64, 0, s>>>(
+      q, k, v, q_norm, k_norm, frequencies, factors, k16, v16, heads, kv_heads,
+      p, 0, eps);
 }
 }  // namespace gufo::models::lfm3::gpu
