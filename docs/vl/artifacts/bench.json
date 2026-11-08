@@ -1,0 +1,72 @@
+{
+  "schema": "gufo-model-bench/1",
+  "category": "llm",
+  "sampling": {
+    "temperature": 0,
+    "seed": 1
+  },
+  "gufo": {
+    "serve": [],
+    "llm": [
+      "--think",
+      "off",
+      "--max-pending-per-client",
+      "8"
+    ],
+    "readiness": "/ready"
+  },
+  "reference": {
+    "name": "llama.cpp",
+    "server": "llama-server",
+    "args": [
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "--cache-reuse",
+      "0",
+      "--jinja",
+      "--reasoning",
+      "off",
+      "--cache-ram",
+      "0"
+    ],
+    "endpoint_profile": "openai",
+    "readiness": "/health"
+  },
+  "model": {
+    "id": "LFM3-VL-2B",
+    "docs": "lfm3-vl",
+    "label": "LFM3-VL 2B Q8_0"
+  },
+  "files": {
+    "gguf": "LFM3-VL-2B-Q8_0.gguf",
+    "mmproj": "mmproj-LFM3-VL-2B-BF16.gguf"
+  },
+  "variants": {
+    "default": {
+      "label": "Q8_0",
+      "requires": [
+        "gguf",
+        "mmproj"
+      ]
+    }
+  },
+  "tables": {
+    "image-encoder": {
+      "title": "Image encoder",
+      "per_variant": false,
+      "sizes": [
+        256,
+        512,
+        768,
+        1024
+      ],
+      "warmup": 1,
+      "repetitions": 3,
+      "context": 8192,
+      "metric": "ms",
+      "better": "lower"
+    }
+  }
+}

@@ -5,6 +5,7 @@
 #include <gufo/ext/component_cache_resources.hpp>
 #include <gufo/ext/gguf_identity.hpp>
 #include <gufo/ext/host_budget.hpp>
+#include <gufo/ext/sampling.hpp>
 #include <gufo/ext/sha256.hpp>
 #include <sstream>
 #include <stdexcept>
@@ -22,6 +23,14 @@ using namespace gufo::ext;
 struct ImageContext final : TextPromptContext {
   lfm3_vl::Prompt prompt;
 };
+
+// LiquidAI's general recommendation (chat, tools, agents, coding), as in
+// the official generation_config.json, for either thinking mode.
+sampling::TextSamplingDefaults SamplingDefaults() {
+  const sampling::TextSamplingValues values{
+      .temperature = 0.1F, .top_k = 50, .repeat_penalty = 1.1F};
+  return {values, values, values};
+}
 
 class State final : public TextRunnerState {
 public:
@@ -123,6 +132,7 @@ public:
                              .incremental_text_is_exact = true,
                              .prefix_reuse = true,
                              .partial_prefill_retention = true},
+            .sampling_defaults = SamplingDefaults(),
             // Each prefill pass is the engine's 512-row workspace, the
             // host's decode-active budget. A pass that short gets one layer
             // group from the host, so passes run unsplit beside decoders.
@@ -288,12 +298,17 @@ public:
       s.logits_ready = true;
     }
     auto token = sampler.Sample(s.logits);
+    auto logprobs =
+        sampling::CollectLogprobs(s.logits, token, sampler.config().logprobs);
     if (state.stop_at_eos() && model_->tokenizer().IsStop(token))
-      return {.stop = true, .token = token, .piece = {}, .logprobs = {}};
+      return {.stop = true,
+              .token = token,
+              .piece = {},
+              .logprobs = std::move(logprobs)};
     return {.stop = false,
             .token = token,
             .piece = std::string(model_->tokenizer().Piece(token)),
-            .logprobs = {}};
+            .logprobs = std::move(logprobs)};
   }
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
     auto& s = Get(state);

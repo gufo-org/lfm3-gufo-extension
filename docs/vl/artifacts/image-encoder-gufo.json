@@ -1,0 +1,114 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.1.8",
+      "memoryTotalBytes": 134310215680,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "10.1.0",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "a568074ce6fb9029f7abb69112fa248ea6da887b8ad8287029f4126144caff1e",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-11-08",
+  "mode": null,
+  "model": {
+    "id": "LFM3-VL-2B",
+    "variant": null
+  },
+  "notes": [
+    "prompt_ms of a request with one gradient PNG and a one-line text turn, max_tokens 1, cache_prompt=false, 1 warm-up then 3 timed samples per size; includes the projector encode and the prefill of the image and text tokens on both servers"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "1024": {
+      "command": "gufo serve --port 60135 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
+      "ms": 1376.0,
+      "ms_sd": 8.0,
+      "prompt_n": [
+        1044,
+        1044,
+        1044
+      ],
+      "samples": 3
+    },
+    "256": {
+      "command": "gufo serve --port 60135 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
+      "ms": 92.4,
+      "ms_sd": 0.3,
+      "prompt_n": [
+        84,
+        84,
+        84
+      ],
+      "samples": 3
+    },
+    "512": {
+      "command": "gufo serve --port 60135 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
+      "ms": 218.4,
+      "ms_sd": 0.3,
+      "prompt_n": [
+        276,
+        276,
+        276
+      ],
+      "samples": 3
+    },
+    "768": {
+      "command": "gufo serve --port 60135 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
+      "ms": 556.2,
+      "ms_sd": 1.9,
+      "prompt_n": [
+        596,
+        596,
+        596
+      ],
+      "samples": 3
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "gufo",
+      "serve",
+      "--port",
+      "60135",
+      "--sessions",
+      "1",
+      "llm",
+      "--model",
+      "LFM3-VL-2B-Q8_0.gguf",
+      "--context",
+      "8192",
+      "--served-model-name",
+      "bench",
+      "--think",
+      "off",
+      "--max-pending-per-client",
+      "8",
+      "--mmproj",
+      "mmproj-LFM3-VL-2B-BF16.gguf",
+      "--max-request-bytes",
+      "67108864"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "12f8d8ab9a944b2df3efe388b44246ec37923c53"
+  },
+  "table": "image-encoder",
+  "target": "gufo"
+}
