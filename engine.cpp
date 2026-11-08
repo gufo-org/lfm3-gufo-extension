@@ -271,12 +271,16 @@ struct Session::Impl {
         dense(l.out_proj, a.floats(), out.floats(), n, s);
       } else {
         gpu::Project(inputs, z.floats(), n, s, workspace, split);
-        gpu::LaunchBatchedPerHeadRMSNorm(
-            q.floats(), static_cast<const float*>(l.q_norm.data), q.floats(), n,
-            c.heads, c.head_dim, c.eps, s);
-        gpu::LaunchBatchedPerHeadRMSNorm(
-            k.floats(), static_cast<const float*>(l.k_norm.data), k.floats(), n,
-            c.kv_heads[i], c.head_dim, c.eps, s);
+        // Decode rows normalize, rotate and cache in one launch per row.
+        const bool rows = !batch.empty() || (n == 1 && !c.decision);
+        if (!rows) {
+          gpu::LaunchBatchedPerHeadRMSNorm(
+              q.floats(), static_cast<const float*>(l.q_norm.data), q.floats(),
+              n, c.heads, c.head_dim, c.eps, s);
+          gpu::LaunchBatchedPerHeadRMSNorm(
+              k.floats(), static_cast<const float*>(l.k_norm.data), k.floats(),
+              n, c.kv_heads[i], c.head_dim, c.eps, s);
+        }
         const bool swa = c.layers[i] == LayerType::kSlidingAttention;
         const auto* factors =
             swa ? nullptr : static_cast<const float*>(w.rope_freqs.data);
@@ -288,6 +292,20 @@ struct Session::Impl {
           auto* vr = v.floats() + row * c.kv_heads[i] * c.head_dim;
           const float* table =
               frequencies.floats() + (swa ? c.head_dim / 2 : 0);
+          if (rows) {
+            gpu::DecodeHeads(
+                qr, kr, vr, static_cast<const float*>(l.q_norm.data),
+                static_cast<const float*>(l.k_norm.data), table, factors,
+                state.k.floats(), state.v.floats(), c.heads, c.kv_heads[i],
+                c.head_dim, owner.position, state.capacity, c.eps, s);
+            gpu::Attention(qr, kr, vr, gate.floats() + row * c.heads,
+                           state.k.floats(), state.v.floats(),
+                           a.floats() + row * c.heads * c.head_dim, 1, c.heads,
+                           c.kv_heads[i], c.head_dim, owner.position,
+                           state.capacity, swa ? c.window : 0, s,
+                           owner.attention_scratch.floats());
+            return;
+          }
           gpu::Rope(qr, table, factors, count, c.heads, c.head_dim,
                     owner.position, s);
           gpu::Rope(kr, table, factors, count, c.kv_heads[i], c.head_dim,

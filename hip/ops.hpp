@@ -77,6 +77,14 @@ void SelectRows(const Tensor& source, const std::uint32_t* rows, void* out,
                 int count, hipStream_t stream);
 void StoreKV(const float* k, const float* v, float* cache_k, float* cache_v,
              int n, int stride, int position, int capacity, hipStream_t stream);
+// One decode row: per-head Q/K RMSNorm, RoPE and the K/V cache store in one
+// launch; the same results as the separate launches. Attention reads the
+// current row from k and v, so storing first is equivalent.
+void DecodeHeads(float* q, float* k, const float* v, const float* q_norm,
+                 const float* k_norm, const float* frequencies,
+                 const float* factors, float* cache_k, float* cache_v,
+                 int heads, int kv_heads, int dim, int position, int capacity,
+                 float eps, hipStream_t stream);
 
 void LaunchBatchedRMSNorm(const float* x, const float* weight, float* out,
                           void* out_bf16, std::size_t batch_size,

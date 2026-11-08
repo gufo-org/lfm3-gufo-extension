@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <gufo/ext/experimental/ggml_dequant.hpp>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -300,27 +301,12 @@ __global__ void FastGEMVBlockKernel(const void* __restrict__ A,
   }
 }
 
-template<std::uint32_t WavesPerBlock>
-__launch_bounds__(WavesPerBlock * 32, 4) __global__
-    void Q8_0GEMVKernel_2Rows(const void* __restrict__ A,
-                              const float* __restrict__ x,
-                              float* __restrict__ y, std::size_t M,
-                              std::size_t K) {
-  const std::size_t tid = threadIdx.x;
-  const std::size_t lane_id = tid & 31u;
-  const std::size_t warp_id = tid >> 5u;
-  const std::size_t pair_idx = (blockIdx.x * WavesPerBlock) + warp_id;
-  const std::size_t m0 = pair_idx * 2;
-  const std::size_t m1 = m0 + 1;
-  if (m0 >= M)
-    return;
-
-  const std::size_t num_blocks = K / kQ8_0BlockSize;
-  const auto* row0_blocks =
-      static_cast<const Q8_0Block*>(A) + (m0 * num_blocks);
-  const auto* row1_blocks =
-      (m1 < M) ? (static_cast<const Q8_0Block*>(A) + (m1 * num_blocks))
-               : nullptr;
+// Two Q8_0 rows dotted with x by one wave; row1_blocks may be null. Every
+// GEMV entry point shares this reduction order.
+__device__ __forceinline__ void Q8_0Dot2(
+    const Q8_0Block* __restrict__ row0_blocks,
+    const Q8_0Block* __restrict__ row1_blocks, const float* __restrict__ x,
+    std::size_t num_blocks, std::size_t lane_id, float& out0, float& out1) {
   float sum0 = 0.0F;
   float sum1 = 0.0F;
 
@@ -349,7 +335,75 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
     sum0 += __shfl_xor(sum0, off);
     sum1 += __shfl_xor(sum1, off);
   }
-
+  out0 = sum0;
+  out1 = sum1;
+}
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Q8_0GEMVKernel_2Rows(const void* __restrict__ A,
+                              const float* __restrict__ x,
+                              float* __restrict__ y, std::size_t M,
+                              std::size_t K) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t pair_idx = (blockIdx.x * WavesPerBlock) + warp_id;
+  const std::size_t m0 = pair_idx * 2;
+  const std::size_t m1 = m0 + 1;
+  if (m0 >= M)
+    return;
+  const std::size_t num_blocks = K / kQ8_0BlockSize;
+  const auto* blocks = static_cast<const Q8_0Block*>(A);
+  float sum0, sum1;
+  Q8_0Dot2(blocks + m0 * num_blocks,
+           m1 < M ? blocks + m1 * num_blocks : nullptr, x, num_blocks, lane_id,
+           sum0, sum1);
+  if (lane_id == 0) {
+    y[m0] = sum0;
+    if (m1 < M)
+      y[m1] = sum1;
+  }
+}
+// Up to four Q8_0 GEMVs of one input in a single launch, each owning a
+// contiguous range of blocks. With kSwiGLU, a wave dots row m of job 0 (gate)
+// and of job 1 (up) and writes silu(gate) * up to job 0's output.
+template<std::uint32_t WavesPerBlock, bool kSwiGLU>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Q8_0MultiGEMV(Projections jobs, const float* __restrict__ x,
+                       std::size_t K) {
+  int job = 0;
+  for (int j = 1; j < jobs.count; ++j)
+    if (int(blockIdx.x) >= jobs.first_block[j])
+      job = j;
+  const std::size_t lane_id = threadIdx.x & 31u;
+  const std::size_t unit =
+      (blockIdx.x - jobs.first_block[job]) * WavesPerBlock +
+      (threadIdx.x >> 5u);
+  const std::size_t M = jobs.job[job].rows;
+  const std::size_t num_blocks = K / kQ8_0BlockSize;
+  const auto* blocks = static_cast<const Q8_0Block*>(jobs.job[job].weight);
+  float sum0, sum1;
+  if constexpr (kSwiGLU) {
+    if (unit >= M)
+      return;
+    Q8_0Dot2(
+        blocks + unit * num_blocks,
+        static_cast<const Q8_0Block*>(jobs.job[1].weight) + unit * num_blocks,
+        x, num_blocks, lane_id, sum0, sum1);
+    if (lane_id == 0) {
+      // BatchedSwiGLUActivationKernel's formula.
+      const float sig_g = 1.0F / (1.0F + expf(-sum0));
+      jobs.job[0].out[unit] = (sum0 * sig_g) * sum1;
+    }
+    return;
+  }
+  const std::size_t m0 = unit * 2, m1 = m0 + 1;
+  if (m0 >= M)
+    return;
+  Q8_0Dot2(blocks + m0 * num_blocks,
+           m1 < M ? blocks + m1 * num_blocks : nullptr, x, num_blocks, lane_id,
+           sum0, sum1);
+  float* y = jobs.job[job].out;
   if (lane_id == 0) {
     y[m0] = sum0;
     if (m1 < M)
@@ -907,6 +961,76 @@ __global__ void Rotary(float* x, const float* frequencies, const float* factors,
     x[head * D + pair] = a * cs - b * sn;
     x[head * D + pair + D / 2] = b * cs + a * sn;
   }
+}
+// One decode row: per-head Q/K RMSNorm, RoPE and the K/V cache store in one
+// launch. A block of D / 2 threads owns a head and a thread owns one RoPE
+// pair, which are also the two elements it normalizes. The squares, their
+// tree reduction and every later expression repeat
+// BatchedPerHeadRMSNormKernel and Rotary exactly, so results are unchanged.
+template<int D>
+__launch_bounds__(D / 2) __global__ void DecodeHeadsKernel(
+    float* __restrict__ q, float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ q_norm, const float* __restrict__ k_norm,
+    const float* __restrict__ frequencies, const float* __restrict__ factors,
+    float* __restrict__ ck, float* __restrict__ cv, int heads, int kv_heads,
+    int position, int capacity, float eps) {
+  const int head = blockIdx.x, pair = threadIdx.x;
+  const bool is_key = head >= heads;
+  const int kvh = head - heads;
+  float* x = is_key ? k + kvh * D : q + head * D;
+  const float* weight = is_key ? k_norm : q_norm;
+  const float x0 = x[pair], x1 = x[pair + D / 2];
+  // The original 256-thread tree: stride 128 adds zeros, stride 64 pairs
+  // element i with i + 64, then halves down to one.
+  __shared__ float s_sum[D / 2];
+  {
+    // Both squares round before the add, as two separate threads did.
+#pragma clang fp contract(off)
+    s_sum[pair] = x0 * x0 + x1 * x1;
+  }
+  __syncthreads();
+  for (int stride = D / 4; stride > 0; stride /= 2) {
+    if (pair < stride)
+      s_sum[pair] += s_sum[pair + stride];
+    __syncthreads();
+  }
+  const float mean_sq = s_sum[0] / static_cast<float>(D);
+  const float inv_rms = rsqrtf(mean_sq + eps);
+  const float a = (x0 * inv_rms) * weight[pair],
+              b = (x1 * inv_rms) * weight[pair + D / 2];
+  float angle = position * frequencies[pair];
+  if (factors)
+    angle /= factors[pair];
+  float sn, cs;
+  sincosf(angle, &sn, &cs);
+  const float r0 = a * cs - b * sn, r1 = b * cs + a * sn;
+  x[pair] = r0;
+  x[pair + D / 2] = r1;
+  if (!is_key)
+    return;
+  const std::size_t slot =
+      std::size_t(position % capacity) * kv_heads * D + kvh * D;
+  ck[slot + pair] = r0;
+  ck[slot + pair + D / 2] = r1;
+  cv[slot + pair] = v[kvh * D + pair];
+  cv[slot + pair + D / 2] = v[kvh * D + pair + D / 2];
+}
+// One-row convolution and history update by the owner of each channel, with
+// Convolution's and ConvolutionHistory's expressions.
+__global__ void ConvolutionStep(const float* p, const float* w, float* history,
+                                float* y, int H, int L) {
+  int ch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ch >= H)
+    return;
+  float* own = history + ch * (L - 1);
+  const float current = p[ch] * p[2 * H + ch];
+  float sum = 0;
+  for (int t = 0; t < L; ++t)
+    sum = fmaf(w[ch * L + t], t == L - 1 ? current : own[t], sum);
+  y[ch] = sum * p[H + ch];
+  for (int j = 0; j < L - 2; ++j)
+    own[j] = own[j + 1];
+  own[L - 2] = current;
 }
 // One wave owns a query/head. Four independent dot chains preserve the
 // original four 32-lane sums, without a block barrier for every cached token.
@@ -1589,6 +1713,34 @@ void LaunchSplit(std::span<const Output> outputs, SplitActivations split, int n,
         <<<grid, 256, 0, s>>>(jobs, split, n, K);
 }
 }  // namespace
+// One-row Q8_0 projections of one input in a single launch; false when the
+// weights do not qualify.
+template<bool kSwiGLU>
+bool LaunchMultiGEMV(std::span<const Output> outputs, const float* x,
+                     hipStream_t s) {
+  constexpr std::uint32_t kWaves = 4;
+  if (outputs.size() > Projections::kMax)
+    return false;
+  Projections jobs{};
+  jobs.count = int(outputs.size());
+  int blocks = 0;
+  for (int i = 0; i < jobs.count; ++i) {
+    const auto& w = *outputs[i].weight;
+    if (w.type != core::GgmlType::kQ8_0 || w.cols != outputs[0].weight->cols ||
+        w.cols % kQ8_0BlockSize)
+      return false;
+    jobs.job[i] = {w.data, outputs[i].out, int(w.rows)};
+    jobs.first_block[i] = blocks;
+    const int units = kSwiGLU ? int(w.rows) : (int(w.rows) + 1) / 2;
+    if (!kSwiGLU || i == 0)
+      blocks += (units + kWaves - 1) / kWaves;
+  }
+  if (kSwiGLU)
+    jobs.count = 1;
+  Q8_0MultiGEMV<kWaves, kSwiGLU>
+      <<<blocks, kWaves * 32, 0, s>>>(jobs, x, outputs[0].weight->cols);
+  return true;
+}
 bool SharesSplit(std::span<const Output> outputs, int n,
                  DenseWorkspace workspace) {
   bool shared = outputs.size() <= Projections::kMax;
@@ -1612,6 +1764,8 @@ bool ResidualNorm(const float* branch, const Tensor* post_norm, float* x,
 void Project(std::span<const Output> outputs, const float* x, int n,
              hipStream_t s, DenseWorkspace workspace, bool split_ready) {
   const auto K = outputs[0].weight->cols;
+  if (n == 1 && LaunchMultiGEMV<false>(outputs, x, s))
+    return;
   if (!SharesSplit(outputs, n, workspace)) {
     for (const auto& o : outputs)
       Dense(*o.weight, x, o.out, n, s, workspace);
@@ -1641,6 +1795,8 @@ void ProjectSwiGLU(const Tensor& gate, const Tensor& up, const float* x,
     LaunchSplit<true>(outputs, split, n, gate.cols, s);
     return;
   }
+  if (n == 1 && gate.rows == up.rows && LaunchMultiGEMV<true>(outputs, x, s))
+    return;
   Dense(gate, x, out, n, s, workspace);
   Dense(up, x, up_scratch, n, s, workspace);
   LaunchBatchedSwiGLUActivation(out, up_scratch, out, nullptr,
@@ -1692,6 +1848,10 @@ void Dense(const Tensor& w, const float* x, float* out, int n, hipStream_t s,
 }
 void ShortConv(const float* p, const float* w, float* h, float* out, int n,
                int H, int L, hipStream_t s) {
+  if (n == 1) {
+    ConvolutionStep<<<(H + 127) / 128, 128, 0, s>>>(p, w, h, out, H, L);
+    return;
+  }
   Convolution<<<dim3((H + 127) / 128, n), 128, 0, s>>>(p, w, h, out, n, H, L);
   ConvolutionHistory<<<(H + 127) / 128, 128, 0, s>>>(p, h, n, H, L);
 }
@@ -1705,7 +1865,7 @@ void Rope(float* x, const float* frequencies, const float* f, int n, int h,
   Rotary<<<(n * h + rows * kRopeRows - 1) / (rows * kRopeRows), threads, 0,
            s>>>(x, frequencies, f, n, h, d, p);
 }
-constexpr int kMinPromptSpan = 8192, kMaxPromptSplits = 16;
+constexpr int kMinPromptSpan = 2048, kMaxPromptSplits = 16;
 int PromptSplits(int keys, int& span) {
   span = std::max(kMinPromptSpan,
                   (keys + kMaxPromptSplits - 1) / kMaxPromptSplits);
@@ -1785,5 +1945,16 @@ void StoreKV(const float* k, const float* v, float* ck, float* cv, int n,
              int stride, int p, int cap, hipStream_t s) {
   Cache<<<(std::size_t(std::min(n, cap)) * stride + 255) / 256, 256, 0, s>>>(
       k, v, ck, cv, n, stride, p, cap);
+}
+void DecodeHeads(float* q, float* k, const float* v, const float* q_norm,
+                 const float* k_norm, const float* frequencies,
+                 const float* factors, float* ck, float* cv, int heads,
+                 int kv_heads, int d, int p, int cap, float eps,
+                 hipStream_t s) {
+  if (d != 128)
+    throw std::invalid_argument("LFM3 decode heads need dimension 128");
+  DecodeHeadsKernel<128><<<heads + kv_heads, 64, 0, s>>>(
+      q, k, v, q_norm, k_norm, frequencies, factors, ck, cv, heads, kv_heads, p,
+      cap, eps);
 }
 }  // namespace gufo::models::lfm3::gpu
