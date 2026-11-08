@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -9,10 +10,20 @@
 namespace gufo::models::lfm3 {
 namespace {
 
-bool IsGguf(const std::filesystem::path& path) {
+// Directory scans select GGUF files by name. An explicit path is recognized
+// by content instead: Gufo resolves links before probing, and a Hugging Face
+// cache link resolves to an extensionless blob named by its hash.
+enum class Naming { kScanned, kExplicit };
+
+bool IsGguf(const std::filesystem::path& path, Naming naming) {
   std::error_code ec;
-  return path.extension() == ".gguf" &&
-         std::filesystem::is_regular_file(path, ec);
+  if (!std::filesystem::is_regular_file(path, ec))
+    return false;
+  if (naming == Naming::kScanned)
+    return path.extension() == ".gguf";
+  char magic[4]{};
+  std::ifstream in(path, std::ios::binary);
+  return in.read(magic, sizeof magic) && std::equal(magic, magic + 4, "GGUF");
 }
 
 bool IsMmprojName(const std::filesystem::path& path) {
@@ -20,26 +31,28 @@ bool IsMmprojName(const std::filesystem::path& path) {
 }
 
 std::unique_ptr<core::GgufReader> OpenBackbone(
-    const std::filesystem::path& path) {
-  if (!IsGguf(path) || IsMmprojName(path))
+    const std::filesystem::path& path, Naming naming) {
+  if (!IsGguf(path, naming) ||
+      (naming == Naming::kScanned && IsMmprojName(path)))
     return nullptr;
   std::string error;
   return core::GgufReader::OpenFile(path.string(), &error);
 }
 
-bool IsLfm3AudioBackbone(const std::filesystem::path& path) {
-  auto reader = OpenBackbone(path);
+bool IsLfm3AudioBackbone(const std::filesystem::path& path, Naming naming) {
+  auto reader = OpenBackbone(path, naming);
   return reader && ProbeLfm3Gguf(*reader) &&
          reader->GetMetadataString("general.basename") == "LFM3-Audio";
 }
 
-bool IsD1Backbone(const std::filesystem::path& path) {
-  auto reader = OpenBackbone(path);
+bool IsD1Backbone(const std::filesystem::path& path, Naming naming) {
+  auto reader = OpenBackbone(path, naming);
   return reader && ProbeD1Gguf(*reader);
 }
 
-bool IsLfm3AudioMmproj(const std::filesystem::path& path) {
-  if (!IsGguf(path) || !IsMmprojName(path))
+bool IsLfm3AudioMmproj(const std::filesystem::path& path, Naming naming) {
+  if (!IsGguf(path, naming) ||
+      (naming == Naming::kScanned && !IsMmprojName(path)))
     return false;
   std::string error;
   auto reader = core::GgufReader::OpenFile(path.string(), &error);
@@ -51,11 +64,11 @@ bool IsLfm3AudioMmproj(const std::filesystem::path& path) {
 
 std::vector<std::filesystem::path> Entries(
     const std::filesystem::path& dir,
-    bool (*keep)(const std::filesystem::path&)) {
+    bool (*keep)(const std::filesystem::path&, Naming)) {
   std::vector<std::filesystem::path> found;
   std::error_code ec;
   for (const auto& entry : std::filesystem::directory_iterator(dir, ec))
-    if (keep(entry.path()))
+    if (keep(entry.path(), Naming::kScanned))
       found.push_back(entry.path());
   return found;
 }
@@ -99,12 +112,13 @@ namespace {
 // model_root is a backbone file, or a directory holding exactly one.
 std::optional<std::filesystem::path> FindBackbone(
     std::string_view model_root,
-    bool (*is_backbone)(const std::filesystem::path&), std::string_view family,
-    std::string* error) {
+    bool (*is_backbone)(const std::filesystem::path&, Naming),
+    std::string_view family, std::string* error) {
   std::filesystem::path backbone(model_root);
   std::error_code ec;
   if (!std::filesystem::is_directory(backbone, ec))
-    return is_backbone(backbone) ? std::optional(backbone) : std::nullopt;
+    return is_backbone(backbone, Naming::kExplicit) ? std::optional(backbone)
+                                                    : std::nullopt;
   const auto found = Entries(backbone, is_backbone);
   if (found.size() > 1)
     *error = "several " + std::string(family) + " GGUF files in " +
@@ -125,7 +139,8 @@ std::optional<Lfm3AudioArtifacts> FindLfm3Audio(std::string_view model_root,
     if (!backbone)
       return std::nullopt;
     if (!mmproj.empty()) {
-      if (!IsLfm3AudioMmproj(std::filesystem::path(mmproj))) {
+      if (!IsLfm3AudioMmproj(std::filesystem::path(mmproj),
+                             Naming::kExplicit)) {
         *error =
             "--mmproj is not an LFM3-Audio mmproj GGUF: " + std::string(mmproj);
         return std::nullopt;
