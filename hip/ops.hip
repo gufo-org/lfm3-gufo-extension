@@ -1243,6 +1243,8 @@ __launch_bounds__(256) __global__
   const int h = g * kGroup + wave % kGroup, w0 = q0 + wave / kGroup * 16;
   const int row = w0 + col, stride = kh * D;
   const bool live = row < n;
+  // Q carries the softmax scale in base-2 units before its split.
+  const float scale = rsqrtf(float(D)) * 1.44269504088896341F;
   v16h qf[kSteps], ql[kSteps];
   {
     const float* qr = q + (std::size_t(live ? row : 0) * heads + h) * D;
@@ -1250,8 +1252,12 @@ __launch_bounds__(256) __global__
     for (int s = 0; s < kSteps; ++s)
 #pragma unroll
       for (int c = 0; c < 4; ++c) {
-        const float4 f = live ? reinterpret_cast<const float4*>(qr)[s * 4 + c]
-                              : make_float4(0, 0, 0, 0);
+        float4 f = live ? reinterpret_cast<const float4*>(qr)[s * 4 + c]
+                        : make_float4(0, 0, 0, 0);
+        f.x *= scale;
+        f.y *= scale;
+        f.z *= scale;
+        f.w *= scale;
         qf[s][c * 4 + 0] = static_cast<_Float16>(f.x);
         qf[s][c * 4 + 1] = static_cast<_Float16>(f.y);
         qf[s][c * 4 + 2] = static_cast<_Float16>(f.z);
@@ -1272,7 +1278,9 @@ __launch_bounds__(256) __global__
   const int block_last = min(position + min(q0 + kQueries, n) - 1, span_last);
   const int wave_first = first_key(position + w0);
   const int wave_last = min(position + min(w0 + 16, n) - 1, span_last);
-  const float scale = rsqrtf(float(D)) * 1.44269504088896341F;
+  // Keys every query of the wave sees: tiles inside skip the mask.
+  const int open_first = first_key(position + min(w0 + 16, n) - 1);
+  const int open_last = min(position + w0, span_last);
   v8f acc[kSteps] = {};
   float maximum = -INFINITY, sum = 0;
   // K: 32 keys x 16 uint4 per tile, two per thread. V: lane owns a key and
@@ -1327,14 +1335,22 @@ __launch_bounds__(256) __global__
         s[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf, qf[st], s[kb]);
       }
     float tile_max = -INFINITY;
+    if (base >= open_first && base + kKeys - 1 <= open_last) {
 #pragma unroll
-    for (int kb = 0; kb < 2; ++kb)
+      for (int kb = 0; kb < 2; ++kb)
 #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        const int t = base + kb * 16 + 2 * i + half;
-        s[kb][i] = t >= lo && t <= hi ? s[kb][i] * scale : -INFINITY;
-        tile_max = fmaxf(tile_max, s[kb][i]);
-      }
+        for (int i = 0; i < 8; ++i)
+          tile_max = fmaxf(tile_max, s[kb][i]);
+    } else {
+#pragma unroll
+      for (int kb = 0; kb < 2; ++kb)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const int t = base + kb * 16 + 2 * i + half;
+          s[kb][i] = t >= lo && t <= hi ? s[kb][i] : -INFINITY;
+          tile_max = fmaxf(tile_max, s[kb][i]);
+        }
+    }
     tile_max = fmaxf(tile_max, OtherHalf(tile_max));
     const float next = fmaxf(maximum, tile_max);
     const float shift = next == -INFINITY ? 0 : next;
@@ -1357,9 +1373,11 @@ __launch_bounds__(256) __global__
                      unsigned(__builtin_bit_cast(Half, b)) << 16;
       }
     sum = sum * alpha + local;
+    // An unchanged maximum gives alpha == 1 exactly.
+    if (__builtin_amdgcn_ballot_w32(alpha != 1.0F))
 #pragma unroll
-    for (int t = 0; t < kSteps; ++t)
-      acc[t] *= alpha;
+      for (int t = 0; t < kSteps; ++t)
+        acc[t] *= alpha;
 #pragma unroll
     for (int kb = 0; kb < 2; ++kb) {
       // Key 2m comes from the first half's element m, key 2m + 1 from the
@@ -1893,7 +1911,9 @@ void LaunchSplit(std::span<const Output> outputs, SplitActivations split, int n,
   Projections jobs{};
   jobs.count = int(outputs.size());
   int row_blocks = 0;
-  const bool wide = outputs[0].weight->rows >= 1024;
+  bool wide = false;
+  for (const auto& o : outputs)
+    wide = wide || o.weight->rows >= 1024;
   const int tile_rows = (wide ? 256 : 64) / (kSwiGLU ? 2 : 1);
   for (int i = 0; i < jobs.count; ++i) {
     const auto& w = *outputs[i].weight;
@@ -1979,15 +1999,9 @@ void Project(std::span<const Output> outputs, const float* x, int n,
   const auto split = SplitActivations::In(workspace.quantized, n, K);
   if (!split_ready)
     SplitRows<<<n, 256, 0, s>>>(x, split, K);
-  // Wide and narrow projections use different tiles.
-  Output wide[Projections::kMax], narrow[Projections::kMax];
-  std::size_t wide_count = 0, narrow_count = 0;
-  for (const auto& o : outputs)
-    (o.weight->rows >= 1024 ? wide[wide_count++] : narrow[narrow_count++]) = o;
-  if (wide_count)
-    LaunchSplit({wide, wide_count}, split, n, K, s, workspace);
-  if (narrow_count)
-    LaunchSplit({narrow, narrow_count}, split, n, K, s, workspace);
+  // With one wide projection all of them share its tiles; waves past a
+  // narrow projection's rows skip their products.
+  LaunchSplit(outputs, split, n, K, s, workspace);
 }
 void ProjectSwiGLU(const Tensor& gate, const Tensor& up, const float* x,
                    float* out, float* up_scratch, int n, hipStream_t s,

@@ -478,6 +478,7 @@ __launch_bounds__(kWaves * 32) __global__
             t_block = tile % sk.token_blocks * BN;
   const int kb_begin = part * blocks / parts,
             kb_end = (part + 1) * blocks / parts;
+  const bool wave_live = r_block + (kSwiGLU ? wave * 16 : wave * RM * 16) < M;
   // This lane's row of tile i.
   int row[RM];
   const std::uint8_t* w_ptr[RM];
@@ -598,6 +599,8 @@ __launch_bounds__(kWaves * 32) __global__
     __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
     for (int j = 0; j < RN; ++j) {
+      if (!wave_live)
+        break;
       const int t = j * 16 + sub;
       v16h b[2][2];
 #pragma unroll
