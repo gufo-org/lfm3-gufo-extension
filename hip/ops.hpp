@@ -14,11 +14,18 @@ void Embed(const Tensor& weight, const std::uint32_t* tokens, float* out, int n,
 // Prompt projections of n rows need SplitActivationBytes(n, K) here.
 // row_max (one word per prompt row) lets the FFN down projection split its
 // input while staging.
+// With partial (SplitPartialBytes) and zeroed tickets (kMaxSplitUnits
+// words), projections whose tiles leave the last wave of resident blocks
+// partly idle split those tiles across K.
 struct DenseWorkspace {
   void* quantized{};
   unsigned* row_max{};
+  float* partial{};
+  unsigned* tickets{};
 };
 std::size_t DenseWorkspaceBytes(std::size_t rows, std::size_t K);
+inline constexpr int kMaxSplitParts = 8, kMaxSplitUnits = 192;
+std::size_t SplitPartialBytes();
 struct Output {
   const Tensor* weight;
   float* out;

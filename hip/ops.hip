@@ -1832,13 +1832,63 @@ void Embed(const Tensor& w, const std::uint32_t* tokens, float* out, int n,
 std::size_t DenseWorkspaceBytes(std::size_t rows, std::size_t K) {
   return SplitActivationBytes(rows, K);
 }
+// The widest tile keeps 64 accumulators in each of 256 threads.
+std::size_t SplitPartialBytes() {
+  return std::size_t(kMaxSplitUnits) * 256 * 64 * sizeof(float);
+}
 namespace {
 bool SplitPrompt(const Tensor& w, int n, DenseWorkspace workspace) {
   return n >= 32 && w.type == core::GgmlType::kQ8_0 && workspace.quantized;
 }
+// Blocks of kernel resident at once on the device.
+template<auto kernel>
+int ResidentBlocks() {
+  static const int count = [] {
+    int device = 0, units = 0, per_unit = 0;
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipDeviceGetAttribute(&units, hipDeviceAttributeMultiprocessorCount,
+                              device) != hipSuccess ||
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_unit, kernel, 256,
+                                                     0) != hipSuccess)
+      return 0;
+    return units * per_unit;
+  }();
+  return count;
+}
+// Splits the tiles of the last, partial wave of resident blocks across K
+// when that shortens the launch. Time is counted in K blocks per wave; a
+// part costs about four more for its prologue and partial sums (measured
+// at LFM3's shapes).
+SplitK PlanSplit(int token_blocks, int tiles, int k_blocks, int resident,
+                 DenseWorkspace workspace) {
+  SplitK plan{token_blocks, tiles};
+  if (!workspace.partial || !workspace.tickets || resident <= 0)
+    return plan;
+  const int rest = tiles % resident;
+  if (!rest)
+    return plan;
+  constexpr double kPartCost = 4;
+  double best = k_blocks;
+  for (int parts = 2; parts <= kMaxSplitParts; ++parts) {
+    if (rest * parts > kMaxSplitUnits || k_blocks / parts < 8)
+      break;
+    const double time = (rest * parts + resident - 1) / resident *
+                        (double(k_blocks) / parts + kPartCost);
+    if (time < best) {
+      best = time;
+      plan.parts = parts;
+    }
+  }
+  if (plan.parts > 1) {
+    plan.split_from = tiles - rest;
+    plan.partial = workspace.partial;
+    plan.tickets = workspace.tickets;
+  }
+  return plan;
+}
 template<bool kSwiGLU = false, bool kRaw = false>
 void LaunchSplit(std::span<const Output> outputs, SplitActivations split, int n,
-                 int K, hipStream_t s) {
+                 int K, hipStream_t s, DenseWorkspace workspace = {}) {
   constexpr int BN = 64;
   Projections jobs{};
   jobs.count = int(outputs.size());
@@ -1852,15 +1902,20 @@ void LaunchSplit(std::span<const Output> outputs, SplitActivations split, int n,
     if (!kSwiGLU || i == 0)
       row_blocks += (int(w.rows) + tile_rows - 1) / tile_rows;
   }
-  const dim3 grid((n + BN - 1) / BN, row_blocks);
+  const int token_blocks = (n + BN - 1) / BN, tiles = token_blocks * row_blocks;
   if (kSwiGLU)
     jobs.count = 1;  // Both weights belong to every row block.
+  const auto launch = [&]<auto kernel>() {
+    const auto plan = kSwiGLU ? SplitK{token_blocks, tiles}
+                              : PlanSplit(token_blocks, tiles, K / 32,
+                                          ResidentBlocks<kernel>(), workspace);
+    const int units = plan.split_from + (tiles - plan.split_from) * plan.parts;
+    kernel<<<units, 256, 0, s>>>(jobs, split, n, K, plan);
+  };
   if (wide)
-    SplitQ8Gemm<256, BN, 8, 1, kSwiGLU, kRaw>
-        <<<grid, 256, 0, s>>>(jobs, split, n, K);
+    launch.template operator()<RegQ8Gemm<BN / 16, kSwiGLU, kRaw>>();
   else
-    SplitQ8Gemm<64, BN, 4, 2, kSwiGLU, kRaw>
-        <<<grid, 256, 0, s>>>(jobs, split, n, K);
+    launch.template operator()<SplitQ8Gemm<64, BN, 4, 2, kSwiGLU, kRaw>>();
 }
 }  // namespace
 // One-row Q8_0 projections of one input in a single launch; false when the
@@ -1930,9 +1985,9 @@ void Project(std::span<const Output> outputs, const float* x, int n,
   for (const auto& o : outputs)
     (o.weight->rows >= 1024 ? wide[wide_count++] : narrow[narrow_count++]) = o;
   if (wide_count)
-    LaunchSplit({wide, wide_count}, split, n, K, s);
+    LaunchSplit({wide, wide_count}, split, n, K, s, workspace);
   if (narrow_count)
-    LaunchSplit({narrow, narrow_count}, split, n, K, s);
+    LaunchSplit({narrow, narrow_count}, split, n, K, s, workspace);
 }
 void ProjectSwiGLU(const Tensor& gate, const Tensor& up, const float* x,
                    float* out, float* up_scratch, int n, hipStream_t s,
@@ -1970,7 +2025,7 @@ void ProjectFfn(const Tensor& gate, const Tensor& up, const Tensor& down,
     raw.raw = hidden;
     raw.row_max = workspace.row_max;
     const Output second[] = {{&down, out}};
-    LaunchSplit<false, true>(second, raw, n, down.cols, s);
+    LaunchSplit<false, true>(second, raw, n, down.cols, s, workspace);
     return;
   }
   ProjectSwiGLU(gate, up, x, hidden, up_scratch, n, s, workspace, split_ready);

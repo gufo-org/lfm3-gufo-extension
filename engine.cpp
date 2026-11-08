@@ -121,7 +121,8 @@ struct Session::Impl {
     std::uint32_t capacity{};
   };
   std::vector<State> states;
-  Buffer quantized, row_max, attention_scratch, frequencies, chunk_k, chunk_v;
+  Buffer quantized, row_max, split_partial, split_tickets, attention_scratch,
+      frequencies, chunk_k, chunk_v;
   Impl(std::shared_ptr<Model> m, std::uint32_t ctx, std::size_t rows = kChunk)
       : model(std::move(m)),
         context(ctx),
@@ -145,6 +146,10 @@ struct Session::Impl {
         std::max({c.hidden * 3, c.intermediate, c.heads * c.head_dim});
     quantized = Buffer(gpu::DenseWorkspaceBytes(rows, width));
     row_max = Buffer(rows * sizeof(unsigned));
+    split_partial = Buffer(gpu::SplitPartialBytes());
+    split_tickets = Buffer(gpu::kMaxSplitUnits * sizeof(unsigned));
+    Check(hipMemsetAsync(split_tickets.data, 0,
+                         gpu::kMaxSplitUnits * sizeof(unsigned), stream.value));
     attention_scratch =
         Buffer(gpu::AttentionScratchBytes(c.heads, c.head_dim, ctx, rows));
     // Global then sliding-window RoPE frequencies.
@@ -206,17 +211,18 @@ struct Session::Impl {
       Check(hipMemcpyAsync(decision_groups.data, groups.data(),
                            groups.size_bytes(), hipMemcpyHostToDevice, s));
     }
+    const gpu::DenseWorkspace workspace{
+        quantized.data, static_cast<unsigned*>(row_max.data),
+        split_partial.floats(), static_cast<unsigned*>(split_tickets.data)};
     auto dense = [&](const Tensor& weight, const float* input, float* output,
                      int count, hipStream_t stream) {
-      gpu::Dense(weight, input, output, count, stream, {quantized.data});
+      gpu::Dense(weight, input, output, count, stream, workspace);
     };
     auto norm = [&](const float* input, const Tensor& weight, float* output,
                     std::size_t count) {
       gpu::LaunchBatchedRMSNorm(input, static_cast<const float*>(weight.data),
                                 output, nullptr, count, weight.cols, c.eps, s);
     };
-    const gpu::DenseWorkspace workspace{quantized.data,
-                                        static_cast<unsigned*>(row_max.data)};
     // x += post(branch), then z = norm(x), split for the next projections
     // when they all read split prompt inputs. Returns whether z was split.
     auto residual_norm = [&](const float* branch, const Tensor* post,
