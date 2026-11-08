@@ -8,7 +8,7 @@ spoken instructions. Questions are packed in sets of 16 by default. This
 extension's `d1` decision provider serves it ([d1/](../../d1), on the
 [LFM3 backbone](../../README.md), the [LFM3-VL](../vl/README.md) vision tower
 and the [LFM3-Audio](../audio/README.md) encoder); it needs a Gufo with
-extension API 0.2.0 or newer (the `decision` capability).
+extension API 0.2.16 or newer (the `decision` capability).
 
 Download the backbone and projector from
 [LiquidAI/d1-Omni-2B-GGUF](https://huggingface.co/LiquidAI/d1-Omni-2B-GGUF/tree/c53ae0b1f92b17065e9158d34019c9ca1ea5bcf8):
