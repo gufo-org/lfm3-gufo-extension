@@ -91,3 +91,20 @@ Q8_0, pp2048/tg128 unless stated; quality evidence in QUALITY.md.
 The next prompt-depth lever is attention arithmetic. The current FP32 SIMT
 kernel reaches about 40% of the issue rate; matrix-core attention would need a
 precision decision (for example split FP16 products).
+
+## November 8 pass: decode launches and depth
+
+Q8_0, `gufo bench` CLI (not the HTTP tables in BENCHMARKS.md), Gufo
+`6d793814`. Attention timings are per global layer and 512-row chunk from a
+standalone operator benchmark with 16 heads, 4 KV heads and D = 128.
+
+| Mechanism | Decision and evidence |
+| --- | --- |
+| One launch for one-row q/k/v/gate GEMVs; gate/up GEMV with SwiGLU; per-head Q/K RMSNorm, RoPE and KV store in one kernel; in-place one-row convolution | Retained. Decode dropped from 322 to about 180 launches per token (about 2 µs idle each). Same expressions and reduction order: greedy decode logits are byte-identical for one session and a three-session batch. tg128 105.6 → 110.4 at depth 0, 73.7 → 76.2 at 32K. |
+| Prompt key spans of at least 2048 instead of 8192 | Retained. Balances causal blocks at mid depths: 8K 6.62 → 5.71 ms, 16K 11.7 → 11.0 ms. Lower FP64 error; a 9000-token prompt changes logits by at most 1.4e-5 (argmax unchanged). |
+| Split-FP16 WMMA prompt attention (Q, K, V and P as high/low pairs, three products) | Rejected. 86.5 → 68.9 ms at 128K, but about 10× the FP32 kernel's error and fails the 2e-6 operator gate. |
+| Register prefetch of the next K/V tile (prompt and decode) | Rejected. Prompt unchanged (latency already hidden by resident blocks, 208 → 252 VGPRs); decode 2.70 → 3.27 ms at 128K. |
+| 512-thread prompt blocks (twice the queries per K/V tile) | Rejected: slightly slower; not bound by K/V traffic. |
+| QK with scalar-register queries or readlane broadcasts instead of DPP | Rejected: SGPR/VGPR spills (2.5×–10× slower) and 5× slower. Ablation attributes about 59% of prompt-attention time to the DPP QK FMAs, which cannot dual-issue. |
+| Decode attention tile/split sizes (32/64 keys, 64–256 splits) | Neutral. Decode attention reads the FP32 KV cache at about 199 GB/s; lower KV precision is the remaining depth lever. |
+| Batched decode GEMM with 4 or 8 rows per wave | Rejected: slower than 2. |
