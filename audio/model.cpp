@@ -42,6 +42,7 @@ struct Buffer {
   }
   Buffer(const Buffer&) = delete;
   float* floats() const { return static_cast<float*>(data); }
+  std::uint16_t* halves() const { return static_cast<std::uint16_t*>(data); }
   std::int32_t* ints() const { return static_cast<std::int32_t*>(data); }
   // Grow-only reallocation; contents are not preserved.
   void Reserve(std::size_t size) {
@@ -72,8 +73,8 @@ struct StackState {
     for (const auto& b : s.blocks) {
       if (b.attention()) {
         conv.emplace_back();
-        k.emplace_back(std::size_t(window) * s.kv_heads * s.head_dim * 4);
-        v.emplace_back(std::size_t(window) * s.kv_heads * s.head_dim * 4);
+        k.emplace_back(std::size_t(window) * s.kv_heads * s.head_dim * 2);
+        v.emplace_back(std::size_t(window) * s.kv_heads * s.head_dim * 2);
       } else {
         conv.emplace_back(std::size_t(s.hidden) * (s.conv_width - 1) * 4);
         k.emplace_back();
@@ -90,8 +91,8 @@ struct StackState {
 };
 // Activations of one stack for up to kRows rows.
 struct Scratch {
-  Buffer x, z, o, p, q, k, v, gate, a, ff_gate, ff_up, quantized, row_max,
-      frequencies;
+  Buffer x, z, o, p, q, k, v, k16, v16, gate, a, ff_gate, ff_up, quantized,
+      row_max, frequencies;
   // FP32 copies of BF16 weights, multiplied by hipBLAS for wide batches.
   hipblasHandle_t blas{};
   const std::unordered_map<const void*, float*>* fp32{};
@@ -105,6 +106,8 @@ struct Scratch {
     q = Buffer(R * s.heads * s.head_dim * 4);
     k = Buffer(R * s.kv_heads * s.head_dim * 4);
     v = Buffer(R * s.kv_heads * s.head_dim * 4);
+    k16 = Buffer(R * s.kv_heads * s.head_dim * 2);
+    v16 = Buffer(R * s.kv_heads * s.head_dim * 2);
     gate = Buffer(R * s.heads * 4);
     a = Buffer(R * std::max<std::size_t>(H, s.heads * s.head_dim) * 4);
     ff_gate = Buffer(R * s.intermediate * 4);
@@ -186,10 +189,13 @@ void RunStack(const Stack& st, StackState* state, int n, int window,
                         rows, st.heads, st.head_dim, position, s);
         lfm3::gpu::Rope(sc.k.floats() + ko, sc.frequencies.floats(), nullptr,
                         rows, st.kv_heads, st.head_dim, position, s);
-        const float* ck = state ? state->k[i].floats() : nullptr;
-        const float* cv = state ? state->v[i].floats() : nullptr;
+        lfm3::gpu::PackKV(sc.k.floats() + ko, sc.v.floats() + ko,
+                          sc.k16.halves() + ko, sc.v16.halves() + ko,
+                          std::size_t(rows) * st.kv_heads * st.head_dim, s);
+        const auto* ck = state ? state->k[i].halves() : nullptr;
+        const auto* cv = state ? state->v[i].halves() : nullptr;
         gpu::Attention(
-            sc.q.floats() + qo, sc.k.floats() + ko, sc.v.floats() + ko,
+            sc.q.floats() + qo, sc.k16.halves() + ko, sc.v16.halves() + ko,
             b.attn_gate.data ? sc.gate.floats() + std::size_t(r) * st.heads
                              : nullptr,
             ck, cv, sc.a.floats() + qo, rows, st.heads, st.kv_heads,
@@ -197,9 +203,10 @@ void RunStack(const Stack& st, StackState* state, int n, int window,
             state != nullptr, s);
       }
       if (state)
-        lfm3::gpu::StoreKV(sc.k.floats(), sc.v.floats(), state->k[i].floats(),
-                           state->v[i].floats(), n, st.kv_heads * st.head_dim,
-                           position, state->capacity, s);
+        lfm3::gpu::StoreKV(sc.k16.halves(), sc.v16.halves(),
+                           state->k[i].halves(), state->v[i].halves(), n,
+                           st.kv_heads * st.head_dim, position, state->capacity,
+                           s);
       Dense(b.attn_out, sc.a.floats(), sc.o.floats(), n, s, sc);
     } else {
       Dense(b.in_proj, sc.z.floats(), sc.p.floats(), n, s, sc);

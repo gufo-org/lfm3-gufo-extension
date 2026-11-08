@@ -972,7 +972,7 @@ __launch_bounds__(D / 2) __global__ void DecodeHeadsKernel(
     float* __restrict__ q, float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ q_norm, const float* __restrict__ k_norm,
     const float* __restrict__ frequencies, const float* __restrict__ factors,
-    float* __restrict__ ck, float* __restrict__ cv, int heads, int kv_heads,
+    Half* __restrict__ ck, Half* __restrict__ cv, int heads, int kv_heads,
     int position, int capacity, float eps) {
   const int head = blockIdx.x, pair = threadIdx.x;
   const bool is_key = head >= heads;
@@ -1010,10 +1010,13 @@ __launch_bounds__(D / 2) __global__ void DecodeHeadsKernel(
     return;
   const std::size_t slot =
       std::size_t(position % capacity) * kv_heads * D + kvh * D;
-  ck[slot + pair] = r0;
-  ck[slot + pair + D / 2] = r1;
-  cv[slot + pair] = v[kvh * D + pair];
-  cv[slot + pair + D / 2] = v[kvh * D + pair + D / 2];
+  const auto f16 = [](float x) {
+    return __builtin_bit_cast(Half, static_cast<_Float16>(x));
+  };
+  ck[slot + pair] = f16(r0);
+  ck[slot + pair + D / 2] = f16(r1);
+  cv[slot + pair] = f16(v[kvh * D + pair]);
+  cv[slot + pair + D / 2] = f16(v[kvh * D + pair + D / 2]);
 }
 // One-row convolution and history update by the owner of each channel, with
 // Convolution's and ConvolutionHistory's expressions.
@@ -1032,67 +1035,9 @@ __global__ void ConvolutionStep(const float* p, const float* w, float* history,
     own[j] = own[j + 1];
   own[L - 2] = current;
 }
-// One wave owns a query/head. Four independent dot chains preserve the
-// original four 32-lane sums, without a block barrier for every cached token.
-__global__ void Attn(const float* q, const float* k, const float* v,
-                     const float* gate, const float* ck, const float* cv,
-                     float* y, int heads, int kh, int D, int position,
-                     int capacity, int window) {
-  int h = blockIdx.x, row = blockIdx.y, lane = threadIdx.x;
-  int query = position + row;
-  int first = window > 0 ? max(0, query + 1 - window) : 0;
-  int kvh = h / (heads / kh), stride = kh * D;
-  float query_values[4], acc[4] = {};
-  for (int part = 0; part < 4; ++part)
-    query_values[part] =
-        q[(std::size_t(row) * heads + h) * D + lane + part * 32];
-  float maximum = -INFINITY, denominator = 0;
-  constexpr int kLookahead = 8;
-  for (int base = first; base <= query; base += kLookahead) {
-    float keys[kLookahead][4], values[kLookahead][4];
-#pragma unroll
-    for (int j = 0; j < kLookahead; ++j) {
-      int t = base + j;
-      if (t <= query) {
-        const float* key = t >= position
-                               ? k + std::size_t(t - position) * stride
-                               : ck + std::size_t(t % capacity) * stride;
-        const float* value = t >= position
-                                 ? v + std::size_t(t - position) * stride
-                                 : cv + std::size_t(t % capacity) * stride;
-#pragma unroll
-        for (int part = 0; part < 4; ++part) {
-          keys[j][part] = key[kvh * D + lane + part * 32];
-          values[j][part] = value[kvh * D + lane + part * 32];
-        }
-      }
-    }
-#pragma unroll
-    for (int j = 0; j < kLookahead; ++j) {
-      if (base + j <= query) {
-        float dot[4];
-#pragma unroll
-        for (int part = 0; part < 4; ++part)
-          dot[part] = query_values[part] * keys[j][part];
-        for (int offset = 16; offset; offset /= 2)
-#pragma unroll
-          for (int part = 0; part < 4; ++part)
-            dot[part] += __shfl_down(dot[part], offset, 32);
-        float score = __shfl(
-            (dot[0] + dot[1] + dot[2] + dot[3]) * rsqrtf(float(D)), 0, 32);
-        float next = fmaxf(maximum, score);
-        float alpha = expf(maximum - next), beta = expf(score - next);
-        denominator = denominator * alpha + beta;
-        maximum = next;
-#pragma unroll
-        for (int part = 0; part < 4; ++part)
-          acc[part] = acc[part] * alpha + beta * values[j][part];
-      }
-    }
-  }
-  for (int part = 0; part < 4; ++part)
-    y[(std::size_t(row) * heads + h) * D + lane + part * 32] =
-        (acc[part] / denominator) / (1 + expf(-gate[row * heads + h]));
+template<class F, int... I>
+__device__ __forceinline__ void Unroll(F f, std::integer_sequence<int, I...>) {
+  (f(std::integral_constant<int, I>{}), ...);
 }
 // acc += (lane N of this 16-lane row's x) * y, as one DPP row_share FMA.
 template<int N>
@@ -1102,29 +1047,59 @@ __device__ __forceinline__ float FmaRowShare(float x, float y, float acc) {
       : "v"(x), "v"(y), "n"(N));
   return acc;
 }
-template<class F, int... I>
-__device__ __forceinline__ void Unroll(F f, std::integer_sequence<int, I...>) {
-  (f(std::integral_constant<int, I>{}), ...);
+using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+// 16 contiguous halves; every fragment row starts on a 16-byte boundary.
+__device__ __forceinline__ v16h Fragment(const Half* p) {
+  union {
+    v16h f;
+    uint4 u[2];
+  } c;
+  c.u[0] = reinterpret_cast<const uint4*>(p)[0];
+  c.u[1] = reinterpret_cast<const uint4*>(p)[1];
+  return c.f;
 }
-// Prompt attention: a block owns 64 (head, query) rows of one KV group and
-// streams 32-key K/V tiles through LDS. Each wave owns eight rows and each
-// lane one key of the tile. Query values stay in registers and reach every
-// lane through DPP broadcasts, so K/V is read once per wave. Scores, the
-// online softmax and P*V accumulate in FP32.
-template<int D, bool bidirectional = false, bool packed = false>
+// The same lane of the other 16-lane half of the wave.
+__device__ __forceinline__ unsigned OtherHalf(unsigned x) {
+  return __builtin_amdgcn_permlanex16(x, x, 0x76543210u, 0xfedcba98u, false,
+                                      false);
+}
+__device__ __forceinline__ float OtherHalf(float x) {
+  return __builtin_bit_cast(float, OtherHalf(__builtin_bit_cast(unsigned, x)));
+}
+__device__ __forceinline__ Half ToHalf(float x) {
+  return __builtin_bit_cast(Half, static_cast<_Float16>(x));
+}
+__device__ __forceinline__ float4 Widen(uint2 h) {
+  const auto* x = reinterpret_cast<const _Float16*>(&h);
+  return make_float4(float(x[0]), float(x[1]), float(x[2]), float(x[3]));
+}
+// Rows at or after position come from the current chunk, earlier rows from
+// the ring.
+__device__ __forceinline__ const Half* KeyRow(const Half* chunk,
+                                              const Half* ring, int t,
+                                              int position, int capacity,
+                                              int stride) {
+  return t >= position ? chunk + std::size_t(t - position) * stride
+                       : ring + std::size_t(t % capacity) * stride;
+}
+// Bidirectional prompt attention over F16 K/V rows: a block owns 64 (head,
+// query) rows of one KV group and streams 32-key K/V tiles through LDS. Each
+// wave owns eight rows and each lane one key of the tile. Query values stay in
+// registers and reach every lane through DPP broadcasts. Scores, the online
+// softmax and P*V accumulate in FP32. With groups, a query attends only to
+// keys of its own group (negative groups attend everywhere).
+template<int D, bool packed = false>
 __launch_bounds__(256) __global__
-    void TiledAttn(const float* __restrict__ q, const float* __restrict__ k,
-                   const float* __restrict__ v, const float* __restrict__ gate,
-                   const float* __restrict__ ck, const float* __restrict__ cv,
-                   float* __restrict__ y, float* __restrict__ partial, int n,
-                   int heads, int kh, int position, int capacity, int window,
-                   int span, const std::int32_t* groups = nullptr) {
+    void TiledAttn(const float* __restrict__ q, const Half* __restrict__ k,
+                   const Half* __restrict__ v, const float* __restrict__ gate,
+                   float* __restrict__ y, int n, int heads, int kh,
+                   const std::int32_t* groups = nullptr) {
   constexpr int kRows = 8, kKeys = 32, kSlices = D / 16;
   static_assert(D == 128);
   __shared__ float4 sk[kKeys][D / 4 + 1], sv[kKeys][D / 4];
   const int group = heads / kh, queries = 64 / group;
-  const int g = blockIdx.z, split = blockIdx.y, q0 = blockIdx.x * queries,
-            tid = threadIdx.x;
+  const int g = blockIdx.z, q0 = blockIdx.x * queries, tid = threadIdx.x;
   const int lane = tid % 32, wave = tid / 32;
   const int h = g * group + wave * kRows / queries;
   const int wq0 = q0 + wave * kRows % queries;
@@ -1147,36 +1122,22 @@ __launch_bounds__(256) __global__
     denominator[r] = 0;
   }
   const float scale = rsqrtf(float(D));
-  // Long histories split their keys into spans of span keys, one per
-  // blockIdx.y; blocks of one span run together and share its K/V in cache.
-  const int last_query =
-      min(bidirectional ? n - 1 : position + min(q0 + queries, n) - 1,
-          (split + 1) * span - 1);
-  const int begin =
-      max(window > 0 ? max(0, position + q0 + 1 - window) : 0, split * span);
-  const int wave_last =
-      bidirectional ? n - 1 : position + min(wq0 + kRows, n) - 1;
-  const int wave_first = window > 0 ? max(0, position + wq0 + 1 - window) : 0;
-  for (int base = begin; base <= last_query; base += kKeys) {
+  for (int base = 0; base < n; base += kKeys) {
     __syncthreads();
     for (int i = tid; i < kKeys * D / 4; i += 256) {
       int t = base + i / (D / 4), d4 = i % (D / 4);
       float4 kk = make_float4(0, 0, 0, 0), vv = kk;
-      if (t <= last_query) {
-        const float* key = t >= position
-                               ? k + std::size_t(t - position) * stride
-                               : ck + std::size_t(t % capacity) * stride;
-        const float* value = t >= position
-                                 ? v + std::size_t(t - position) * stride
-                                 : cv + std::size_t(t % capacity) * stride;
-        kk = reinterpret_cast<const float4*>(key + g * D)[d4];
-        vv = reinterpret_cast<const float4*>(value + g * D)[d4];
+      if (t < n) {
+        kk = Widen(reinterpret_cast<const uint2*>(k + std::size_t(t) * stride +
+                                                  g * D)[d4]);
+        vv = Widen(reinterpret_cast<const uint2*>(v + std::size_t(t) * stride +
+                                                  g * D)[d4]);
       }
       sk[i / (D / 4)][d4] = kk;
       sv[i / (D / 4)][d4] = vv;
     }
     __syncthreads();
-    if (wq0 >= n || base > wave_last || base + kKeys <= wave_first)
+    if (wq0 >= n)
       continue;
     float score[kRows] = {};
 #pragma unroll
@@ -1197,10 +1158,7 @@ __launch_bounds__(256) __global__
     const int t = base + lane;
 #pragma unroll
     for (int r = 0; r < kRows; ++r) {
-      const int query = position + wq0 + r;
-      const int first = window > 0 ? max(0, query + 1 - window) : 0;
-      bool valid = wq0 + r < n && t >= first && (bidirectional || t <= query) &&
-                   t <= last_query;
+      bool valid = wq0 + r < n && t < n;
       if constexpr (packed) {
         if (valid) {
           const auto own = groups[wq0 + r], key = groups[t];
@@ -1249,39 +1207,224 @@ __launch_bounds__(256) __global__
       total += __shfl_xor(total, offset, 32);
     if (row >= n)
       continue;
-    if (gridDim.y > 1) {
-      float* out =
-          partial + ((std::size_t(split) * n + row) * heads + h) * (D + 2);
-      if (!lane) {
-        out[0] = maximum[r];
-        out[1] = total;
-      }
-      reinterpret_cast<float4*>(out + 2)[lane] = acc[r];
-      continue;
-    }
     const float g_scale = 1 + expf(-gate[row * heads + h]);
     reinterpret_cast<float4*>(y + (std::size_t(row) * heads + h) * D)[lane] =
         make_float4((acc[r].x / total) / g_scale, (acc[r].y / total) / g_scale,
                     (acc[r].z / total) / g_scale, (acc[r].w / total) / g_scale);
   }
 }
-// One decode query per head. A block owns one KV group and a span of keys,
-// processed in kDecodeKeys tiles with an online softmax; four threads split
-// each key's dot products and all heads of the group share every loaded key
-// and value row. With several spans, each block stores its maximum,
-// denominator and unnormalized output for DecodeCombine.
-constexpr int kDecodeKeys = 64, kMaxGroup = 8, kMaxDecodeSplits = 64;
+// Causal prompt attention on the matrix cores: FP16 Q, K, V and
+// probabilities, FP32 accumulation and softmax. A block owns 128 query rows
+// of one KV group (16 queries of one head per wave) and streams 32-key tiles
+// of the F16 cache through LDS, prefetching the next tile into registers.
+//
+// Each wave computes S^T = K Q^T and O^T = V^T P^T. In the WMMA accumulator
+// layout lane L then holds query L % 16 and keys (or dimensions) 2i + L / 16,
+// so a query's softmax state lives in one lane pair: the row maximum and sum
+// need one cross-half exchange and the rescale is a per-lane scalar. Scores
+// are kept in base-2 units. Long histories split keys across blockIdx.y; each
+// split stores its maximum, sum and unnormalized output for PromptCombine.
+template<int D, int kGroup>
+__launch_bounds__(256) __global__
+    void WmmaAttn(const float* __restrict__ q, const Half* __restrict__ k,
+                  const Half* __restrict__ v, const float* __restrict__ gate,
+                  const Half* __restrict__ ck, const Half* __restrict__ cv,
+                  float* __restrict__ y, float* __restrict__ partial, int n,
+                  int heads, int kh, int position, int capacity, int window,
+                  int span) {
+  static_assert(D == 128 && 8 % kGroup == 0);
+  constexpr int kKeys = 32, kQueries = 128 / kGroup, kSteps = D / 16;
+  constexpr int kKStride = D + 8, kVStride = kKeys + 8;
+  __shared__ __attribute__((aligned(16))) Half sk[kKeys * kKStride];
+  __shared__ __attribute__((aligned(16))) Half svt[D * kVStride];
+  const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const int col = lane % 16, half = lane / 16;
+  const int g = blockIdx.z, split = blockIdx.y, q0 = blockIdx.x * kQueries;
+  const int h = g * kGroup + wave % kGroup, w0 = q0 + wave / kGroup * 16;
+  const int row = w0 + col, stride = kh * D;
+  const bool live = row < n;
+  v16h qf[kSteps], ql[kSteps];
+  {
+    const float* qr = q + (std::size_t(live ? row : 0) * heads + h) * D;
+#pragma unroll
+    for (int s = 0; s < kSteps; ++s)
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        const float4 f = live ? reinterpret_cast<const float4*>(qr)[s * 4 + c]
+                              : make_float4(0, 0, 0, 0);
+        qf[s][c * 4 + 0] = static_cast<_Float16>(f.x);
+        qf[s][c * 4 + 1] = static_cast<_Float16>(f.y);
+        qf[s][c * 4 + 2] = static_cast<_Float16>(f.z);
+        qf[s][c * 4 + 3] = static_cast<_Float16>(f.w);
+        ql[s][c * 4 + 0] = static_cast<_Float16>(f.x - float(qf[s][c * 4 + 0]));
+        ql[s][c * 4 + 1] = static_cast<_Float16>(f.y - float(qf[s][c * 4 + 1]));
+        ql[s][c * 4 + 2] = static_cast<_Float16>(f.z - float(qf[s][c * 4 + 2]));
+        ql[s][c * 4 + 3] = static_cast<_Float16>(f.w - float(qf[s][c * 4 + 3]));
+      }
+  }
+  const int span_first = split * span, span_last = span_first + span - 1;
+  const auto first_key = [&](int query) {
+    return max(window > 0 ? query + 1 - window : 0, span_first);
+  };
+  const int query = position + row;
+  const int lo = first_key(query), hi = min(query, span_last);
+  const int block_first = max(0, first_key(position + q0));
+  const int block_last = min(position + min(q0 + kQueries, n) - 1, span_last);
+  const int wave_first = first_key(position + w0);
+  const int wave_last = min(position + min(w0 + 16, n) - 1, span_last);
+  const float scale = rsqrtf(float(D)) * 1.44269504088896341F;
+  v8f acc[kSteps] = {};
+  float maximum = -INFINITY, sum = 0;
+  // K: 32 keys x 16 uint4 per tile, two per thread. V: lane owns a key and
+  // wave owns 16 dimensions, so the transposed LDS writes do not conflict.
+  uint4 kr[2], vr[2];
+  const auto load = [&](int base) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int idx = tid + i * 256, t = base + idx / (D / 8);
+      kr[i] = t <= block_last
+                  ? reinterpret_cast<const uint4*>(
+                        KeyRow(k, ck, t, position, capacity, stride) +
+                        g * D)[idx % (D / 8)]
+                  : make_uint4(0, 0, 0, 0);
+    }
+    const int t = base + lane;
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+      vr[i] = t <= block_last
+                  ? reinterpret_cast<const uint4*>(
+                        KeyRow(v, cv, t, position, capacity, stride) + g * D +
+                        wave * 16)[i]
+                  : make_uint4(0, 0, 0, 0);
+  };
+  load(block_first);
+  for (int base = block_first; base <= block_last; base += kKeys) {
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int idx = tid + i * 256;
+      *reinterpret_cast<uint4*>(
+          &sk[idx / (D / 8) * kKStride + idx % (D / 8) * 8]) = kr[i];
+    }
+    {
+      const auto* vh = reinterpret_cast<const Half*>(vr);
+#pragma unroll
+      for (int d = 0; d < 16; ++d)
+        svt[(wave * 16 + d) * kVStride + lane] = vh[d];
+    }
+    __syncthreads();
+    if (base + kKeys <= block_last)
+      load(base + kKeys);
+    if (w0 >= n || base > wave_last || base + kKeys <= wave_first)
+      continue;
+    v8f s[2] = {};
+#pragma unroll
+    for (int st = 0; st < kSteps; ++st)
+#pragma unroll
+      for (int kb = 0; kb < 2; ++kb) {
+        const v16h kf = Fragment(&sk[(kb * 16 + col) * kKStride + st * 16]);
+        s[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf, ql[st], s[kb]);
+        s[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf, qf[st], s[kb]);
+      }
+    float tile_max = -INFINITY;
+#pragma unroll
+    for (int kb = 0; kb < 2; ++kb)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int t = base + kb * 16 + 2 * i + half;
+        s[kb][i] = t >= lo && t <= hi ? s[kb][i] * scale : -INFINITY;
+        tile_max = fmaxf(tile_max, s[kb][i]);
+      }
+    tile_max = fmaxf(tile_max, OtherHalf(tile_max));
+    const float next = fmaxf(maximum, tile_max);
+    const float shift = next == -INFINITY ? 0 : next;
+    const float alpha = __builtin_amdgcn_exp2f(maximum - shift);
+    maximum = next;
+    // Probabilities round to F16 once; the sum adds the rounded values, so
+    // the weights applied to V are exactly normalized.
+    unsigned own[2][4];
+    float local = 0;
+#pragma unroll
+    for (int kb = 0; kb < 2; ++kb)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const auto a = static_cast<_Float16>(
+                       __builtin_amdgcn_exp2f(s[kb][2 * j] - shift)),
+                   b = static_cast<_Float16>(
+                       __builtin_amdgcn_exp2f(s[kb][2 * j + 1] - shift));
+        local += float(a) + float(b);
+        own[kb][j] = unsigned(__builtin_bit_cast(Half, a)) |
+                     unsigned(__builtin_bit_cast(Half, b)) << 16;
+      }
+    sum = sum * alpha + local;
+#pragma unroll
+    for (int t = 0; t < kSteps; ++t)
+      acc[t] *= alpha;
+#pragma unroll
+    for (int kb = 0; kb < 2; ++kb) {
+      // Key 2m comes from the first half's element m, key 2m + 1 from the
+      // second half's.
+      union {
+        v16h f;
+        unsigned u[8];
+      } p;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const unsigned other = OtherHalf(own[kb][j]);
+        const unsigned first = half ? other : own[kb][j],
+                       second = half ? own[kb][j] : other;
+        p.u[2 * j] = (first & 0xffffu) | second << 16;
+        p.u[2 * j + 1] = first >> 16 | (second & 0xffff0000u);
+      }
+#pragma unroll
+      for (int t = 0; t < kSteps; ++t)
+        acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+            Fragment(&svt[(t * 16 + col) * kVStride + kb * 16]), p.f, acc[t]);
+    }
+  }
+  const float total = sum + OtherHalf(sum);
+  if (!live)
+    return;
+  if (gridDim.y > 1) {
+    float* out =
+        partial + ((std::size_t(split) * n + row) * heads + h) * (D + 2);
+    if (!half) {
+      out[0] = maximum;
+      out[1] = total;
+    }
+#pragma unroll
+    for (int t = 0; t < kSteps; ++t)
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        out[2 + t * 16 + 2 * i + half] = acc[t][i];
+    return;
+  }
+  const float g_scale = 1 + expf(-gate[row * heads + h]);
+  float* out = y + (std::size_t(row) * heads + h) * D;
+#pragma unroll
+  for (int t = 0; t < kSteps; ++t)
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      out[t * 16 + 2 * i + half] = (acc[t][i] / total) / g_scale;
+}
+// One decode query per head over the F16 ring. A block owns one KV group and
+// a span of keys, processed in kDecodeKeys tiles with an online softmax; four
+// threads split each key's dot products and all heads of the group share
+// every loaded key and value row. Q, scores and P*V stay FP32. With several
+// spans, each block stores its maximum, denominator and unnormalized output
+// for DecodeCombine.
+constexpr int kDecodeKeys = 64, kMaxGroup = 8, kMaxDecodeSplits = 128;
 template<int D>
 __launch_bounds__(256) __global__
-    void DecodeAttn(const float* __restrict__ q, const float* __restrict__ k,
-                    const float* __restrict__ v, const float* __restrict__ gate,
-                    const float* __restrict__ ck, const float* __restrict__ cv,
+    void DecodeAttn(const float* __restrict__ q, const Half* __restrict__ k,
+                    const Half* __restrict__ v, const float* __restrict__ gate,
+                    const Half* __restrict__ ck, const Half* __restrict__ cv,
                     float* __restrict__ y, float* __restrict__ partial,
                     int heads, int kh, int position, int capacity, int window,
                     int span) {
-  constexpr int kChunks = D / 16;  // float4 chunks per thread and row
+  constexpr int kChunks = D / 32;  // uint4 (8-half) chunks per thread and row
   __shared__ float4 sq[kMaxGroup][D / 4];
-  __shared__ float4 sv[kDecodeKeys][D / 4];
+  __shared__ uint4 sv[kDecodeKeys][D / 8];
   __shared__ float sp[kMaxGroup][kDecodeKeys];
   __shared__ float reduce[8][kMaxGroup];
   const int g = blockIdx.x, split = blockIdx.y, splits = gridDim.y;
@@ -1316,7 +1459,7 @@ __launch_bounds__(256) __global__
   // Threads split the group's heads; each owns D * group / 256 dimensions.
   const int per_head = 256 / group, dims = D / per_head;
   const int oh = tid / per_head, d0 = (tid % per_head) * dims;
-  const auto* sv_floats = reinterpret_cast<const float*>(sv);
+  const auto* sv_halves = reinterpret_cast<const _Float16*>(sv);
   const float scale = rsqrtf(float(D));
   float maxima[kMaxGroup], sums[kMaxGroup], acc[kMaxGroup / 2] = {};
   for (int hh = 0; hh < kMaxGroup; ++hh) {
@@ -1326,20 +1469,19 @@ __launch_bounds__(256) __global__
   for (int base = begin; base < end; base += kDecodeKeys) {
     const int keys = min(kDecodeKeys, end - base), t = base + j;
     const bool valid = j < keys;
-    float4 kk[kChunks];
+    float4 kk[2 * kChunks];
     __syncthreads();
     if (valid) {
-      const float* key = t >= position
-                             ? k + std::size_t(t - position) * stride
-                             : ck + std::size_t(t % capacity) * stride;
-      const float* value = t >= position
-                               ? v + std::size_t(t - position) * stride
-                               : cv + std::size_t(t % capacity) * stride;
+      const Half* key = KeyRow(k, ck, t, position, capacity, stride) + g * D;
+      const Half* value = KeyRow(v, cv, t, position, capacity, stride) + g * D;
 #pragma unroll
       for (int c = 0; c < kChunks; ++c) {
-        kk[c] = reinterpret_cast<const float4*>(key + g * D)[c * 4 + part];
-        sv[j][c * 4 + part] =
-            reinterpret_cast<const float4*>(value + g * D)[c * 4 + part];
+        const int u = c * 4 + part;
+        const uint4 kh8 = reinterpret_cast<const uint4*>(key)[u],
+                    vh8 = reinterpret_cast<const uint4*>(value)[u];
+        kk[2 * c] = Widen(make_uint2(kh8.x, kh8.y));
+        kk[2 * c + 1] = Widen(make_uint2(kh8.z, kh8.w));
+        sv[j][u] = vh8;
       }
     }
     __syncthreads();
@@ -1348,8 +1490,8 @@ __launch_bounds__(256) __global__
       float dot = 0;
       if (valid)
 #pragma unroll
-        for (int c = 0; c < kChunks; ++c) {
-          const float4 qq = sq[hh][c * 4 + part];
+        for (int c = 0; c < 2 * kChunks; ++c) {
+          const float4 qq = sq[hh][(c / 2 * 4 + part) * 2 + c % 2];
           dot = fmaf(qq.x, kk[c].x, dot);
           dot = fmaf(qq.y, kk[c].y, dot);
           dot = fmaf(qq.z, kk[c].z, dot);
@@ -1383,7 +1525,7 @@ __launch_bounds__(256) __global__
     for (int key = 0; key < keys; ++key) {
       const float p = sp[oh][key];
       for (int d = 0; d < dims; ++d)
-        acc[d] = fmaf(p, sv_floats[key * D + d0 + d], acc[d]);
+        acc[d] = fmaf(p, float(sv_halves[key * D + d0 + d]), acc[d]);
     }
   }
   float own_max = maxima[0], own_sum = sums[0];
@@ -1407,7 +1549,7 @@ __launch_bounds__(256) __global__
   for (int d = 0; d < dims; ++d)
     out[2 + d0 + d] = acc[d];
 }
-// Merges TiledAttn key spans: one block per (row, head).
+// Merges WmmaAttn key spans (base-2 maxima): one block per (row, head).
 template<int D>
 __global__ void PromptCombine(const float* __restrict__ partial,
                               const float* __restrict__ gate,
@@ -1419,7 +1561,7 @@ __global__ void PromptCombine(const float* __restrict__ partial,
   float sum = 0, acc = 0;
   for (int s = 0; s < splits; ++s) {
     const float* part = partial + (std::size_t(s) * rows + rh) * (D + 2);
-    const float w = expf(part[0] - maximum);
+    const float w = __builtin_amdgcn_exp2f(part[0] - maximum);
     sum = fmaf(part[1], w, sum);
     acc = fmaf(part[2 + d], w, acc);
   }
@@ -1442,8 +1584,16 @@ __global__ void DecodeCombine(const float* __restrict__ partial,
   }
   y[std::size_t(h) * D + d] = (acc / sum) / (1 + expf(-gate[h]));
 }
-__global__ void Cache(const float* k, const float* v, float* ck, float* cv,
-                      int n, int stride, int position, int capacity) {
+__global__ void PackRows(const float* k, const float* v, Half* k16, Half* v16,
+                         std::size_t count) {
+  const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  k16[i] = ToHalf(k[i]);
+  v16[i] = ToHalf(v[i]);
+}
+__global__ void Cache(const Half* k, const Half* v, Half* ck, Half* cv, int n,
+                      int stride, int position, int capacity) {
   auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   // Only the last capacity rows have distinct destinations.
   int kept = min(n, capacity), first = n - kept;
@@ -1879,17 +2029,18 @@ std::size_t AttentionScratchBytes(int heads, int dim, int context, int rows) {
   return std::max(decode, std::size_t(prompt > 1 ? prompt * rows : 0)) * heads *
          (dim + 2) * sizeof(float);
 }
-void Attention(const float* q, const float* k, const float* v, const float* g,
-               const float* ck, const float* cv, float* out, int n, int h,
-               int kh, int d, int p, int cap, int win, hipStream_t s,
-               float* scratch) {
+void Attention(const float* q, const Half* k, const Half* v, const float* g,
+               const Half* ck, const Half* cv, float* out, int n, int h, int kh,
+               int d, int p, int cap, int win, hipStream_t s, float* scratch) {
   const int group = h / kh;
-  if (n == 1 && scratch && d == 128 && group >= 2 && group <= kMaxGroup &&
-      256 % group == 0) {
+  if (d != 128 || !scratch || h % kh || group < 2 || 8 % group)
+    throw std::invalid_argument("unsupported LFM3 attention shape");
+  if (n == 1) {
     const int first = win > 0 ? std::max(0, p + 1 - win) : 0;
     const int tiles = (p + 1 - first + kDecodeKeys - 1) / kDecodeKeys;
-    const int span =
-        (tiles + kMaxDecodeSplits - 1) / kMaxDecodeSplits * kDecodeKeys;
+    // 64 spans keep short histories wide; past 64K keys more spans pay.
+    const int most = tiles > 1024 ? kMaxDecodeSplits : 64;
+    const int span = (tiles + most - 1) / most * kDecodeKeys;
     const int splits = (p + 1 - first + span - 1) / span;
     DecodeAttn<128><<<dim3(kh, splits), 256, 0, s>>>(
         q, k, v, g, ck, cv, out, scratch, h, kh, p, cap, win, span);
@@ -1897,34 +2048,34 @@ void Attention(const float* q, const float* k, const float* v, const float* g,
       DecodeCombine<128><<<h, 128, 0, s>>>(scratch, g, out, h, splits);
     return;
   }
-  if (d == 128 && group <= 8 && 64 % group == 0 && n >= 64 / group) {
-    int span;
-    const int splits = scratch && !win ? PromptSplits(p + n, span) : 1;
-    if (splits == 1)
-      span = p + n;
-    TiledAttn<128>
-        <<<dim3((n + 64 / group - 1) / (64 / group), splits, kh), 256, 0, s>>>(
-            q, k, v, g, ck, cv, out, scratch, n, h, kh, p, cap, win, span);
-    if (splits > 1)
-      PromptCombine<128><<<n * h, 128, 0, s>>>(scratch, g, out, n * h, splits);
-    return;
-  }
-  Attn<<<dim3(h, n), 32, 0, s>>>(q, k, v, g, ck, cv, out, h, kh, d, p, cap,
-                                 win);
+  int span;
+  const int splits = win ? 1 : PromptSplits(p + n, span);
+  if (splits == 1)
+    span = p + n;
+  const dim3 grid((n + 128 / group - 1) / (128 / group), splits, kh);
+  const auto launch = [&](auto kernel) {
+    kernel<<<grid, 256, 0, s>>>(q, k, v, g, ck, cv, out, scratch, n, h, kh, p,
+                                cap, win, span);
+  };
+  if (group == 2)
+    launch(WmmaAttn<128, 2>);
+  else if (group == 4)
+    launch(WmmaAttn<128, 4>);
+  else
+    launch(WmmaAttn<128, 8>);
+  if (splits > 1)
+    PromptCombine<128><<<n * h, 128, 0, s>>>(scratch, g, out, n * h, splits);
 }
-void BidirectionalAttention(const float* q, const float* k, const float* v,
+void BidirectionalAttention(const float* q, const Half* k, const Half* v,
                             const float* g, float* out, int n, int h, int kh,
                             hipStream_t s, const std::int32_t* groups) {
   const int queries = 64 / (h / kh);
-  if (groups) {
-    TiledAttn<128, true, true>
-        <<<dim3((n + queries - 1) / queries, 1, kh), 256, 0, s>>>(
-            q, k, v, g, nullptr, nullptr, out, nullptr, n, h, kh, 0, n, 0, n,
-            groups);
-    return;
-  }
-  TiledAttn<128, true><<<dim3((n + queries - 1) / queries, 1, kh), 256, 0, s>>>(
-      q, k, v, g, nullptr, nullptr, out, nullptr, n, h, kh, 0, n, 0, n);
+  const dim3 grid((n + queries - 1) / queries, 1, kh);
+  if (groups)
+    TiledAttn<128, true>
+        <<<grid, 256, 0, s>>>(q, k, v, g, out, n, h, kh, groups);
+  else
+    TiledAttn<128><<<grid, 256, 0, s>>>(q, k, v, g, out, n, h, kh);
 }
 namespace {
 __global__ void CopyRows(const unsigned char* source, const std::uint32_t* rows,
@@ -1941,14 +2092,19 @@ void SelectRows(const Tensor& source, const std::uint32_t* rows, void* out,
                                  rows, static_cast<unsigned char*>(out),
                                  source.bytes / source.rows);
 }
-void StoreKV(const float* k, const float* v, float* ck, float* cv, int n,
+void PackKV(const float* k, const float* v, Half* k16, Half* v16,
+            std::size_t count, hipStream_t s) {
+  if (count)
+    PackRows<<<(count + 255) / 256, 256, 0, s>>>(k, v, k16, v16, count);
+}
+void StoreKV(const Half* k, const Half* v, Half* ck, Half* cv, int n,
              int stride, int p, int cap, hipStream_t s) {
   Cache<<<(std::size_t(std::min(n, cap)) * stride + 255) / 256, 256, 0, s>>>(
       k, v, ck, cv, n, stride, p, cap);
 }
 void DecodeHeads(float* q, float* k, const float* v, const float* q_norm,
                  const float* k_norm, const float* frequencies,
-                 const float* factors, float* ck, float* cv, int heads,
+                 const float* factors, Half* ck, Half* cv, int heads,
                  int kv_heads, int d, int p, int cap, float eps,
                  hipStream_t s) {
   if (d != 128)

@@ -4,6 +4,13 @@ October 28, 2026, Strix Halo `gfx1151`, GCC 16.2 / ROCm 10.1 HIP Clang 24.
 Original BF16 and official Q8_0 GGUFs are pinned to Hugging Face revision
 `b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf`.
 
+Since November 8, 2026 every attention K/V cache is F16 (llama.cpp's default);
+the teacher comparisons below were measured with the earlier FP32 caches and
+were not repeated. The F16 path is gated by FP64 operator references over the
+stored F16 rows (decode `2e-6`, matrix-core prompts `1e-3`), the 513-token
+chunked/serial session gate (`0.002`; 0.00136 Q8_0, 0.00175 BF16) and the
+functional suites (see EXPERIMENTS.md).
+
 ## Independent checks
 
 The native BF16 path is compared against llama.cpp

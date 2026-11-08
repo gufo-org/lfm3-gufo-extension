@@ -198,7 +198,8 @@ std::vector<float> Vision::Encode(const Picture& p) {
   Buffer x(std::size_t(n) * 1024 * 4), z(std::size_t(n) * 4096 * 4),
       o(std::size_t(n) * 1024 * 4), mix(std::size_t(n) * 3072 * 4),
       q(std::size_t(n) * 1024 * 4), k(std::size_t(n) * 512 * 4),
-      v(std::size_t(n) * 512 * 4), a(std::size_t(n) * 1024 * 4),
+      v(std::size_t(n) * 512 * 4), k16(std::size_t(n) * 512 * 2),
+      v16(std::size_t(n) * 512 * 2), a(std::size_t(n) * 1024 * 4),
       gate(std::size_t(n) * 2560 * 4), up(std::size_t(n) * 2560 * 4),
       workspace(lfm3::gpu::DenseWorkspaceBytes(n, 4096));
   auto dense = [&](const Tensor& t, const float* in, float* out, int rows) {
@@ -231,7 +232,10 @@ std::vector<float> Vision::Encode(const Picture& p) {
                                              1e-5F, s);
       gpu::AxialRope(q.f(), p.height, p.width, 16, s);
       gpu::AxialRope(k.f(), p.height, p.width, 8, s);
-      lfm3_audio::gpu::Attention(q.f(), k.f(), v.f(), nullptr, nullptr, nullptr,
+      auto* kh = static_cast<std::uint16_t*>(k16.data);
+      auto* vh = static_cast<std::uint16_t*>(v16.data);
+      lfm3::gpu::PackKV(k.f(), v.f(), kh, vh, std::size_t(n) * 512, s);
+      lfm3_audio::gpu::Attention(q.f(), kh, vh, nullptr, nullptr, nullptr,
                                  a.f(), n, 16, 8, 64, 0, n, 0, false, s);
     } else {
       dense(b.in, z.f(), mix.f(), n);

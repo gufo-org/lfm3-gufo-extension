@@ -27,7 +27,7 @@ ContinuationLayout::ContinuationLayout(const Config& c, std::uint32_t context)
   add(ContinuationPart::kMetadata, 0, kContinuationMetadataBytes);
   for (std::uint32_t layer = 0; layer < c.layers.size(); ++layer) {
     const std::size_t row =
-        std::size_t{c.kv_heads[layer]} * c.head_dim * sizeof(float);
+        std::size_t{c.kv_heads[layer]} * c.head_dim * sizeof(std::uint16_t);
     switch (c.layers[layer]) {
       case LayerType::kConvolution:
         add(ContinuationPart::kConvolution, 0,

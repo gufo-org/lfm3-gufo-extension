@@ -36,6 +36,7 @@ struct Buffer {
   }
   Buffer(const Buffer&) = delete;
   float* floats() const { return static_cast<float*>(data); }
+  gpu::Half* halves() const { return static_cast<gpu::Half*>(data); }
 };
 struct Stream {
   hipStream_t value{};
@@ -120,7 +121,7 @@ struct Session::Impl {
     std::uint32_t capacity{};
   };
   std::vector<State> states;
-  Buffer quantized, row_max, attention_scratch, frequencies;
+  Buffer quantized, row_max, attention_scratch, frequencies, chunk_k, chunk_v;
   Impl(std::shared_ptr<Model> m, std::uint32_t ctx, std::size_t rows = kChunk)
       : model(std::move(m)),
         context(ctx),
@@ -148,6 +149,8 @@ struct Session::Impl {
         Buffer(gpu::AttentionScratchBytes(c.heads, c.head_dim, ctx, rows));
     // Global then sliding-window RoPE frequencies.
     frequencies = Buffer(std::size_t(c.head_dim) * 4);
+    chunk_k = Buffer(rows * c.heads * c.head_dim * sizeof(gpu::Half));
+    chunk_v = Buffer(rows * c.heads * c.head_dim * sizeof(gpu::Half));
     gpu::RopeFrequencies(frequencies.floats(), c.head_dim, c.theta,
                          stream.value);
     gpu::RopeFrequencies(frequencies.floats() + c.head_dim / 2, c.head_dim,
@@ -163,8 +166,8 @@ struct Session::Impl {
         s.capacity = c.layers[i] == LayerType::kSlidingAttention
                          ? std::min(ctx, c.window)
                          : ctx;
-        s.k = Buffer(std::size_t(s.capacity) * c.kv_heads[i] * c.head_dim * 4);
-        s.v = Buffer(std::size_t(s.capacity) * c.kv_heads[i] * c.head_dim * 4);
+        s.k = Buffer(std::size_t(s.capacity) * c.kv_heads[i] * c.head_dim * 2);
+        s.v = Buffer(std::size_t(s.capacity) * c.kv_heads[i] * c.head_dim * 2);
       }
       states.push_back(std::move(s));
     }
@@ -287,20 +290,24 @@ struct Session::Impl {
         const auto attend = [&](Impl& owner, std::size_t row,
                                 std::size_t count) {
           auto& state = owner.states[i];
+          const auto stride = std::size_t(c.kv_heads[i]) * c.head_dim;
           auto* qr = q.floats() + row * c.heads * c.head_dim;
-          auto* kr = k.floats() + row * c.kv_heads[i] * c.head_dim;
-          auto* vr = v.floats() + row * c.kv_heads[i] * c.head_dim;
+          auto* kr = k.floats() + row * stride;
+          auto* vr = v.floats() + row * stride;
+          auto* ck = state.k.halves();
+          auto* cv = state.v.halves();
           const float* table =
               frequencies.floats() + (swa ? c.head_dim / 2 : 0);
+          auto* gr = gate.floats() + row * c.heads;
+          auto* ar = a.floats() + row * c.heads * c.head_dim;
           if (rows) {
             gpu::DecodeHeads(
                 qr, kr, vr, static_cast<const float*>(l.q_norm.data),
-                static_cast<const float*>(l.k_norm.data), table, factors,
-                state.k.floats(), state.v.floats(), c.heads, c.kv_heads[i],
-                c.head_dim, owner.position, state.capacity, c.eps, s);
-            gpu::Attention(qr, kr, vr, gate.floats() + row * c.heads,
-                           state.k.floats(), state.v.floats(),
-                           a.floats() + row * c.heads * c.head_dim, 1, c.heads,
+                static_cast<const float*>(l.k_norm.data), table, factors, ck,
+                cv, c.heads, c.kv_heads[i], c.head_dim, owner.position,
+                state.capacity, c.eps, s);
+            const auto slot = owner.position % state.capacity * stride;
+            gpu::Attention(qr, ck + slot, cv + slot, gr, ck, cv, ar, 1, c.heads,
                            c.kv_heads[i], c.head_dim, owner.position,
                            state.capacity, swa ? c.window : 0, s,
                            owner.attention_scratch.floats());
@@ -310,22 +317,23 @@ struct Session::Impl {
                     owner.position, s);
           gpu::Rope(kr, table, factors, count, c.kv_heads[i], c.head_dim,
                     owner.position, s);
+          // Full-attention rows never wrap, so the chunk is packed in place.
+          // A sliding ring is written only after attention read its history.
+          gpu::Half* kc = swa ? chunk_k.halves() : ck + owner.position * stride;
+          gpu::Half* vc = swa ? chunk_v.halves() : cv + owner.position * stride;
+          gpu::PackKV(kr, vr, kc, vc, count * stride, s);
           if (c.decision && !swa)
             gpu::BidirectionalAttention(
-                qr, kr, vr, gate.floats() + row * c.heads,
-                a.floats() + row * c.heads * c.head_dim, count, c.heads,
-                c.kv_heads[i], s,
+                qr, kc, vc, gr, ar, count, c.heads, c.kv_heads[i], s,
                 static_cast<const std::int32_t*>(decision_groups.data));
           else
-            gpu::Attention(qr, kr, vr, gate.floats() + row * c.heads,
-                           state.k.floats(), state.v.floats(),
-                           a.floats() + row * c.heads * c.head_dim, count,
-                           c.heads, c.kv_heads[i], c.head_dim, owner.position,
+            gpu::Attention(qr, kc, vc, gr, ck, cv, ar, count, c.heads,
+                           c.kv_heads[i], c.head_dim, owner.position,
                            state.capacity, swa ? c.window : 0, s,
                            owner.attention_scratch.floats());
-          gpu::StoreKV(kr, vr, state.k.floats(), state.v.floats(), count,
-                       c.kv_heads[i] * c.head_dim, owner.position,
-                       state.capacity, s);
+          if (swa)
+            gpu::StoreKV(kc, vc, ck, cv, count, stride, owner.position,
+                         state.capacity, s);
         };
         if (batch.empty())
           attend(*this, 0, n);
@@ -573,8 +581,7 @@ bool Session::ForwardEmbeddings(std::span<const float> rows, bool on_device,
       throw std::invalid_argument(
           "invalid LFM3 embedding/logit count or context exhausted");
     if (hooks_)
-      hooks_->BeforeWrite(impl_->position,
-                          impl_->position + std::uint32_t(n));
+      hooks_->BeforeWrite(impl_->position, impl_->position + std::uint32_t(n));
     for (std::size_t offset = 0; offset < n; offset += Impl::kChunk) {
       const auto count = std::min(Impl::kChunk, n - offset);
       try {
@@ -779,7 +786,7 @@ void Session::FinishRestore(std::uint32_t position) {
   impl_->poisoned = false;
 }
 namespace {
-constexpr std::uint32_t kSnapshotMagic = 0x334d464c, kSnapshotVersion = 1;
+constexpr std::uint32_t kSnapshotMagic = 0x334d464c, kSnapshotVersion = 2;
 constexpr std::size_t kSnapshotHeaderBytes = 32;
 void WriteWord(std::span<std::uint8_t> data, std::size_t word,
                std::uint32_t value) {
@@ -821,7 +828,7 @@ std::size_t StateBytes(const Config& c, std::uint32_t position) {
                  : std::size_t(c.layers[i] == LayerType::kSlidingAttention
                                    ? std::min(position, c.window)
                                    : position) *
-                       c.kv_heads[i] * c.head_dim * 8;
+                       c.kv_heads[i] * c.head_dim * 2 * sizeof(gpu::Half);
   return bytes;
 }
 }  // namespace
@@ -881,7 +888,7 @@ std::vector<std::uint8_t> Session::SaveSnapshot() const {
       copy(state.conv.data, std::size_t(c.hidden) * (c.conv_width - 1) * 4);
     else {
       auto size = std::size_t(std::min(impl_->position, state.capacity)) *
-                  c.kv_heads[i] * c.head_dim * 4;
+                  c.kv_heads[i] * c.head_dim * sizeof(gpu::Half);
       copy(state.k.data, size);
       copy(state.v.data, size);
     }
@@ -923,7 +930,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> bytes,
           copy(state.conv.data, std::size_t(c.hidden) * (c.conv_width - 1) * 4);
         else {
           auto size = std::size_t(std::min(position, state.capacity)) *
-                      c.kv_heads[i] * c.head_dim * 4;
+                      c.kv_heads[i] * c.head_dim * sizeof(gpu::Half);
           copy(state.k.data, size);
           copy(state.v.data, size);
         }

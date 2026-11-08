@@ -38,6 +38,10 @@ int main() {
           k[i] = std::cos(i * .13) * .3;
           v[i] = std::sin(i * .09);
         }
+        // K and V are stored as F16; the reference uses the stored values.
+        for (auto* x : {&k, &v})
+          for (auto& e : *x)
+            e = float(static_cast<_Float16>(e));
         for (std::size_t i = 0; i < gate.size(); ++i)
           gate[i] = std::cos(i * .07);
         std::vector<std::int32_t> groups(n);
@@ -46,9 +50,14 @@ int main() {
         Device group_device(n);
         Check(hipMemcpy(group_device.p, groups.data(), groups.size() * 4,
                         hipMemcpyHostToDevice));
-        Device dq(q), dk(k), dv(v), dg(gate), out(q.size());
-        gufo::models::lfm3::gpu::BidirectionalAttention(
-            dq.p, dk.p, dv.p, dg.p, out.p, n, heads, kh, nullptr,
+        Device dq(q), dk(k), dv(v), dg(gate), out(q.size()), k16(k.size()),
+            v16(k.size());
+        namespace g = gufo::models::lfm3::gpu;
+        auto* kh16 = reinterpret_cast<g::Half*>(k16.p);
+        auto* vh16 = reinterpret_cast<g::Half*>(v16.p);
+        g::PackKV(dk.p, dv.p, kh16, vh16, k.size(), nullptr);
+        g::BidirectionalAttention(
+            dq.p, kh16, vh16, dg.p, out.p, n, heads, kh, nullptr,
             packed ? reinterpret_cast<const std::int32_t*>(group_device.p)
                    : nullptr);
         auto actual = out.Read(q.size());
