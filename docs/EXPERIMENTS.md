@@ -142,3 +142,35 @@ functional suites, LFM3-Audio ASR of the English fixture (exact transcript), a
 TTS round trip transcribed back word for word, and a 41.5K-token needle
 retrieval. Snapshot version 2 and continuation layout version 2 reject FP32
 state.
+
+## November 8 pass: prompt processing
+
+Q8_0 `gufo bench` pp2048 / tg128 against the F16-cache commit (`0f6c662`).
+Microbenchmarks ran at model shapes with 512-row chunks.
+
+| Depth | Before | After |
+| ---: | --- | --- |
+| 0 | 5179 / 110.3 | 6282 / 110.4 |
+| 8K | 4677 / 103.7 | 5731 / 103.5 |
+| 16K | 4187 / 98.1 | 5064 / 97.9 |
+| 32K | 3582 / 88.7 | 4419 / 88.6 |
+| 128K | 2040 / 60.3 | 2569 / 60.3 |
+
+| Mechanism | Decision and evidence |
+| --- | --- |
+| Register-resident weights (`RegQ8Gemm`): each wave owns its rows, so weights load straight into WMMA registers and only activations pass through LDS; products transposed so each lane scales by its own row's Q8 scale | Retained. Byte-identical to `SplitQ8Gemm` without splits; 16 KB LDS fits 3 blocks per WGP (60 slots) instead of 2. |
+| Tail split-K: tiles of the last partial wave of resident blocks split across K, last part sums partials in part order | Retained. Deterministic; FP64 projection error unchanged. Projections per layer-chunk: out 294 → 240 µs, FFN 2804 → 2587 µs. A part costs about four K blocks, so the planner skips in_proj. |
+| q/k/v/gate in one wide launch (waves past a narrow job's rows skip products) | Retained, byte-identical: 460 → 375 µs. |
+| Trailing-row pruning: only the frontier row leaves the last layer; after the last full-attention layer's K/V, its remaining work and the final convolution layer run on the last 7 (then 1) rows | Retained. Exact by construction (decision and batched rows excluded); 1500-token prompt + 24 decode steps: max logit change 3e-6, argmax identical. About +6.6% at depth 0, +9.7% at 32K. |
+| Prompt Q/K norms, RoPE and F16 K/V packing in one launch (`DecodeHeadsKernel` over rows); convolution sliding a 7-tap window down 16 rows | Retained, byte-identical logits: +2.6% at depth 0. |
+| Attention: skip masking on interior tiles, skip the accumulator rescale when every alpha is exactly 1, fold the softmax scale into Q before its split | Retained. Mask/rescale skips byte-identical; scale fold keeps the FP64 error (8.4e-6 at 128K). About 8% faster attention. |
+| At most 8 prompt key spans (was 16) | Retained: 32K layer 5.95 → 5.62 ms, error unchanged. |
+| 768 / 1024-row chunks | Rejected again: 5630 / 5530 versus 5725 at 512. |
+| 4×2 waves, 128-token tiles, 4-wave blocks, two K blocks per barrier, half-row weight loads with `v_permlanex16` | Rejected: neutral or slower (128-token tiles spill). |
+| Q high/remainder packed into one register set | Impossible: gfx1151 WMMA lanes 0-15 compute even output rows and 16-31 odd rows, each from its own full operand copy (a garbage-filled probe changes results). |
+| Attention LDS double buffer (one barrier per tile); more key spans or group-fastest grid for few-row tails | Rejected: neutral. A 7-row tail at 128K reads 268 MB of K/V at about 215 GB/s, so it is DRAM-bound. |
+
+Pure WMMA reaches about 51 TFLOPS on this device; the split GEMM runs at
+about 37 raw TFLOPS. Ablation: weight loads about 9%, activation loads 5%,
+barrier 3%. Attention is about 60% WMMA time, 10% K/V loads. The remaining
+large levers lower precision (F16-only activations or Q) and need a decision.
