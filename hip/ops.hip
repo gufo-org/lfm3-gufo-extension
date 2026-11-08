@@ -919,6 +919,45 @@ __global__ void Convolution(const float* p, const float* w,
   }
   y[std::size_t(row) * H + ch] = sum * p[std::size_t(row) * 3 * H + H + ch];
 }
+// Convolution for a fixed width: a thread slides one channel's window down
+// kConvRows rows, forming each B*x product once; every output keeps the
+// per-row FMA order.
+constexpr int kConvRows = 16;
+template<int L>
+__global__ void ConvolutionWindow(const float* p, const float* w,
+                                  const float* history, float* y, int n,
+                                  int H) {
+  const int ch = blockIdx.x * blockDim.x + threadIdx.x,
+            first = blockIdx.y * kConvRows;
+  if (ch >= H)
+    return;
+  float taps[L], window[L];
+#pragma unroll
+  for (int t = 0; t < L; ++t)
+    taps[t] = w[ch * L + t];
+  const auto bx = [&](int source) {
+    return source >= 0 ? p[std::size_t(source) * 3 * H + ch] *
+                             p[std::size_t(source) * 3 * H + 2 * H + ch]
+                       : history[ch * (L - 1) + (L - 1) + source];
+  };
+  // window[t] holds the product of row - (L - 1) + t.
+#pragma unroll
+  for (int t = 0; t < L - 1; ++t)
+    window[t + 1] = bx(first - (L - 1) + t);
+  const int last = min(first + kConvRows, n);
+#pragma unroll 4
+  for (int row = first; row < last; ++row) {
+#pragma unroll
+    for (int t = 0; t < L - 1; ++t)
+      window[t] = window[t + 1];
+    window[L - 1] = bx(row);
+    float sum = 0;
+#pragma unroll
+    for (int t = 0; t < L; ++t)
+      sum = fmaf(taps[t], window[t], sum);
+    y[std::size_t(row) * H + ch] = sum * p[std::size_t(row) * 3 * H + H + ch];
+  }
+}
 // Runs after Convolution: keeps the last L - 1 B*x products.
 __global__ void ConvolutionHistory(const float* p, float* history, int n, int H,
                                    int L) {
@@ -962,11 +1001,13 @@ __global__ void Rotary(float* x, const float* frequencies, const float* factors,
     x[head * D + pair + D / 2] = b * cs + a * sn;
   }
 }
-// One decode row: per-head Q/K RMSNorm, RoPE and the K/V cache store in one
-// launch. A block of D / 2 threads owns a head and a thread owns one RoPE
-// pair, which are also the two elements it normalizes. The squares, their
-// tree reduction and every later expression repeat
+// Per-head Q/K RMSNorm, RoPE and the F16 K/V store of rows in one launch.
+// A block of D / 2 threads owns a head of row blockIdx.y and a thread owns
+// one RoPE pair, which are also the two elements it normalizes. The
+// squares, their tree reduction and every later expression repeat
 // BatchedPerHeadRMSNormKernel and Rotary exactly, so results are unchanged.
+// With capacity, the one decode row goes to ring slot position % capacity;
+// without, row r goes to row r of ck and cv.
 template<int D>
 __launch_bounds__(D / 2) __global__ void DecodeHeadsKernel(
     float* __restrict__ q, float* __restrict__ k, const float* __restrict__ v,
@@ -974,9 +1015,13 @@ __launch_bounds__(D / 2) __global__ void DecodeHeadsKernel(
     const float* __restrict__ frequencies, const float* __restrict__ factors,
     Half* __restrict__ ck, Half* __restrict__ cv, int heads, int kv_heads,
     int position, int capacity, float eps) {
-  const int head = blockIdx.x, pair = threadIdx.x;
+  const int head = blockIdx.x, pair = threadIdx.x, row = blockIdx.y;
   const bool is_key = head >= heads;
   const int kvh = head - heads;
+  q += std::size_t(row) * heads * D;
+  k += std::size_t(row) * kv_heads * D;
+  v += std::size_t(row) * kv_heads * D;
+  position += row;
   float* x = is_key ? k + kvh * D : q + head * D;
   const float* weight = is_key ? k_norm : q_norm;
   const float x0 = x[pair], x1 = x[pair + D / 2];
@@ -1009,7 +1054,8 @@ __launch_bounds__(D / 2) __global__ void DecodeHeadsKernel(
   if (!is_key)
     return;
   const std::size_t slot =
-      std::size_t(position % capacity) * kv_heads * D + kvh * D;
+      std::size_t(capacity ? position % capacity : row) * kv_heads * D +
+      kvh * D;
   const auto f16 = [](float x) {
     return __builtin_bit_cast(Half, static_cast<_Float16>(x));
   };
@@ -2071,7 +2117,12 @@ void ShortConv(const float* p, const float* w, float* h, float* out, int n,
     ConvolutionStep<<<(H + 127) / 128, 128, 0, s>>>(p, w, h, out, H, L);
     return;
   }
-  Convolution<<<dim3((H + 127) / 128, n), 128, 0, s>>>(p, w, h, out, n, H, L);
+  if (L == 7)
+    ConvolutionWindow<7>
+        <<<dim3((H + 127) / 128, (n + kConvRows - 1) / kConvRows), 128, 0, s>>>(
+            p, w, h, out, n, H);
+  else
+    Convolution<<<dim3((H + 127) / 128, n), 128, 0, s>>>(p, w, h, out, n, H, L);
   ConvolutionHistory<<<(H + 127) / 128, 128, 0, s>>>(p, h, n, H, L);
 }
 void RopeFrequencies(float* out, int d, float theta, hipStream_t s) {
@@ -2181,5 +2232,15 @@ void DecodeHeads(float* q, float* k, const float* v, const float* q_norm,
   DecodeHeadsKernel<128><<<heads + kv_heads, 64, 0, s>>>(
       q, k, v, q_norm, k_norm, frequencies, factors, ck, cv, heads, kv_heads, p,
       cap, eps);
+}
+void PromptHeads(float* q, float* k, const float* v, const float* q_norm,
+                 const float* k_norm, const float* frequencies,
+                 const float* factors, Half* k16, Half* v16, int n, int heads,
+                 int kv_heads, int d, int p, float eps, hipStream_t s) {
+  if (d != 128)
+    throw std::invalid_argument("LFM3 prompt heads need dimension 128");
+  DecodeHeadsKernel<128><<<dim3(heads + kv_heads, n), 64, 0, s>>>(
+      q, k, v, q_norm, k_norm, frequencies, factors, k16, v16, heads, kv_heads,
+      p, 0, eps);
 }
 }  // namespace gufo::models::lfm3::gpu

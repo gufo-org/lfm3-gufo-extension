@@ -316,16 +316,9 @@ struct Session::Impl {
               out.floats() + o * c.hidden, rows_out, s);
       } else {
         gpu::Project(inputs, z.floats(), n, s, workspace, split);
-        // Decode rows normalize, rotate and cache in one launch per row.
+        // Rows normalize, rotate and store K/V in one launch (per decode
+        // row).
         const bool rows = !batch.empty() || (n == 1 && !c.decision);
-        if (!rows) {
-          gpu::LaunchBatchedPerHeadRMSNorm(
-              q.floats(), static_cast<const float*>(l.q_norm.data), q.floats(),
-              n, c.heads, c.head_dim, c.eps, s);
-          gpu::LaunchBatchedPerHeadRMSNorm(
-              k.floats(), static_cast<const float*>(l.k_norm.data), k.floats(),
-              n, c.kv_heads[i], c.head_dim, c.eps, s);
-        }
         const bool swa = c.layers[i] == LayerType::kSlidingAttention;
         const auto* factors =
             swa ? nullptr : static_cast<const float*>(w.rope_freqs.data);
@@ -355,15 +348,14 @@ struct Session::Impl {
                            owner.attention_scratch.floats());
             return;
           }
-          gpu::Rope(qr, table, factors, count, c.heads, c.head_dim,
-                    owner.position, s);
-          gpu::Rope(kr, table, factors, count, c.kv_heads[i], c.head_dim,
-                    owner.position, s);
           // Full-attention rows never wrap, so the chunk is packed in place.
           // A sliding ring is written only after attention read its history.
           gpu::Half* kc = swa ? chunk_k.halves() : ck + owner.position * stride;
           gpu::Half* vc = swa ? chunk_v.halves() : cv + owner.position * stride;
-          gpu::PackKV(kr, vr, kc, vc, count * stride, s);
+          gpu::PromptHeads(qr, kr, vr, static_cast<const float*>(l.q_norm.data),
+                           static_cast<const float*>(l.k_norm.data), table,
+                           factors, kc, vc, count, c.heads, c.kv_heads[i],
+                           c.head_dim, owner.position, c.eps, s);
           if (c.decision && !swa)
             gpu::BidirectionalAttention(
                 qr, kc, vc, gr, ar, count, c.heads, c.kv_heads[i], s,

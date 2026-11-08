@@ -95,6 +95,13 @@ void StoreKV(const Half* k, const Half* v, Half* cache_k, Half* cache_v, int n,
 // One decode row: per-head Q/K RMSNorm, RoPE and the F16 K/V cache store in
 // one launch; Q and K match the separate launches. Attention then reads the
 // current row from the cache slot.
+// The same for n prompt rows at position, packing K and V rows into k16
+// and v16 (n rows each) instead of a ring.
+void PromptHeads(float* q, float* k, const float* v, const float* q_norm,
+                 const float* k_norm, const float* frequencies,
+                 const float* factors, Half* k16, Half* v16, int n, int heads,
+                 int kv_heads, int dim, int position, float eps,
+                 hipStream_t stream);
 void DecodeHeads(float* q, float* k, const float* v, const float* q_norm,
                  const float* k_norm, const float* frequencies,
                  const float* factors, Half* cache_k, Half* cache_v, int heads,
