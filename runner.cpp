@@ -122,7 +122,14 @@ public:
                              .final_token_advance_required = true,
                              .incremental_text_is_exact = true,
                              .prefix_reuse = true,
-                             .partial_prefill_retention = true}};
+                             .partial_prefill_retention = true},
+            // Each prefill pass is the engine's 512-row workspace, the
+            // host's decode-active budget. A pass that short gets one layer
+            // group from the host, so passes run unsplit beside decoders.
+            .scheduling = TextSchedulingProfile{
+                .pass_tokens = Session::kPrefillChunk,
+                .max_layer_groups = 1,
+                .max_yield_decode_width = Session::kMaxBatch}};
   }
   TextRunnerResourceClaim ResourceClaim() const override {
     return {.resident_weights_bytes = 0,

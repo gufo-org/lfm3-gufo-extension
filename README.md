@@ -11,8 +11,8 @@ backbone:
 - d1-Omni-2B decisions over text, images and audio, through `gufo decide` and
   `gufo serve decision` ([d1](docs/d1/README.md)).
 
-The extension needs a Gufo with extension API 0.2.0 or
-newer (Gufo [#1026](https://github.com/gufo-org/gufo/pull/1026)); see
+The extension needs a Gufo with extension API 0.2.16 or newer (Gufo
+[#1039](https://github.com/gufo-org/gufo/pull/1039), scheduling profiles); see
 [TODO.md](TODO.md). Functional suites are in
 [tests/functional](tests/functional/README.md).
 
@@ -99,7 +99,10 @@ The CLI reserves 8192 tokens; HTTP accepts `--context` up to the native 262144.
 The native limit is a loader limit, not a qualification of maximum-depth quality
 or speed. HTTP supports Chat Completions, Responses and Messages, custom stops,
 structured JSON and native tool calls. Sessions have independent FP32 state;
-the scheduler batches up to eight autoregressive decode rows. RAM checkpoints,
+the scheduler batches up to eight autoregressive decode rows. Beside decoding
+sessions, a prompt advances in the engine's 512-token passes, one decode round
+between passes; the scheduling profile asks for no layer split, since one such
+pass takes about 0.1 s at depth zero. RAM checkpoints,
 prefix reuse, cancellation recovery and restart-safe disk checkpoints use the
 component cache: full-attention rows are shared between checkpoints, while
 convolution state and sliding windows are private. Speculative decoding and image inputs remain
