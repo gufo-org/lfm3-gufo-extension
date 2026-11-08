@@ -2135,7 +2135,7 @@ void Rope(float* x, const float* frequencies, const float* f, int n, int h,
   Rotary<<<(n * h + rows * kRopeRows - 1) / (rows * kRopeRows), threads, 0,
            s>>>(x, frequencies, f, n, h, d, p);
 }
-constexpr int kMinPromptSpan = 2048, kMaxPromptSplits = 16;
+constexpr int kMinPromptSpan = 2048, kMaxPromptSplits = 8;
 int PromptSplits(int keys, int& span) {
   span = std::max(kMinPromptSpan,
                   (keys + kMaxPromptSplits - 1) / kMaxPromptSplits);
