@@ -1,0 +1,77 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.1.8",
+      "memoryTotalBytes": 134310215680,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "10.1.0",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "a568074ce6fb9029f7abb69112fa248ea6da887b8ad8287029f4126144caff1e",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-11-08",
+  "mode": null,
+  "model": {
+    "id": "LFM3-1.7B",
+    "variant": null
+  },
+  "notes": [
+    "peak device-global hipMemGetInfo used bytes (total - free), sampled every 250 ms during the request; idle_gib is the same counter before the server started",
+    "server mode: ar"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "16K prefix, pp4096 + tg128": {
+      "command": "gufo serve --port 59501 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133121 --served-model-name bench --think off --max-pending-per-client 8",
+      "gib": 12.61,
+      "idle_gib": 2.38
+    },
+    "pp2048 + tg128": {
+      "command": "gufo serve --port 59501 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133121 --served-model-name bench --think off --max-pending-per-client 8",
+      "gib": 11.98,
+      "idle_gib": 2.38
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "gufo",
+      "serve",
+      "--port",
+      "59501",
+      "--sessions",
+      "1",
+      "llm",
+      "--model",
+      "LFM3-1.7B-Q8_0.gguf",
+      "--context",
+      "133121",
+      "--served-model-name",
+      "bench",
+      "--think",
+      "off",
+      "--max-pending-per-client",
+      "8"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "12f8d8ab9a944b2df3efe388b44246ec37923c53"
+  },
+  "table": "memory",
+  "target": "gufo"
+}

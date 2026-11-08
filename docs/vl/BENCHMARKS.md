@@ -1,19 +1,28 @@
-# LFM3-VL measurement scope
+# LFM3-VL 2B benchmarks
 
-No matched end-to-end comparison or performance headline is qualified yet.
-Focused HTTP evidence retains individual prefill/decode timings in
-[qualification metrics](artifacts/qualification.json); those are observations.
-The full native context and large-image workloads remain unmeasured.
+AMD Strix Halo `gfx1151`, 128 GB unified memory. Official `Q8_0` backbone and
+BF16 projector (`b36554cf`). HTTP, greedy, thinking off. Gufo `12f8d8ab` with
+this extension (November 8, 2026). Positive gain favors Gufo. **TODO** means
+unmeasured: the llama.cpp reference (b12205 or newer) has not been run yet.
+[Quality](QUALITY.md) · [Benchmark configuration](artifacts/bench.json)
 
-The standard backbone smoke benchmark is retained locally as
-`artifacts/lfm3-vl/backbone-bench.log`:
+## Image encoder
 
-```sh
-gufo bench --model models/lfm3-vl/LFM3-VL-2B-Q8_0.gguf \
-  -p 128 -n 128 -r 1
-```
+Prompt time of a request carrying one gradient PNG and a one-line question,
+one output token, prompt cache off: image decoding and resizing, the vision
+tower, the projector and the prefill of the image and text tokens. One warmup,
+then the mean of three requests per size.
 
-This measures text-backbone work only. It excludes image decoding, resize,
-vision encoding and projector work, so it is not a multimodal throughput
-claim. See [quality](QUALITY.md) for the independent numerical checks and
-scope of the HTTP histories.
+<!-- bench:image-encoder -->
+| LFM3-VL 2B Q8_0 vision<br>RGB image | Merged tokens | Gufo ms | llama.cpp ms | Gain |
+| --- | ---: | ---: | ---: | ---: |
+| 256×256 | 64 | 92.4 ± 0.3 | TODO | TODO |
+| 512×512 | 256 | 218.4 ± 0.3 | TODO | TODO |
+| 768×768 | 576 | 556.2 ± 1.9 | TODO | TODO |
+| 1024×1024 | 1024 | 1376.0 ± 8.0 | TODO | TODO |
+<!-- /bench -->
+
+![Image encoder](artifacts/charts/image-encoder.svg)
+
+Text-only speed of this backbone, throughput beside other sessions and
+images larger than 1024×1024 are not measured.
