@@ -44,11 +44,11 @@ void TestBytes() {
   const l::ContinuationLayout layout(Geometry(), 8192);
   const std::size_t expected = 65536 * 4 + 2048 * 4 +
                                l::kContinuationMetadataBytes +
-                               2 * 2048 * 3 * 4 + 2 * 512 * 4 * 64 * 4;
+                               2 * 2048 * 3 * 4 + 2 * 512 * 4 * 64 * 2;
   Require(layout.PrivateBytes() == expected, "private bytes");
-  Require(layout.RowBytes(1000) == 2 * 1000 * 8 * 64 * 4, "row bytes");
+  Require(layout.RowBytes(1000) == 2 * 1000 * 8 * 64 * 2, "F16 row bytes");
   const l::ContinuationLayout small(Geometry(), 100);
-  Require(small.PrivateBytes() == expected - 2 * (512 - 100) * 4 * 64 * 4,
+  Require(small.PrivateBytes() == expected - 2 * (512 - 100) * 4 * 64 * 2,
           "a ring holds at most the context");
 }
 void TestPositions() {

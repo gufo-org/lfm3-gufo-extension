@@ -214,13 +214,17 @@ __global__ void LayerNormKernel(const float* x, const float* w, const float* b,
   for (int i = threadIdx.x; i < dim; i += blockDim.x)
     y[std::size_t(blockIdx.x) * dim + i] = (row[i] - mean) * inv * w[i] + b[i];
 }
-// One wave per (head, query). Lanes own dim / 32 elements each.
+__device__ __forceinline__ float Widen(std::uint16_t h) {
+  return float(__builtin_bit_cast(_Float16, h));
+}
+// One wave per (head, query) over F16 K/V. Lanes own dim / 32 elements each.
 template<int P>
-__global__ void AttentionKernel(const float* q, const float* k, const float* v,
-                                const float* gate, const float* ck,
-                                const float* cv, float* y, int n, int heads,
-                                int kh, int position, int capacity, int window,
-                                bool causal) {
+__global__ void AttentionKernel(const float* q, const std::uint16_t* k,
+                                const std::uint16_t* v, const float* gate,
+                                const std::uint16_t* ck,
+                                const std::uint16_t* cv, float* y, int n,
+                                int heads, int kh, int position, int capacity,
+                                int window, bool causal) {
   constexpr int D = P * 32;
   const int h = blockIdx.x, row = blockIdx.y, lane = threadIdx.x;
   const int query = position + row;
@@ -238,15 +242,14 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
     qv[p] = q[(std::size_t(row) * heads + h) * D + lane + p * 32];
   float maximum = -INFINITY, denominator = 0;
   for (int t = first; t <= last; ++t) {
-    const float* key = t >= position ? k + std::size_t(t - position) * stride
-                                     : ck + std::size_t(t % capacity) * stride;
-    const float* value = t >= position
-                             ? v + std::size_t(t - position) * stride
-                             : cv + std::size_t(t % capacity) * stride;
+    const auto* key = t >= position ? k + std::size_t(t - position) * stride
+                                    : ck + std::size_t(t % capacity) * stride;
+    const auto* value = t >= position ? v + std::size_t(t - position) * stride
+                                      : cv + std::size_t(t % capacity) * stride;
     float dot = 0;
 #pragma unroll
     for (int p = 0; p < P; ++p)
-      dot = fmaf(qv[p], key[kvh * D + lane + p * 32], dot);
+      dot = fmaf(qv[p], Widen(key[kvh * D + lane + p * 32]), dot);
     for (int offset = 16; offset; offset /= 2)
       dot += __shfl_xor(dot, offset, 32);
     const float score = dot * scale;
@@ -256,7 +259,7 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
     maximum = next;
 #pragma unroll
     for (int p = 0; p < P; ++p)
-      acc[p] = acc[p] * alpha + beta * value[kvh * D + lane + p * 32];
+      acc[p] = acc[p] * alpha + beta * Widen(value[kvh * D + lane + p * 32]);
   }
   const float g =
       gate ? 1.0F / (1.0F + expf(-gate[std::size_t(row) * heads + h])) : 1.0F;
@@ -692,10 +695,11 @@ void LayerNorm(const float* x, const float* w, const float* b, float* y, int n,
                int dim, float eps, hipStream_t s) {
   LayerNormKernel<<<n, 256, 0, s>>>(x, w, b, y, dim, eps);
 }
-void Attention(const float* q, const float* k, const float* v,
-               const float* gate, const float* ck, const float* cv, float* out,
-               int n, int heads, int kh, int dim, int position, int capacity,
-               int window, bool causal, hipStream_t s) {
+void Attention(const float* q, const std::uint16_t* k, const std::uint16_t* v,
+               const float* gate, const std::uint16_t* ck,
+               const std::uint16_t* cv, float* out, int n, int heads, int kh,
+               int dim, int position, int capacity, int window, bool causal,
+               hipStream_t s) {
   const dim3 grid(heads, n);
   switch (dim) {
     case 32:

@@ -1,6 +1,7 @@
 #include "../hip/ops.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <gufo/ext/experimental/ggml_dequant.hpp>
 #include <iostream>
@@ -124,12 +125,21 @@ void Rotary(int n) {
   Check(hipDeviceSynchronize());
   Near(b.Read(x.size()), expected, 2e-5F);
 }
-void Attention(int n, int window, int P = 259) {
-  constexpr int H = 4, KH = 2, D = 128;
+float Round16(float x) {
+  return float(static_cast<_Float16>(x));
+}
+// K and V are stored as F16, so the FP64 reference reads the rounded values.
+// Decode keeps Q and probabilities in FP32; prompts round both to F16 for
+// the matrix cores, which bounds their error near F16 resolution.
+void Attention(int n, int window, int P = 259, int H = 4, int KH = 2) {
+  constexpr int D = 128;
   const int capacity = window ? window : P + n, stride = KH * D;
   auto q = Data(n * H * D, 0.7F), k = Data(n * stride, 0.5F),
        v = Data(n * stride, 0.9F), gates = Data(n * H, 0.7F);
   auto ck = Data(capacity * stride, 0.6F), cv = Data(capacity * stride, 0.8F);
+  for (auto* x : {&k, &v, &ck, &cv})
+    for (auto& e : *x)
+      e = Round16(e);
   std::vector<float> expected(n * H * D);
   for (int row = 0; row < n; ++row)
     for (int h = 0; h < H; ++h) {
@@ -164,19 +174,35 @@ void Attention(int n, int window, int P = 259) {
       }
     }
   Buffer dq(q), dk(k), dv(v), dg(gates), dck(ck), dcv(cv), out(expected.size()),
+      k16(k.size()), v16(v.size()), ck16(ck.size()), cv16(cv.size()),
       scratch(g::AttentionScratchBytes(H, D, P + n, n) / 4);
-  g::Attention(dq.p, dk.p, dv.p, dg.p, dck.p, dcv.p, out.p, n, H, KH, D, P,
-               capacity, window, nullptr, scratch.p);
-  g::StoreKV(dk.p, dv.p, dck.p, dcv.p, n, stride, P, capacity, nullptr);
+  const auto half = [](const Buffer& b) {
+    return reinterpret_cast<g::Half*>(b.p);
+  };
+  g::PackKV(dk.p, dv.p, half(k16), half(v16), k.size(), nullptr);
+  g::PackKV(dck.p, dcv.p, half(ck16), half(cv16), ck.size(), nullptr);
+  g::Attention(dq.p, half(k16), half(v16), dg.p, half(ck16), half(cv16), out.p,
+               n, H, KH, D, P, capacity, window, nullptr, scratch.p);
+  g::StoreKV(half(k16), half(v16), half(ck16), half(cv16), n, stride, P,
+             capacity, nullptr);
   Check(hipDeviceSynchronize());
-  Near(out.Read(expected.size()), expected, 2e-6F);
+  Near(out.Read(expected.size()), expected, n == 1 ? 2e-6F : 1e-3F);
   for (int row = 0; row < n; ++row)
     for (int d = 0; d < stride; ++d) {
       ck[((P + row) % capacity) * stride + d] = k[row * stride + d];
       cv[((P + row) % capacity) * stride + d] = v[row * stride + d];
     }
-  Near(dck.Read(ck.size()), ck, 0);
-  Near(dcv.Read(cv.size()), cv, 0);
+  // The ring holds exactly the rounded rows.
+  const auto read = [&](const Buffer& b, std::size_t count) {
+    std::vector<g::Half> bits(count);
+    Check(hipMemcpy(bits.data(), b.p, count * 2, hipMemcpyDeviceToHost));
+    std::vector<float> x(count);
+    for (std::size_t i = 0; i < count; ++i)
+      x[i] = float(std::bit_cast<_Float16>(bits[i]));
+    return x;
+  };
+  Near(read(ck16, ck.size()), ck, 0);
+  Near(read(cv16, cv.size()), cv, 0);
 }
 }  // namespace
 int main() {
@@ -200,6 +226,12 @@ int main() {
     std::cerr << "prompt 17000\n";
     Attention(40, 0, 17000);
     Attention(40, 256, 17000);
+    // The model's 16 query and 4 KV heads.
+    std::cerr << "model heads\n";
+    for (int n : {1, 77, 512}) {
+      Attention(n, 0, 3000, 16, 4);
+      Attention(n, 256, 3000, 16, 4);
+    }
     std::cout << "PASS LFM3 convolution, RoPE, gated GQA and sliding ring "
                  "against independent formulas\n";
   } catch (const std::exception& e) {

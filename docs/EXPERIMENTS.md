@@ -91,3 +91,54 @@ Q8_0, pp2048/tg128 unless stated; quality evidence in QUALITY.md.
 The next prompt-depth lever is attention arithmetic. The current FP32 SIMT
 kernel reaches about 40% of the issue rate; matrix-core attention would need a
 precision decision (for example split FP16 products).
+
+## November 8 pass: decode launches and depth
+
+Q8_0, `gufo bench` CLI (not the HTTP tables in BENCHMARKS.md), Gufo
+`6d793814`. Attention timings are per global layer and 512-row chunk from a
+standalone operator benchmark with 16 heads, 4 KV heads and D = 128.
+
+| Mechanism | Decision and evidence |
+| --- | --- |
+| One launch for one-row q/k/v/gate GEMVs; gate/up GEMV with SwiGLU; per-head Q/K RMSNorm, RoPE and KV store in one kernel; in-place one-row convolution | Retained. Decode dropped from 322 to about 180 launches per token (about 2 µs idle each). Same expressions and reduction order: greedy decode logits are byte-identical for one session and a three-session batch. tg128 105.6 → 110.4 at depth 0, 73.7 → 76.2 at 32K. |
+| Prompt key spans of at least 2048 instead of 8192 | Retained. Balances causal blocks at mid depths: 8K 6.62 → 5.71 ms, 16K 11.7 → 11.0 ms. Lower FP64 error; a 9000-token prompt changes logits by at most 1.4e-5 (argmax unchanged). |
+| Split-FP16 WMMA prompt attention (Q, K, V and P as high/low pairs, three products) | Rejected. 86.5 → 68.9 ms at 128K, but about 10× the FP32 kernel's error and fails the 2e-6 operator gate. |
+| Register prefetch of the next K/V tile (prompt and decode) | Rejected. Prompt unchanged (latency already hidden by resident blocks, 208 → 252 VGPRs); decode 2.70 → 3.27 ms at 128K. |
+| 512-thread prompt blocks (twice the queries per K/V tile) | Rejected: slightly slower; not bound by K/V traffic. |
+| QK with scalar-register queries or readlane broadcasts instead of DPP | Rejected: SGPR/VGPR spills (2.5×–10× slower) and 5× slower. Ablation attributes about 59% of prompt-attention time to the DPP QK FMAs, which cannot dual-issue. |
+| Decode attention tile/split sizes (32/64 keys, 64–256 splits) | Neutral. Decode attention reads the FP32 KV cache at about 199 GB/s; lower KV precision is the remaining depth lever. |
+| Batched decode GEMM with 4 or 8 rows per wave | Rejected: slower than 2. |
+
+## November 8 pass: F16 K/V caches
+
+Every attention K/V cache in the extension is now F16, llama.cpp's default
+and Gufo's standard (Liquid AI ships BF16 weights and specifies no FP32 cache).
+The FP32 cache route was removed, not kept as an option. Q8_0 `gufo bench`
+pp2048 / tg128 against the committed FP32-cache build:
+
+| Depth | FP32 K/V | F16 K/V |
+| ---: | --- | --- |
+| 0 | 5019 / 110.3 | 5179 / 110.3 |
+| 8K | 3749 / 98.0 | 4677 / 103.7 |
+| 16K | 2958 / 88.9 | 4187 / 98.1 |
+| 32K | 2124 / 76.2 | 3582 / 88.7 |
+| 128K | 784 / 39.4 | 2040 / 60.3 |
+
+| Mechanism | Decision and evidence |
+| --- | --- |
+| Matrix-core prompt attention: S^T = K Q^T and O^T = V^T P^T, so lane L owns query L % 16 and the softmax needs one cross-half exchange; F16 K, V and probabilities, FP32 scores and accumulation | Retained. One global layer, 512 rows at 128K: 86.5 → 23.6 ms (with split Q below). |
+| Q as one F16 value | Rejected for quality. The 513-token chunked/serial session gate measured 0.0025 against 0.002; FP64 operator error about 3e-4. |
+| Q as F16 high part plus F16 remainder (two QK products) | Retained. FP64 error about 5× lower (6.7e-5 at depth 0, 1.1e-5 at depth); session gate 0.00136 Q8_0, 0.00175 BF16. Costs about 40% of attention time; the kernel then issues WMMA at about 60% of the F16 peak, 256 VGPRs. |
+| Loading each K/V tile at its use instead of a register prefetch | Rejected: 6.4 → 7.3 ms at 32K. |
+| Decode attention over the F16 ring with the V tile kept F16 in LDS | Retained. LDS 39 KB → 23 KB per block doubles resident blocks: 128K layer 1.59 → 1.32 ms (about 204 GB/s). |
+| Decode spans: 64 up to 64K keys, 128 beyond | Retained: 128K 1.32 → 1.26 ms; 128 spans hurt short histories. 32 or 256 spans and 128-key tiles were neutral or slower. |
+| Sliding rings | Full-attention chunks are packed straight into the cache; sliding chunks go through an F16 staging buffer and are written to the ring after attention reads the history. |
+
+Cache-free attention reads the same F16 rows: decision prompts (bidirectional
+TiledAttn), audio stacks (rings and stateless) and the VL encoder. Checks:
+operator FP64 references over the stored F16 values, session, continuation,
+D1 and VL contract tests, the VL (19 checks) and D1 packed (26 checks)
+functional suites, LFM3-Audio ASR of the English fixture (exact transcript), a
+TTS round trip transcribed back word for word, and a 41.5K-token needle
+retrieval. Snapshot version 2 and continuation layout version 2 reject FP32
+state.

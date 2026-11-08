@@ -155,7 +155,7 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
     for (unsigned i = 0; i < 4; ++i)
       identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
   };
-  put(1);  // Component layout version.
+  put(2);  // Component layout version: F16 K/V rows.
   put(context);
   for (const auto& component : layout_.Components())
     descriptors_.push_back(component.descriptor);

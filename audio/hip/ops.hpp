@@ -46,16 +46,17 @@ void FlattenChannels(const float* in, float* out, int width, int height,
                      int channels, hipStream_t stream);
 void LayerNorm(const float* x, const float* w, const float* b, float* y, int n,
                int dim, float eps, hipStream_t stream);
-// Attention for head dimensions that are multiples of 32, up to 128. Queries
-// of the current chunk sit at positions position..position + n - 1; earlier
-// keys come from a ring of capacity rows, the chunk's own keys from k/v.
-// window > 0 limits causal attention to the last window keys; causal false
-// attends to every row of the chunk (no cache). gate (n x heads) is optional.
-void Attention(const float* q, const float* k, const float* v,
-               const float* gate, const float* cache_k, const float* cache_v,
-               float* out, int n, int heads, int kv_heads, int dim,
-               int position, int capacity, int window, bool causal,
-               hipStream_t stream);
+// Attention over F16 K/V (IEEE binary16 bits), for head dimensions that are
+// multiples of 32, up to 128; scores and sums stay FP32. Queries of the chunk
+// sit at positions position..position + n - 1; earlier keys come from a ring of
+// capacity rows, the chunk's own keys from k/v. window > 0 limits causal
+// attention to the last window keys; causal false attends to every row of the
+// chunk (no cache). gate (n x heads) is optional.
+void Attention(const float* q, const std::uint16_t* k, const std::uint16_t* v,
+               const float* gate, const std::uint16_t* cache_k,
+               const std::uint16_t* cache_v, float* out, int n, int heads,
+               int kv_heads, int dim, int position, int capacity, int window,
+               bool causal, hipStream_t stream);
 // out[c, :] = base[c, :] + (masked[c] ? mask : table[c * size + codes[c]]).
 void DepthInputs(const float* base, const float* mask, const Tensor& table,
                  const std::int32_t* codes, const std::int32_t* masked,

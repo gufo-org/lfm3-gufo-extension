@@ -56,27 +56,43 @@ void ShortConv(const float* projection, const float* weight, float* history,
 void RopeFrequencies(float* out, int dim, float theta, hipStream_t stream);
 void Rope(float* x, const float* frequencies, const float* factors, int n,
           int heads, int dim, int position, hipStream_t stream);
-// Reads previous cached rows plus the current chunk. Cache writes follow this
-// launch, so a sliding ring cannot overwrite history needed by early queries.
-// Long histories split their keys across blocks through scratch of
+// IEEE binary16 bits. Attention K/V caches and chunk rows are F16.
+using Half = std::uint16_t;
+// Causal attention of n query rows at position. Key rows at or after
+// position come from k and v (n F16 rows), earlier rows from the ring
+// (slot t % capacity), so a sliding ring is written after this launch. Prompt
+// rows run on the matrix cores with F16 Q and probabilities; decode (n == 1)
+// keeps Q and probabilities in FP32. Both accumulate in FP32. Long histories
+// split their keys across blocks through scratch of
 // AttentionScratchBytes(heads, dim, context, rows) bytes, where rows bounds
 // the queries of one call.
-void Attention(const float* q, const float* k, const float* v,
-               const float* gate, const float* cache_k, const float* cache_v,
-               float* out, int n, int heads, int kv_heads, int dim,
-               int position, int capacity, int window, hipStream_t stream,
-               float* scratch = nullptr);
+void Attention(const float* q, const Half* k, const Half* v, const float* gate,
+               const Half* cache_k, const Half* cache_v, float* out, int n,
+               int heads, int kv_heads, int dim, int position, int capacity,
+               int window, hipStream_t stream, float* scratch);
 std::size_t AttentionScratchBytes(int heads, int dim, int context, int rows);
-// Complete bidirectional prompt, without a persistent cache.
-void BidirectionalAttention(const float* q, const float* k, const float* v,
+// Complete bidirectional prompt over n F16 K/V rows, without the ring.
+void BidirectionalAttention(const float* q, const Half* k, const Half* v,
                             const float* gate, float* out, int n, int heads,
                             int kv_heads, hipStream_t stream,
                             const std::int32_t* groups = nullptr);
 // Packed row copies; preserves the tensor's encoded row bytes exactly.
 void SelectRows(const Tensor& source, const std::uint32_t* rows, void* out,
                 int count, hipStream_t stream);
-void StoreKV(const float* k, const float* v, float* cache_k, float* cache_v,
-             int n, int stride, int position, int capacity, hipStream_t stream);
+// Rounds count values of k and v to F16.
+void PackKV(const float* k, const float* v, Half* k16, Half* v16,
+            std::size_t count, hipStream_t stream);
+// Copies n F16 rows into the ring at position.
+void StoreKV(const Half* k, const Half* v, Half* cache_k, Half* cache_v, int n,
+             int stride, int position, int capacity, hipStream_t stream);
+// One decode row: per-head Q/K RMSNorm, RoPE and the F16 K/V cache store in
+// one launch; Q and K match the separate launches. Attention then reads the
+// current row from the cache slot.
+void DecodeHeads(float* q, float* k, const float* v, const float* q_norm,
+                 const float* k_norm, const float* frequencies,
+                 const float* factors, Half* cache_k, Half* cache_v, int heads,
+                 int kv_heads, int dim, int position, int capacity, float eps,
+                 hipStream_t stream);
 
 void LaunchBatchedRMSNorm(const float* x, const float* weight, float* out,
                           void* out_bf16, std::size_t batch_size,
