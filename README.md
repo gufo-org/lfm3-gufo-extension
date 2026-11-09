@@ -11,8 +11,8 @@ backbone:
 - d1-Omni-2B decisions over text, images and audio, through `gufo decide` and
   `gufo serve decision` ([d1](docs/d1/README.md)).
 
-The extension needs a Gufo with extension API 0.2.16 or newer (Gufo
-[#1039](https://github.com/gufo-org/gufo/pull/1039), scheduling profiles).
+The extension needs a Gufo with extension API 0.2.20 or newer (Gufo
+[#1110](https://github.com/gufo-org/gufo/pull/1110), shared WAV decoding).
 Functional suites are in [tests/functional](tests/functional/README.md).
 
 The 24-layer backbone mixes 13 gated width-seven convolutions, five sliding

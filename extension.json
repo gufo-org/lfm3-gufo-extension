@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "name": "lfm3",
-  "api_version": ">= 0.2.16",
-  "version": "0.4.0",
+  "api_version": ">= 0.2.20",
+  "version": "0.5.0",
   "depends": [],
   "platforms": ["linux"],
   "entry": "lfm3_register",
