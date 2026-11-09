@@ -78,11 +78,20 @@ void Attention(const float* q, const Half* k, const Half* v, const float* gate,
                int heads, int kv_heads, int dim, int position, int capacity,
                int window, hipStream_t stream, float* scratch);
 std::size_t AttentionScratchBytes(int heads, int dim, int context, int rows);
-// Complete bidirectional prompt over n F16 K/V rows, without the ring.
+// Complete bidirectional prompt over n F16 K/V rows, without the ring, in
+// FP32. A null gate leaves the output ungated.
 void BidirectionalAttention(const float* q, const Half* k, const Half* v,
                             const float* gate, float* out, int n, int heads,
                             int kv_heads, hipStream_t stream,
-                            const std::int32_t* groups = nullptr);
+                            const std::int32_t* groups = nullptr,
+                            int dim = 128);
+// The same over FP32 K/V rows, ungated, for stateless encoders that keep no
+// cache to narrow.
+void BidirectionalAttention(const float* q, const float* k, const float* v,
+                            float* out, int n, int heads, int kv_heads, int dim,
+                            hipStream_t stream);
+// Head dimension 64 or 128 with at most eight query heads per KV head.
+bool SupportsBidirectionalAttention(int heads, int kv_heads, int dim);
 // Packed row copies; preserves the tensor's encoded row bytes exactly.
 void SelectRows(const Tensor& source, const std::uint32_t* rows, void* out,
                 int count, hipStream_t stream);

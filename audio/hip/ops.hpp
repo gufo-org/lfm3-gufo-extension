@@ -11,7 +11,9 @@ enum class Activation { kNone, kSilu, kGelu };
 // y[n, M] = act(x[n, K] W[M, K]^T + bias), with an F32 weight.
 void Sgemm(const float* x, const float* w, const float* bias, float* y, int n,
            int M, int K, Activation act, hipStream_t stream);
-// The same with BF16 weights [M][K], read once per 64 rows of x.
+// The same with BF16 weights [M][K]. With M % 128 == 0 and K % 32 == 0 it
+// runs on the BF16 matrix cores with activations split into three exact BF16
+// terms; the error stays below a sequential FP32 dot product's.
 void SgemmBf16(const float* x, const void* w, const float* bias, float* y,
                int n, int M, int K, Activation act, hipStream_t stream);
 // out = silu(gate) * up.

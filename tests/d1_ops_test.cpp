@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "../audio/hip/ops.hpp"
 #include "../hip/ops.hpp"
 #include "../vl/hip/ops.hpp"
 void Check(hipError_t s) {
@@ -27,9 +28,17 @@ struct Device {
 };
 int main() {
   try {
-    for (bool packed : {false, true})
-      for (int n : {1, 7, 15, 17, 33, 65}) {
-        constexpr int heads = 16, kh = 4, dim = 128;
+    struct Shape {
+      int heads, kh, dim;
+      bool gated, packed;
+    };
+    // d1's gated D = 128 backbone heads (also packed into groups) and the
+    // vision tower's ungated D = 64 heads, two per KV head.
+    for (auto [heads, kh, dim, gated, packed] :
+         {Shape{16, 4, 128, true, false}, Shape{16, 4, 128, true, true},
+          Shape{16, 8, 64, false, false}})
+      for (int n : {1, 7, 15, 17, 33, 65, 300, 1200}) {
+        const int group = heads / kh;
         std::vector<float> q(n * heads * dim), k(n * kh * dim), v(k.size()),
             gate(n * heads);
         for (std::size_t i = 0; i < q.size(); ++i)
@@ -56,10 +65,18 @@ int main() {
         auto* kh16 = reinterpret_cast<g::Half*>(k16.p);
         auto* vh16 = reinterpret_cast<g::Half*>(v16.p);
         g::PackKV(dk.p, dv.p, kh16, vh16, k.size(), nullptr);
-        g::BidirectionalAttention(
-            dq.p, kh16, vh16, dg.p, out.p, n, heads, kh, nullptr,
-            packed ? reinterpret_cast<const std::int32_t*>(group_device.p)
-                   : nullptr);
+        const float* gp = gated ? dg.p : nullptr;
+        if (dim == 64)
+          // The audio/vision entry point routes stateless rows here.
+          gufo::models::lfm3_audio::gpu::Attention(
+              dq.p, kh16, vh16, gp, nullptr, nullptr, out.p, n, heads, kh, dim,
+              0, 1, 0, false, nullptr);
+        else
+          g::BidirectionalAttention(
+              dq.p, kh16, vh16, gp, out.p, n, heads, kh, nullptr,
+              packed ? reinterpret_cast<const std::int32_t*>(group_device.p)
+                     : nullptr,
+              dim);
         auto actual = out.Read(q.size());
         double error = 0;
         for (int row = 0; row < n; ++row)
@@ -70,7 +87,7 @@ int main() {
               double dot = 0;
               for (int d = 0; d < dim; ++d)
                 dot += double(q[(row * heads + h) * dim + d]) *
-                       k[(t * kh + h / 4) * dim + d];
+                       k[(t * kh + h / group) * dim + d];
               scores[t] = !packed || groups[row] < 0 || groups[t] < 0 ||
                                   groups[row] == groups[t]
                               ? std::exp(dot / std::sqrt(dim))
@@ -80,8 +97,9 @@ int main() {
             for (int d = 0; d < dim; ++d) {
               double ref = 0;
               for (int t = 0; t < n; ++t)
-                ref += scores[t] / sum * v[(t * kh + h / 4) * dim + d];
-              ref /= 1 + std::exp(-double(gate[row * heads + h]));
+                ref += scores[t] / sum * v[(t * kh + h / group) * dim + d];
+              if (gated)
+                ref /= 1 + std::exp(-double(gate[row * heads + h]));
               error = std::max(
                   error, std::abs(ref - actual[(row * heads + h) * dim + d]));
             }
@@ -89,8 +107,8 @@ int main() {
         if (error > 2e-6)
           throw std::runtime_error(
               "bidirectional attention differs from independent FP64 formula");
-        std::cout << "attention packed=" << packed << " n=" << n
-                  << " max_error=" << error << '\n';
+        std::cout << "attention dim=" << dim << " packed=" << packed
+                  << " n=" << n << " max_error=" << error << '\n';
       }
     for (int columns : {17, 64}) {
       std::vector<float> weights(19 * columns);
