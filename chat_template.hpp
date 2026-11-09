@@ -29,5 +29,13 @@ std::vector<std::uint32_t> EncodeChat(
     std::span<const ext::ChatTool> tools = {},
     const ReasoningOptions& reasoning = {}, bool add_generation_prompt = true,
     std::span<const ImageExpansion> images = {});
+// The prompt prefix later requests of the conversation keep: the history
+// before the assistant opening, or before a final user turn that follows a
+// tool result or another user message after an assistant reply (per-turn agent
+// context that the next request replaces). Text only.
+std::vector<std::uint32_t> EncodeStableHistory(
+    const Tokenizer& tokenizer, std::span<const ext::ChatMessage> messages,
+    std::span<const ext::ChatTool> tools = {},
+    const ReasoningOptions& reasoning = {});
 }  // namespace gufo::models::lfm3
 #endif

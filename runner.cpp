@@ -202,10 +202,12 @@ public:
     auto tokens = RenderAndTokenize(request);
     if (!tokens)
       return std::nullopt;
-    // Keep the history before the mutable assistant opening. A client that
-    // discards a cancelled reply appends a new user turn at this boundary.
-    const auto history = EncodeChat(model_->tokenizer(), request.messages,
-                                    Tools(request), request.reasoning, false);
+    // Keep the history before the mutable assistant opening (a client that
+    // discards a cancelled reply appends a new user turn there), or before
+    // replaceable per-turn agent context.
+    const auto history =
+        EncodeStableHistory(model_->tokenizer(), request.messages,
+                            Tools(request), request.reasoning);
     if (history.size() > tokens->size() ||
         !std::equal(history.begin(), history.end(), tokens->begin()))
       throw std::logic_error("LFM3 history is not a prompt prefix");

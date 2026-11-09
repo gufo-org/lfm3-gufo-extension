@@ -96,11 +96,23 @@ void Calls(Rendered& out, std::span<const ext::ChatMessage::ToolCall> calls) {
     out.text += kCallClose;
   }
 }
+// Agent clients may end every request with a user message that the next
+// request replaces (per-turn runtime context) rather than keeps. Such context
+// follows a tool result or another user message, not an assistant reply, so
+// only then is the start of a final text-only user turn reported, as in the
+// in-tree Qwen template. A client that keeps the message prefills it again.
 Rendered Render(std::span<const ext::ChatMessage> messages,
                 std::span<const ext::ChatTool> tools,
                 const ReasoningOptions& reasoning, bool generation,
-                std::span<const ImageExpansion> images) {
+                std::span<const ImageExpansion> images,
+                std::optional<std::size_t>* final_user_start = nullptr) {
   Rendered out;
+  const bool replaceable_user =
+      messages.size() >= 2 && messages.back().role == ChatRole::kUser &&
+      messages.back().images.empty() &&
+      (messages[messages.size() - 2].role == ChatRole::kTool ||
+       messages[messages.size() - 2].role == ChatRole::kUser);
+  bool seen_assistant = false;
   std::size_t first = 0;
   std::optional<std::size_t> last_user;
   for (std::size_t i = 0; i < messages.size(); ++i) {
@@ -137,6 +149,11 @@ Rendered Render(std::span<const ext::ChatMessage> messages,
   }
   for (std::size_t i = first; i < messages.size(); ++i) {
     const auto& m = messages[i];
+    if (m.role == ChatRole::kAssistant)
+      seen_assistant = true;
+    else if (final_user_start && replaceable_user && seen_assistant &&
+             i + 1 == messages.size())
+      *final_user_start = out.text.size();
     out.text += kImStart;
     out.text += ToString(m.role);
     out.text += '\n';
@@ -226,6 +243,19 @@ std::vector<std::uint32_t> EncodeChat(
     std::span<const ext::ChatTool> tools, const ReasoningOptions& reasoning,
     bool generation, std::span<const ImageExpansion> images) {
   const auto rendered = Render(messages, tools, reasoning, generation, images);
+  return tokenizer.EncodeFramed(rendered.text, rendered.literals);
+}
+std::vector<std::uint32_t> EncodeStableHistory(
+    const Tokenizer& tokenizer, std::span<const ext::ChatMessage> messages,
+    std::span<const ext::ChatTool> tools, const ReasoningOptions& reasoning) {
+  std::optional<std::size_t> final_user;
+  auto rendered = Render(messages, tools, reasoning, false, {}, &final_user);
+  if (final_user) {
+    rendered.text.resize(*final_user);
+    std::erase_if(rendered.literals, [&](const auto& literal) {
+      return literal.first >= *final_user;
+    });
+  }
   return tokenizer.EncodeFramed(rendered.text, rendered.literals);
 }
 }  // namespace gufo::models::lfm3
