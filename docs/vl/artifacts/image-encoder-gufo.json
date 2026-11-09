@@ -22,7 +22,7 @@
     "fingerprintId": "a568074ce6fb9029f7abb69112fa248ea6da887b8ad8287029f4126144caff1e",
     "schemaVersion": "1.0.0"
   },
-  "measuredOn": "2026-11-08",
+  "measuredOn": "2026-11-09",
   "mode": null,
   "model": {
     "id": "LFM3-VL-2B",
@@ -34,9 +34,9 @@
   "referenceName": "llama.cpp",
   "rows": {
     "1024": {
-      "command": "gufo serve --port 60135 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
-      "ms": 1376.0,
-      "ms_sd": 8.0,
+      "command": "gufo-final serve --port 54721 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
+      "ms": 438.3,
+      "ms_sd": 7.0,
       "prompt_n": [
         1044,
         1044,
@@ -45,9 +45,9 @@
       "samples": 3
     },
     "256": {
-      "command": "gufo serve --port 60135 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
-      "ms": 92.4,
-      "ms_sd": 0.3,
+      "command": "gufo-final serve --port 54721 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
+      "ms": 71.2,
+      "ms_sd": 0.5,
       "prompt_n": [
         84,
         84,
@@ -56,9 +56,9 @@
       "samples": 3
     },
     "512": {
-      "command": "gufo serve --port 60135 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
-      "ms": 218.4,
-      "ms_sd": 0.3,
+      "command": "gufo-final serve --port 54721 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
+      "ms": 134.8,
+      "ms_sd": 0.9,
       "prompt_n": [
         276,
         276,
@@ -67,9 +67,9 @@
       "samples": 3
     },
     "768": {
-      "command": "gufo serve --port 60135 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
-      "ms": 556.2,
-      "ms_sd": 1.9,
+      "command": "gufo-final serve --port 54721 --sessions 1 llm --model LFM3-VL-2B-Q8_0.gguf --context 8192 --served-model-name bench --think off --max-pending-per-client 8 --mmproj mmproj-LFM3-VL-2B-BF16.gguf --max-request-bytes 67108864",
+      "ms": 258.3,
+      "ms_sd": 2.1,
       "prompt_n": [
         596,
         596,
@@ -81,10 +81,10 @@
   "schemaVersion": 1,
   "server": {
     "command": [
-      "gufo",
+      "gufo-final",
       "serve",
       "--port",
-      "60135",
+      "54721",
       "--sessions",
       "1",
       "llm",
@@ -107,7 +107,7 @@
   "source": {
     "buildMode": "nix-release",
     "dirty": true,
-    "revision": "12f8d8ab9a944b2df3efe388b44246ec37923c53"
+    "revision": "365cc5a5f8f16f8c83d585d7d794a5b2983be900"
   },
   "table": "image-encoder",
   "target": "gufo"

@@ -3,6 +3,7 @@
 
 #include <gufo/ext/experimental/ggml_dequant.hpp>
 
+#include "../../hip/ops.hpp"
 #include "ops.hpp"
 namespace gufo::models::lfm3_audio::gpu {
 namespace {
@@ -88,6 +89,139 @@ __global__ void SgemmKernel(const float* __restrict__ x,
         y[std::size_t(r) * M + c] =
             Activate(acc[i][j] + (bias ? bias[c] : 0.0F), act);
     }
+  }
+}
+using v16bf = __attribute__((__vector_size__(16 * sizeof(__bf16)))) __bf16;
+using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+// Round to nearest even; activations here are finite.
+__device__ __forceinline__ std::uint16_t RoundBf16(float x) {
+  std::uint32_t u = __float_as_uint(x);
+  u += 0x7fffU + ((u >> 16) & 1U);
+  return std::uint16_t(u >> 16);
+}
+__device__ __forceinline__ v16bf Bf16Fragment(const std::uint16_t* p) {
+  union {
+    v16bf f;
+    uint4 u[2];
+  } c;
+  c.u[0] = reinterpret_cast<const uint4*>(p)[0];
+  c.u[1] = reinterpret_cast<const uint4*>(p)[1];
+  return c.f;
+}
+// BF16 weights on the matrix cores without rounding activations: each FP32
+// activation is split into three BF16 terms whose sum is exactly the FP32
+// value, and BF16 x BF16 products are exact in FP32. Every K32 block
+// accumulates its WMMA products from zero (smallest terms first) and is then
+// added to the FP32 total, which keeps the error below a sequential FP32 dot
+// product's. Tokens are the A operand, weight rows the B operand, so a lane's
+// outputs are one weight row of eight tokens. Block = BT tokens x BR rows;
+// requires M % BR == 0 and K % 32 == 0.
+template<int BT, int BR, int WT, int WR>
+__launch_bounds__(256) __global__
+    void Split3Gemm(const float* __restrict__ x,
+                    const std::uint16_t* __restrict__ w,
+                    const float* __restrict__ bias, float* __restrict__ y,
+                    int n, int M, int K, Activation act, bool rows_fast) {
+  static_assert(WT * WR == 8);
+  constexpr int TT = BT / WT / 16, TR = BR / WR / 16, kStride = 40;
+  constexpr int kXLoads = BT * 32 / 4 / 256, kWLoads = BR * 32 / 8 / 256;
+  __shared__ __attribute__((aligned(16))) std::uint16_t sx[3][BT * kStride];
+  __shared__ __attribute__((aligned(16))) std::uint16_t sw[BR * kStride];
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int col = lane & 15, half = lane >> 4;
+  const int wt = wave / WR, wr = wave % WR;
+  // With rows_fast, weight row tiles vary fastest: resident blocks share one
+  // activation tile and the small weight matrix stays in the caches, for
+  // activations too large to stay cached across row tiles.
+  const int t0 = (rows_fast ? blockIdx.y : blockIdx.x) * BT,
+            r0 = (rows_fast ? blockIdx.x : blockIdx.y) * BR;
+  float4 xr[kXLoads];
+  uint4 wr4[kWLoads];
+  const auto load = [&](int k0) {
+#pragma unroll
+    for (int i = 0; i < kXLoads; ++i) {
+      const int idx = tid + i * 256, t = idx / 8;
+      xr[i] = t0 + t < n ? reinterpret_cast<const float4*>(
+                               x + std::size_t(t0 + t) * K + k0)[idx % 8]
+                         : make_float4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int i = 0; i < kWLoads; ++i) {
+      const int idx = tid + i * 256;
+      wr4[i] = reinterpret_cast<const uint4*>(
+          w + std::size_t(r0 + idx / 4) * K + k0)[idx % 4];
+    }
+  };
+  v8f acc[TT][TR] = {};
+  load(0);
+  for (int k0 = 0; k0 < K; k0 += 32) {
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < kXLoads; ++i) {
+      const int idx = tid + i * 256, t = idx / 8, c = idx % 8;
+      const float v[4] = {xr[i].x, xr[i].y, xr[i].z, xr[i].w};
+      std::uint32_t part[3][2] = {};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const std::uint16_t a = RoundBf16(v[j]);
+        const float r = v[j] - __uint_as_float(std::uint32_t(a) << 16);
+        const std::uint16_t b = RoundBf16(r);
+        const std::uint16_t e =
+            RoundBf16(r - __uint_as_float(std::uint32_t(b) << 16));
+        part[0][j / 2] |= std::uint32_t(a) << 16 * (j % 2);
+        part[1][j / 2] |= std::uint32_t(b) << 16 * (j % 2);
+        part[2][j / 2] |= std::uint32_t(e) << 16 * (j % 2);
+      }
+#pragma unroll
+      for (int q = 0; q < 3; ++q)
+        *reinterpret_cast<uint2*>(&sx[q][t * kStride + c * 4]) =
+            make_uint2(part[q][0], part[q][1]);
+    }
+#pragma unroll
+    for (int i = 0; i < kWLoads; ++i) {
+      const int idx = tid + i * 256;
+      *reinterpret_cast<uint4*>(&sw[idx / 4 * kStride + idx % 4 * 8]) = wr4[i];
+    }
+    __syncthreads();
+    if (k0 + 32 < K)
+      load(k0 + 32);
+    v8f block[TT][TR] = {};
+#pragma unroll
+    for (int ks = 0; ks < 32; ks += 16) {
+      v16bf b[TR];
+#pragma unroll
+      for (int j = 0; j < TR; ++j)
+        b[j] = Bf16Fragment(&sw[((wr * TR + j) * 16 + col) * kStride + ks]);
+#pragma unroll
+      for (int q = 2; q >= 0; --q)
+#pragma unroll
+        for (int i = 0; i < TT; ++i) {
+          const v16bf a =
+              Bf16Fragment(&sx[q][((wt * TT + i) * 16 + col) * kStride + ks]);
+#pragma unroll
+          for (int j = 0; j < TR; ++j)
+            block[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
+                a, b[j], block[i][j]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < TT; ++i)
+#pragma unroll
+      for (int j = 0; j < TR; ++j)
+        acc[i][j] += block[i][j];
+  }
+#pragma unroll
+  for (int j = 0; j < TR; ++j) {
+    const int r = r0 + (wr * TR + j) * 16 + col;
+    const float add = bias ? bias[r] : 0.0F;
+#pragma unroll
+    for (int i = 0; i < TT; ++i)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int t = t0 + (wt * TT + i) * 16 + 2 * e + half;
+        if (t < n)
+          y[std::size_t(t) * M + r] = Activate(acc[i][j][e] + add, act);
+      }
   }
 }
 __global__ void SwiGluKernel(const float* gate, const float* up, float* out,
@@ -648,6 +782,23 @@ void Sgemm(const float* x, const float* w, const float* bias, float* y, int n,
 }
 void SgemmBf16(const float* x, const void* w, const float* bias, float* y,
                int n, int M, int K, Activation act, hipStream_t s) {
+  const auto* weights = static_cast<const std::uint16_t*>(w);
+  if (M % 128 == 0 && K % 32 == 0) {
+    // Past the 32 MiB MALL, FP32 activations would be streamed again for
+    // every row tile.
+    const bool rows_fast = std::size_t(n) * K * sizeof(float) > (32U << 20);
+    const auto grid = [&](int bt) {
+      const unsigned tokens = (n + bt - 1) / bt, rows = M / 128;
+      return rows_fast ? dim3(rows, tokens) : dim3(tokens, rows);
+    };
+    if (n > 1024)
+      Split3Gemm<128, 128, 2, 4><<<grid(128), 256, 0, s>>>(
+          x, weights, bias, y, n, M, K, act, rows_fast);
+    else
+      Split3Gemm<64, 128, 2, 4><<<grid(64), 256, 0, s>>>(x, weights, bias, y, n,
+                                                         M, K, act, rows_fast);
+    return;
+  }
   SgemmKernel<<<dim3((n + kTile - 1) / kTile, (M + kTile - 1) / kTile), 256, 0,
                 s>>>(x, static_cast<const std::uint16_t*>(w), bias, y, n, M, K,
                      act);
@@ -700,6 +851,14 @@ void Attention(const float* q, const std::uint16_t* k, const std::uint16_t* v,
                const std::uint16_t* cv, float* out, int n, int heads, int kh,
                int dim, int position, int capacity, int window, bool causal,
                hipStream_t s) {
+  // Stateless bidirectional rows: the tiled FP32 kernel shares each K/V tile
+  // across 64 query rows instead of streaming every key once per query.
+  if (!causal && position == 0 && !ck &&
+      lfm3::gpu::SupportsBidirectionalAttention(heads, kh, dim)) {
+    lfm3::gpu::BidirectionalAttention(q, k, v, gate, out, n, heads, kh, s,
+                                      nullptr, dim);
+    return;
+  }
   const dim3 grid(heads, n);
   switch (dim) {
     case 32:

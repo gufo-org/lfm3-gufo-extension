@@ -80,6 +80,17 @@ for the photograph: grids and prompt IDs match, maximum patch error 5.9e-8,
 image-embedding error 3.8e-5, logit error 1.2e-4, KL below 9.7e-10 and total
 variation below 2.0e-5, with every top-1 equal (gates as above).
 
+## November 9 encoder precision
+
+The vision tower now keeps FP32 K/V, runs attention on the matrix cores with
+split-F16 operands and its BF16 projections with exact three-term activation
+splits ([experiments](EXPERIMENTS.md)). Against an FP64 evaluation of the
+same encoder, image-embedding error falls on every checked image
+(gradient 1024×1024: max 5.6e-4 → 6.1e-5; 2048×2048 photograph:
+7.1e-4 → 1.5e-5; 784×1168 PNG: 9.9e-4 → 1.3e-5). The pinned Python teacher
+was not rerun: its transformers 5.21.0 environment was unavailable. The
+focused HTTP suite (`lfm3_vl.py`) passes all 19 cases (28 requests).
+
 ## Limits
 
 These checks establish bounded graph/template/API correctness. They do not

@@ -1135,16 +1135,24 @@ __device__ __forceinline__ const Half* KeyRow(const Half* chunk,
 // registers and reach every lane through DPP broadcasts. Scores, the online
 // softmax and P*V accumulate in FP32. With groups, a query attends only to
 // keys of its own group (negative groups attend everywhere).
-template<int D, bool packed = false>
+// (Head, query) rows per wave: D = 64 leaves registers for 16, which halves
+// the K/V tiles streamed per query.
+constexpr int TiledRows(int D) {
+  return D == 64 ? 16 : 8;
+}
+template<int D, bool packed = false, class KV = Half>
 __launch_bounds__(256) __global__
-    void TiledAttn(const float* __restrict__ q, const Half* __restrict__ k,
-                   const Half* __restrict__ v, const float* __restrict__ gate,
+    void TiledAttn(const float* __restrict__ q, const KV* __restrict__ k,
+                   const KV* __restrict__ v, const float* __restrict__ gate,
                    float* __restrict__ y, int n, int heads, int kh,
                    const std::int32_t* groups = nullptr) {
-  constexpr int kRows = 8, kKeys = 32, kSlices = D / 16;
-  static_assert(D == 128);
-  __shared__ float4 sk[kKeys][D / 4 + 1], sv[kKeys][D / 4];
-  const int group = heads / kh, queries = 64 / group;
+  // Each lane owns kWidth consecutive output dimensions.
+  constexpr int kRows = TiledRows(D), kKeys = 32, kSlices = D / 16,
+                kWidth = D / 32;
+  static_assert(D == 64 || D == 128);
+  __shared__ float4 sk[kKeys][D / 4 + 1];
+  __shared__ float sv[kKeys][D];
+  const int group = heads / kh, queries = 8 * kRows / group;
   const int g = blockIdx.z, q0 = blockIdx.x * queries, tid = threadIdx.x;
   const int lane = tid % 32, wave = tid / 32;
   const int h = g * group + wave * kRows / queries;
@@ -1159,11 +1167,13 @@ __launch_bounds__(256) __global__
           wq0 + r < n
               ? q[(std::size_t(wq0 + r) * heads + h) * D + 16 * m + lane % 16]
               : 0;
-  float4 acc[kRows];
+  float acc[kRows][kWidth];
   float maximum[kRows], denominator[kRows];
 #pragma unroll
   for (int r = 0; r < kRows; ++r) {
-    acc[r] = make_float4(0, 0, 0, 0);
+#pragma unroll
+    for (int c = 0; c < kWidth; ++c)
+      acc[r][c] = 0;
     maximum[r] = -INFINITY;
     denominator[r] = 0;
   }
@@ -1174,13 +1184,20 @@ __launch_bounds__(256) __global__
       int t = base + i / (D / 4), d4 = i % (D / 4);
       float4 kk = make_float4(0, 0, 0, 0), vv = kk;
       if (t < n) {
-        kk = Widen(reinterpret_cast<const uint2*>(k + std::size_t(t) * stride +
-                                                  g * D)[d4]);
-        vv = Widen(reinterpret_cast<const uint2*>(v + std::size_t(t) * stride +
-                                                  g * D)[d4]);
+        if constexpr (std::is_same_v<KV, float>) {
+          kk = reinterpret_cast<const float4*>(k + std::size_t(t) * stride +
+                                               g * D)[d4];
+          vv = reinterpret_cast<const float4*>(v + std::size_t(t) * stride +
+                                               g * D)[d4];
+        } else {
+          kk = Widen(reinterpret_cast<const uint2*>(
+              k + std::size_t(t) * stride + g * D)[d4]);
+          vv = Widen(reinterpret_cast<const uint2*>(
+              v + std::size_t(t) * stride + g * D)[d4]);
+        }
       }
       sk[i / (D / 4)][d4] = kk;
-      sv[i / (D / 4)][d4] = vv;
+      reinterpret_cast<float4*>(sv[i / (D / 4)])[d4] = vv;
     }
     __syncthreads();
     if (wq0 >= n)
@@ -1222,25 +1239,26 @@ __launch_bounds__(256) __global__
       const float next = fmaxf(maximum[r], tile_max);
       const float alpha = expf(maximum[r] - next), p = expf(s - next);
       denominator[r] = denominator[r] * alpha + p;
-      acc[r].x *= alpha;
-      acc[r].y *= alpha;
-      acc[r].z *= alpha;
-      acc[r].w *= alpha;
+#pragma unroll
+      for (int c = 0; c < kWidth; ++c)
+        acc[r][c] *= alpha;
       maximum[r] = next;
       score[r] = p;
     }
 #pragma unroll
     for (int j = 0; j < kKeys; ++j) {
-      const float4 vv = sv[j][lane];
+      float vv[kWidth];
+#pragma unroll
+      for (int c = 0; c < kWidth; ++c)
+        vv[c] = sv[j][lane * kWidth + c];
 #pragma unroll
       for (int r = 0; r < kRows; ++r) {
         const float p = __builtin_bit_cast(
             float,
             __builtin_amdgcn_readlane(__builtin_bit_cast(int, score[r]), j));
-        acc[r].x = fmaf(p, vv.x, acc[r].x);
-        acc[r].y = fmaf(p, vv.y, acc[r].y);
-        acc[r].z = fmaf(p, vv.z, acc[r].z);
-        acc[r].w = fmaf(p, vv.w, acc[r].w);
+#pragma unroll
+        for (int c = 0; c < kWidth; ++c)
+          acc[r][c] = fmaf(p, vv[c], acc[r][c]);
       }
     }
   }
@@ -1253,10 +1271,17 @@ __launch_bounds__(256) __global__
       total += __shfl_xor(total, offset, 32);
     if (row >= n)
       continue;
-    const float g_scale = 1 + expf(-gate[row * heads + h]);
-    reinterpret_cast<float4*>(y + (std::size_t(row) * heads + h) * D)[lane] =
-        make_float4((acc[r].x / total) / g_scale, (acc[r].y / total) / g_scale,
-                    (acc[r].z / total) / g_scale, (acc[r].w / total) / g_scale);
+    float* out = y + (std::size_t(row) * heads + h) * D + lane * kWidth;
+    if (gate) {
+      const float g_scale = 1 + expf(-gate[row * heads + h]);
+#pragma unroll
+      for (int c = 0; c < kWidth; ++c)
+        out[c] = (acc[r][c] / total) / g_scale;
+    } else {
+#pragma unroll
+      for (int c = 0; c < kWidth; ++c)
+        out[c] = acc[r][c] / total;
+    }
   }
 }
 // Causal prompt attention on the matrix cores: FP16 Q, K, V and
@@ -2188,14 +2213,41 @@ void Attention(const float* q, const Half* k, const Half* v, const float* g,
 }
 void BidirectionalAttention(const float* q, const Half* k, const Half* v,
                             const float* g, float* out, int n, int h, int kh,
-                            hipStream_t s, const std::int32_t* groups) {
-  const int queries = 64 / (h / kh);
+                            hipStream_t s, const std::int32_t* groups,
+                            int dim) {
+  if (!SupportsBidirectionalAttention(h, kh, dim))
+    throw std::invalid_argument("unsupported bidirectional attention shape");
+  const int queries = 8 * TiledRows(dim) / (h / kh);
   const dim3 grid((n + queries - 1) / queries, 1, kh);
-  if (groups)
+  if (dim == 64) {
+    if (groups)
+      TiledAttn<64, true>
+          <<<grid, 256, 0, s>>>(q, k, v, g, out, n, h, kh, groups);
+    else
+      TiledAttn<64><<<grid, 256, 0, s>>>(q, k, v, g, out, n, h, kh);
+  } else if (groups)
     TiledAttn<128, true>
         <<<grid, 256, 0, s>>>(q, k, v, g, out, n, h, kh, groups);
   else
     TiledAttn<128><<<grid, 256, 0, s>>>(q, k, v, g, out, n, h, kh);
+}
+void BidirectionalAttention(const float* q, const float* k, const float* v,
+                            float* out, int n, int h, int kh, int dim,
+                            hipStream_t s) {
+  if (!SupportsBidirectionalAttention(h, kh, dim))
+    throw std::invalid_argument("unsupported bidirectional attention shape");
+  const int queries = 8 * TiledRows(dim) / (h / kh);
+  const dim3 grid((n + queries - 1) / queries, 1, kh);
+  if (dim == 64)
+    TiledAttn<64, false, float>
+        <<<grid, 256, 0, s>>>(q, k, v, nullptr, out, n, h, kh);
+  else
+    TiledAttn<128, false, float>
+        <<<grid, 256, 0, s>>>(q, k, v, nullptr, out, n, h, kh);
+}
+bool SupportsBidirectionalAttention(int heads, int kv_heads, int dim) {
+  return (dim == 64 || dim == 128) && kv_heads > 0 && heads % kv_heads == 0 &&
+         heads / kv_heads <= 8 && 8 % (heads / kv_heads) == 0;
 }
 namespace {
 __global__ void CopyRows(const unsigned char* source, const std::uint32_t* rows,

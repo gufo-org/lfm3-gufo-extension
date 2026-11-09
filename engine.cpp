@@ -123,9 +123,14 @@ struct Session::Impl {
   std::vector<State> states;
   Buffer quantized, row_max, split_partial, split_tickets, attention_scratch,
       frequencies, chunk_k, chunk_v;
+  // Decision readout scratch, grown on demand and reused across prompts.
+  Buffer decision_indices, decision_hidden, decision_projected,
+      decision_selected;
+  std::size_t rows, decision_group_bytes{}, decision_capacity[4]{};
   Impl(std::shared_ptr<Model> m, std::uint32_t ctx, std::size_t rows = kChunk)
       : model(std::move(m)),
         context(ctx),
+        rows(rows),
         ids(rows * sizeof(std::uint32_t)),
         x(rows * model->config().hidden * 4),
         z(rows * model->config().hidden * 4),
@@ -207,7 +212,10 @@ struct Session::Impl {
                  x.floats(), n, s);
     }
     if (!groups.empty()) {
-      decision_groups = Buffer(groups.size_bytes());
+      if (decision_group_bytes < groups.size_bytes()) {
+        decision_groups = Buffer(groups.size_bytes());
+        decision_group_bytes = groups.size_bytes();
+      }
       Check(hipMemcpyAsync(decision_groups.data, groups.data(),
                            groups.size_bytes(), hipMemcpyHostToDevice, s));
     }
@@ -466,9 +474,12 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
     for (auto id : tokens)
       if (id >= c.vocab)
         throw std::invalid_argument("d1 token out of range");
-    auto state = std::make_unique<Impl>(impl_->model, impl_->context,
-                                        std::max(kPrefillChunk, tokens.size()));
-    impl_.swap(state);
+    // A decision prompt runs in one pass: grow the rows only when needed.
+    if (impl_->rows < tokens.size() || impl_->poisoned) {
+      auto state = std::make_unique<Impl>(
+          impl_->model, impl_->context, std::max(kPrefillChunk, tokens.size()));
+      impl_.swap(state);
+    }
     if (!Reset(error))
       return false;
     impl_->Run(tokens, true, {},
@@ -516,9 +527,12 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
         throw std::invalid_argument(
             "d1 groups must be a state prefix and ordered positive question "
             "IDs");
-    auto state = std::make_unique<Impl>(impl_->model, impl_->context,
-                                        std::max(kPrefillChunk, tokens.size()));
-    impl_.swap(state);
+    // A decision prompt runs in one pass: grow the rows only when needed.
+    if (impl_->rows < tokens.size() || impl_->poisoned) {
+      auto state = std::make_unique<Impl>(
+          impl_->model, impl_->context, std::max(kPrefillChunk, tokens.size()));
+      impl_.swap(state);
+    }
     if (!Reset(error))
       return false;
     // A lone question sees the entire prompt. Keep its original unmasked
@@ -534,10 +548,22 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
                packed ? groups : std::span<const std::int32_t>{});
     const auto stream = impl_->stream.value;
     const auto& w = impl_->model->impl_->weights;
-    Buffer indices(std::max(positions.size(), vocabulary.size()) *
-                   sizeof(std::uint32_t));
-    Buffer hidden(positions.size() * c.hidden * 4),
-        projected(logits.size_bytes());
+    const auto grow = [](Buffer& buffer, std::size_t& capacity,
+                         std::size_t bytes) -> Buffer& {
+      if (capacity < bytes) {
+        buffer = Buffer(bytes);
+        capacity = bytes;
+      }
+      return buffer;
+    };
+    auto& d = *impl_;
+    auto& indices = grow(
+        d.decision_indices, d.decision_capacity[0],
+        std::max(positions.size(), vocabulary.size()) * sizeof(std::uint32_t));
+    auto& hidden = grow(d.decision_hidden, d.decision_capacity[1],
+                        positions.size() * c.hidden * 4);
+    auto& projected =
+        grow(d.decision_projected, d.decision_capacity[2], logits.size_bytes());
     Check(hipMemcpyAsync(indices.data, positions.data(), positions.size_bytes(),
                          hipMemcpyHostToDevice, stream));
     Tensor states{impl_->x.data, core::GgmlType::kF32, c.hidden,
@@ -548,9 +574,9 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
         hidden.floats(), static_cast<const float*>(w.output_norm.data),
         hidden.floats(), nullptr, positions.size(), c.hidden, c.eps, stream);
     Tensor head = w.output;
-    Buffer selected;
     if (!vocabulary.empty()) {
-      selected = Buffer(vocabulary.size() * (head.bytes / head.rows));
+      auto& selected = grow(d.decision_selected, d.decision_capacity[3],
+                            vocabulary.size() * (head.bytes / head.rows));
       Check(hipMemcpyAsync(indices.data, vocabulary.data(),
                            vocabulary.size_bytes(), hipMemcpyHostToDevice,
                            stream));
