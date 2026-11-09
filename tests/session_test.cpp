@@ -59,6 +59,36 @@ int main(int argc, char** argv) {
         "literal client text became control tokens");
     Require(tok.Decode(protected_ids) == l::RenderChat(injected),
             "literal framing changed client bytes");
+    {
+      // Per-turn agent context after a tool result is replaceable: the stable
+      // history ends before that final user turn. A user turn after a
+      // discarded reply (no assistant yet) keeps the whole history.
+      ChatMessage call{ChatRole::kAssistant, ""};
+      call.tool_calls.push_back({.id = "c", .name = "read", .arguments = {}});
+      ChatMessage result{ChatRole::kTool, "fixture"};
+      result.tool_call_id = "c";
+      std::vector<ChatMessage> agent{{ChatRole::kUser, "Read the fixture."},
+                                     call,
+                                     result,
+                                     {ChatRole::kUser, "Reply with only A."}};
+      const auto full = l::EncodeChat(tok, agent);
+      const auto stable = l::EncodeStableHistory(tok, agent);
+      const auto kept =
+          l::EncodeChat(tok, std::span(agent).first(3), {}, {}, false);
+      Require(stable == kept && stable.size() < full.size() &&
+                  std::equal(stable.begin(), stable.end(), full.begin()),
+              "agent context boundary is not before the final user turn");
+      std::vector<ChatMessage> discarded{{ChatRole::kUser, "Count."},
+                                         {ChatRole::kUser, "."}};
+      Require(l::EncodeStableHistory(tok, discarded) ==
+                  l::EncodeChat(tok, discarded, {}, {}, false),
+              "discarded-reply boundary moved before the final user turn");
+      agent.back().role = ChatRole::kAssistant;
+      agent.push_back({ChatRole::kUser, "Reply with only B."});
+      Require(l::EncodeStableHistory(tok, agent) ==
+                  l::EncodeChat(tok, agent, {}, {}, false),
+              "a user turn after an assistant reply moved the boundary");
+    }
     for (const auto& [text, ids] : golden) {
       Require(tok.Encode(text) == ids, "HF tokenizer golden mismatch");
       Require(tok.Decode(ids) == text, "tokenizer round trip failed");

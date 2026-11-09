@@ -118,6 +118,15 @@ cold control, but the model returns a sentence instead of the required `BETA`.
 The prior full run also encountered bounded cache pressure on intermediate
 history; focused evidence does not retroactively turn that run into a pass.
 
+A final user turn that follows a tool result or another user message, after an
+assistant reply, is per-turn agent context that the next request usually
+replaces. As in the in-tree Qwen template, the stable boundary then ends before
+that turn: editing it in `cache-transforms` (`transform_large_edited`) prefills
+17 tokens instead of 1516. Other histories keep the boundary before the
+assistant opening, so a user turn after a discarded cancelled reply still
+reuses the whole history. An unchanged repeat of such a turn prefills the
+final user message again (13 more tokens in `tool-native-schemas`).
+
 Remaining failures include unfinished reasoning within fixture token limits,
 incorrect tool arguments/selections, and exact-answer failures. Two failures
 were checked independently on their actual fixed token histories:
