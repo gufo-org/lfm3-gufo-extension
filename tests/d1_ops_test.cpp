@@ -110,6 +110,53 @@ int main() {
         std::cout << "attention dim=" << dim << " packed=" << packed
                   << " n=" << n << " max_error=" << error << '\n';
       }
+    // The vision tower's FP32 K/V: split-F16 matrix-core attention and the
+    // tiled FP32 kernel against the FP64 formula.
+    for (int n : {1, 7, 33, 65, 300, 1200}) {
+      constexpr int heads = 16, kh = 8, dim = 64;
+      std::vector<float> q(n * heads * dim), k(n * kh * dim), v(k.size());
+      for (std::size_t i = 0; i < q.size(); ++i)
+        q[i] = std::sin(i * .37) * 2.5;
+      for (std::size_t i = 0; i < k.size(); ++i) {
+        k[i] = std::cos(i * .23) * 1.7;
+        v[i] = std::sin(i * .11) * 3.1;
+      }
+      Device dq(q), dk(k), dv(v), split(q.size()), tiled(q.size());
+      gufo::models::lfm3_vl::gpu::Attention64(dq.p, dk.p, dv.p, split.p, n,
+                                              heads, kh, nullptr);
+      gufo::models::lfm3::gpu::BidirectionalAttention(
+          dq.p, dk.p, dv.p, tiled.p, n, heads, kh, dim, nullptr);
+      const auto a = split.Read(q.size()), b = tiled.Read(q.size());
+      double error = 0, reference_error = 0;
+      for (int row = 0; row < n; ++row)
+        for (int h = 0; h < heads; ++h) {
+          std::vector<double> scores(n);
+          double sum = 0, top = -1e300;
+          for (int t = 0; t < n; ++t) {
+            double dot = 0;
+            for (int d = 0; d < dim; ++d)
+              dot += double(q[(row * heads + h) * dim + d]) *
+                     k[(t * kh + h / 2) * dim + d];
+            scores[t] = dot / 8;
+            top = std::max(top, scores[t]);
+          }
+          for (auto& e : scores)
+            sum += e = std::exp(e - top);
+          for (int d = 0; d < dim; ++d) {
+            double ref = 0;
+            for (int t = 0; t < n; ++t)
+              ref += scores[t] / sum * v[(t * kh + h / 2) * dim + d];
+            const auto at = (row * heads + h) * dim + d;
+            error = std::max(error, std::abs(ref - a[at]));
+            reference_error = std::max(reference_error, std::abs(ref - b[at]));
+          }
+        }
+      std::cout << "split attention n=" << n << " max_error=" << error
+                << " (tiled FP32 " << reference_error << ")\n";
+      if (error > 2e-6)
+        throw std::runtime_error(
+            "split attention differs from independent FP64 formula");
+    }
     for (int columns : {17, 64}) {
       std::vector<float> weights(19 * columns);
       for (std::size_t i = 0; i < weights.size(); ++i)

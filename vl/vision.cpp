@@ -236,8 +236,7 @@ std::vector<float> Vision::Encode(const Picture& p) {
       gpu::AxialRope(q.f(), p.height, p.width, 16, s);
       gpu::AxialRope(k.f(), p.height, p.width, 8, s);
       // The tower keeps no cache: K and V stay FP32.
-      lfm3::gpu::BidirectionalAttention(q.f(), k.f(), v.f(), a.f(), n, 16, 8,
-                                        64, s);
+      gpu::Attention64(q.f(), k.f(), v.f(), a.f(), n, 16, 8, s);
     } else {
       dense(b.in, z.f(), mix.f(), n);
       gpu::SpatialConv(mix.f(), F(b.conv), a.f(), p.height, p.width, 1024, s);
