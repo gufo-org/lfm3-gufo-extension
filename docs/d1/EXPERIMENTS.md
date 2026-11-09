@@ -11,6 +11,8 @@
 | Preserve the original single-slot primitive path | A compact replacement shifted legacy probabilities by up to `1.3e-7`. Retaining the full-vocabulary route restores exact `set_size=1` responses without weakening the compatibility check. |
 | Calibrated single/multiple boxes | Median thousandth edges, presence tables, fixed Halton confidence and reading order match the pinned Python reference; 1/4/16 blocks and absence pass. |
 | Files before images | Initial image-first ordering failed the mixed-media probability gate; reference ordering passes without changing tolerance. |
+| Reuse the decision session and its readout buffers across prompts (grow only when a prompt exceeds its rows) | A new session per prompt allocated every activation, a full-context K/V cache and a stream, then freed them: about 13 ms of idle GPU per prompt. Responses stay bit-identical (all 26 packed/box checks and every `d1.py` text case); `set_size=1` with 17 questions 519 → 316 ms, text 94 → 58 ms. |
+| Share the VL tower's November 9 kernels ([VL experiments](../vl/EXPERIMENTS.md)) | Image 328 → 213 ms, mixed media 385 → 262 ms; probabilities move at most 2.4e-4 against the previous build (gate 0.02), discrete answers and boxes unchanged. |
 
 Current measurements are in [BENCHMARKS.md](BENCHMARKS.md); numerical and API
 limits are in [QUALITY.md](QUALITY.md).

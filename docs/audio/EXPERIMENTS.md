@@ -37,3 +37,12 @@ depth decoder (BF16 WMMA would round activations).
 The backbone step is near its bandwidth floor (see [benchmarks](BENCHMARKS.md)).
 Its remaining overhead is about 1 ms of launch gaps; graphing it needs
 position-independent attention/RoPE/cache launches in the shared LFM3 engine.
+
+November 9, 2026, extension port, HTTP on a release build. The audio encoder
+shares the VL tower's tiled bidirectional attention and split-BF16
+projections ([VL experiments](../vl/EXPERIMENTS.md)): the 10.0 s ASR clip
+270 → 261 ms with the same transcript. Speech synthesis is byte-identical
+(its depth decoder keeps the small-batch BF16 path) at 6.67× real time. A
+profile of one sentence puts every frame at its bandwidth floor: backbone
+Q8_0 GEMVs at about 220 GB/s and the 267 MB BF16 depth decoder streamed
+once per MaskGIT pass; the GPU is busy for the whole request.

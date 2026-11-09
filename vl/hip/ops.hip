@@ -176,15 +176,20 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int kb = 0; kb < 2; ++kb)
       s[kb] = main[kb] + cross[kb];
+    // Only the last tile holds keys past n.
+    if (base + kKeys > n)
+#pragma unroll
+      for (int kb = 0; kb < 2; ++kb)
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          if (base + kb * 16 + 2 * i + half >= n)
+            s[kb][i] = -INFINITY;
     float tile_max = -INFINITY;
 #pragma unroll
     for (int kb = 0; kb < 2; ++kb)
 #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        if (base + kb * 16 + 2 * i + half >= n)
-          s[kb][i] = -INFINITY;
+      for (int i = 0; i < 8; ++i)
         tile_max = fmaxf(tile_max, s[kb][i]);
-      }
     tile_max = fmaxf(tile_max, OtherHalf(tile_max));
     const float next = fmaxf(maximum, tile_max);
     const float alpha = __builtin_amdgcn_exp2f(maximum - next);
