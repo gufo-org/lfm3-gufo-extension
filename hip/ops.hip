@@ -1135,6 +1135,11 @@ __device__ __forceinline__ const Half* KeyRow(const Half* chunk,
 // registers and reach every lane through DPP broadcasts. Scores, the online
 // softmax and P*V accumulate in FP32. With groups, a query attends only to
 // keys of its own group (negative groups attend everywhere).
+// (Head, query) rows per wave: D = 64 leaves registers for 16, which halves
+// the K/V tiles streamed per query.
+constexpr int TiledRows(int D) {
+  return D == 64 ? 16 : 8;
+}
 template<int D, bool packed = false, class KV = Half>
 __launch_bounds__(256) __global__
     void TiledAttn(const float* __restrict__ q, const KV* __restrict__ k,
@@ -1142,11 +1147,12 @@ __launch_bounds__(256) __global__
                    float* __restrict__ y, int n, int heads, int kh,
                    const std::int32_t* groups = nullptr) {
   // Each lane owns kWidth consecutive output dimensions.
-  constexpr int kRows = 8, kKeys = 32, kSlices = D / 16, kWidth = D / 32;
+  constexpr int kRows = TiledRows(D), kKeys = 32, kSlices = D / 16,
+                kWidth = D / 32;
   static_assert(D == 64 || D == 128);
   __shared__ float4 sk[kKeys][D / 4 + 1];
   __shared__ float sv[kKeys][D];
-  const int group = heads / kh, queries = 64 / group;
+  const int group = heads / kh, queries = 8 * kRows / group;
   const int g = blockIdx.z, q0 = blockIdx.x * queries, tid = threadIdx.x;
   const int lane = tid % 32, wave = tid / 32;
   const int h = g * group + wave * kRows / queries;
@@ -2211,7 +2217,7 @@ void BidirectionalAttention(const float* q, const Half* k, const Half* v,
                             int dim) {
   if (!SupportsBidirectionalAttention(h, kh, dim))
     throw std::invalid_argument("unsupported bidirectional attention shape");
-  const int queries = 64 / (h / kh);
+  const int queries = 8 * TiledRows(dim) / (h / kh);
   const dim3 grid((n + queries - 1) / queries, 1, kh);
   if (dim == 64) {
     if (groups)
@@ -2230,7 +2236,7 @@ void BidirectionalAttention(const float* q, const float* k, const float* v,
                             hipStream_t s) {
   if (!SupportsBidirectionalAttention(h, kh, dim))
     throw std::invalid_argument("unsupported bidirectional attention shape");
-  const int queries = 64 / (h / kh);
+  const int queries = 8 * TiledRows(dim) / (h / kh);
   const dim3 grid((n + queries - 1) / queries, 1, kh);
   if (dim == 64)
     TiledAttn<64, false, float>

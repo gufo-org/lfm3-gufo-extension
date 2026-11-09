@@ -121,7 +121,7 @@ __launch_bounds__(256) __global__
     void Split3Gemm(const float* __restrict__ x,
                     const std::uint16_t* __restrict__ w,
                     const float* __restrict__ bias, float* __restrict__ y,
-                    int n, int M, int K, Activation act) {
+                    int n, int M, int K, Activation act, bool rows_fast) {
   static_assert(WT * WR == 8);
   constexpr int TT = BT / WT / 16, TR = BR / WR / 16, kStride = 40;
   constexpr int kXLoads = BT * 32 / 4 / 256, kWLoads = BR * 32 / 8 / 256;
@@ -130,7 +130,11 @@ __launch_bounds__(256) __global__
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int col = lane & 15, half = lane >> 4;
   const int wt = wave / WR, wr = wave % WR;
-  const int t0 = blockIdx.x * BT, r0 = blockIdx.y * BR;
+  // With rows_fast, weight row tiles vary fastest: resident blocks share one
+  // activation tile and the small weight matrix stays in the caches, for
+  // activations too large to stay cached across row tiles.
+  const int t0 = (rows_fast ? blockIdx.y : blockIdx.x) * BT,
+            r0 = (rows_fast ? blockIdx.x : blockIdx.y) * BR;
   float4 xr[kXLoads];
   uint4 wr4[kWLoads];
   const auto load = [&](int k0) {
@@ -780,12 +784,19 @@ void SgemmBf16(const float* x, const void* w, const float* bias, float* y,
                int n, int M, int K, Activation act, hipStream_t s) {
   const auto* weights = static_cast<const std::uint16_t*>(w);
   if (M % 128 == 0 && K % 32 == 0) {
+    // Past the 32 MiB MALL, FP32 activations would be streamed again for
+    // every row tile.
+    const bool rows_fast = std::size_t(n) * K * sizeof(float) > (32U << 20);
+    const auto grid = [&](int bt) {
+      const unsigned tokens = (n + bt - 1) / bt, rows = M / 128;
+      return rows_fast ? dim3(rows, tokens) : dim3(tokens, rows);
+    };
     if (n > 1024)
-      Split3Gemm<128, 128, 2, 4><<<dim3((n + 127) / 128, M / 128), 256, 0, s>>>(
-          x, weights, bias, y, n, M, K, act);
+      Split3Gemm<128, 128, 2, 4><<<grid(128), 256, 0, s>>>(
+          x, weights, bias, y, n, M, K, act, rows_fast);
     else
-      Split3Gemm<64, 128, 2, 4><<<dim3((n + 63) / 64, M / 128), 256, 0, s>>>(
-          x, weights, bias, y, n, M, K, act);
+      Split3Gemm<64, 128, 2, 4><<<grid(64), 256, 0, s>>>(x, weights, bias, y, n,
+                                                         M, K, act, rows_fast);
     return;
   }
   SgemmKernel<<<dim3((n + kTile - 1) / kTile, (M + kTile - 1) / kTile), 256, 0,
