@@ -1,23 +1,35 @@
 #include <algorithm>
 #include <cmath>
-#include <cstring>
+#include <exception>
+#include <gufo/ext/wav.hpp>
 #include <limits>
 #include <numbers>
-#include <stdexcept>
 
 #include "model.hpp"
 namespace gufo::models::lfm3_audio {
 namespace {
-std::uint32_t Read32(const std::byte* p) {
-  std::uint32_t v = 0;
-  for (int i = 0; i < 4; ++i)
-    v |= std::uint32_t(std::to_integer<std::uint8_t>(p[i])) << (8 * i);
-  return v;
-}
-std::uint16_t Read16(const std::byte* p) {
-  return std::uint16_t(std::to_integer<std::uint8_t>(p[0]) |
-                       (std::to_integer<std::uint8_t>(p[1]) << 8));
-}
+namespace core = gufo::core;
+
+// Accepts PCM16/24/32 and float32 up to 8 channels and 192 kHz; 300 seconds
+// matches the d1-Omni input contract, and the ASR runner windows longer
+// input regardless. The shared decoder rejects non-finite float samples
+// and clamps the rest to [-1, 1].
+constexpr core::WavLimits kWavLimits{
+    .max_channels = 8,
+    .max_sample_rate = 192000,
+    .max_seconds = 300,
+    .max_pcm_bits = 32,
+};
+constexpr core::WavMessages kWavMessages{
+    .not_riff = "audio must be a RIFF/WAVE file",
+    .truncated = "truncated WAV chunk",
+    .invalid_fmt = "WAV fmt chunk is invalid",
+    .unsupported_format = "WAV format is unsupported",
+    .unsupported_layout = "WAV must be PCM16/24/32 or float32 interleaved",
+    .too_long = "audio must contain at most 300 seconds",
+    .non_finite = "WAV contains non-finite samples",
+};
+
 void Write32(std::vector<std::byte>& out, std::uint32_t v) {
   for (int i = 0; i < 4; ++i)
     out.push_back(std::byte((v >> (8 * i)) & 255));
@@ -30,58 +42,17 @@ void Write16(std::vector<std::byte>& out, std::uint16_t v) {
 bool DecodeWav(std::span<const std::byte> wav, std::vector<float>* samples,
                std::uint32_t* rate, std::string* error) {
   try {
-    if (wav.size() < 12 || std::memcmp(wav.data(), "RIFF", 4) ||
-        std::memcmp(wav.data() + 8, "WAVE", 4))
-      throw std::invalid_argument("audio must be a RIFF/WAVE file");
-    std::uint16_t format = 0, channels = 0, bits = 0;
-    std::uint32_t sample_rate = 0;
-    std::span<const std::byte> data;
-    for (std::size_t at = 12; at + 8 <= wav.size();) {
-      const auto size = Read32(wav.data() + at + 4);
-      const auto body = at + 8;
-      if (size > wav.size() - body)
-        throw std::invalid_argument("truncated WAV chunk");
-      if (!std::memcmp(wav.data() + at, "fmt ", 4) && size >= 16) {
-        format = Read16(wav.data() + body);
-        channels = Read16(wav.data() + body + 2);
-        sample_rate = Read32(wav.data() + body + 4);
-        bits = Read16(wav.data() + body + 14);
-        if (format == 0xFFFE && size >= 26)
-          format = Read16(wav.data() + body + 24);  // extensible subformat
-      } else if (!std::memcmp(wav.data() + at, "data", 4))
-        data = wav.subspan(body, size);
-      at = body + size + (size & 1);
+    const core::WavAudio decoded =
+        core::DecodeWav(wav, kWavLimits, kWavMessages);
+    const std::size_t channels = decoded.channels;
+    samples->assign(decoded.samples.size() / channels, 0.0F);
+    for (std::size_t frame = 0; frame < samples->size(); ++frame) {
+      float sum = 0.0F;
+      for (std::size_t c = 0; c < channels; ++c)
+        sum += decoded.samples[frame * channels + c];
+      (*samples)[frame] = sum / float(channels);
     }
-    const bool pcm = format == 1 && (bits == 16 || bits == 24 || bits == 32);
-    const bool ieee = format == 3 && bits == 32;
-    if (!channels || !sample_rate || (!pcm && !ieee) || data.empty())
-      throw std::invalid_argument(
-          "WAV must be PCM16/24/32 or float32 with audio data");
-    const std::size_t width = bits / 8, frame = width * channels;
-    const std::size_t count = data.size() / frame;
-    samples->assign(count, 0.0F);
-    for (std::size_t i = 0; i < count; ++i) {
-      float sum = 0;
-      for (std::size_t c = 0; c < channels; ++c) {
-        const auto* p = data.data() + i * frame + c * width;
-        float v;
-        if (ieee) {
-          const auto bits_value = Read32(p);
-          std::memcpy(&v, &bits_value, 4);
-        } else if (width == 2)
-          v = std::int16_t(Read16(p)) / 32768.0F;
-        else if (width == 3) {
-          std::int32_t x =
-              std::int32_t(Read16(p)) |
-              (std::int32_t(std::to_integer<std::int8_t>(p[2])) << 16);
-          v = x / 8388608.0F;
-        } else
-          v = float(std::int32_t(Read32(p)) / 2147483648.0);
-        sum += v;
-      }
-      (*samples)[i] = sum / channels;
-    }
-    *rate = sample_rate;
+    *rate = decoded.sample_rate;
     return true;
   } catch (const std::exception& e) {
     if (error)

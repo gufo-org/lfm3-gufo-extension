@@ -129,7 +129,9 @@ private:
 };
 std::uint32_t MelFrames(std::size_t samples);
 std::uint32_t EncoderTokens(std::uint32_t frames);
-// Mono float samples of a PCM16/PCM24/PCM32/float32 WAV.
+// Mono float samples of a PCM16/PCM24/PCM32/float32 interleaved WAV,
+// decoded by gufo's shared decoder: at most 8 channels, 192 kHz and
+// 300 seconds, finite samples clamped to [-1, 1].
 bool DecodeWav(std::span<const std::byte> wav, std::vector<float>* samples,
                std::uint32_t* rate, std::string* error = nullptr);
 std::vector<std::byte> EncodeWav(std::span<const float> samples,

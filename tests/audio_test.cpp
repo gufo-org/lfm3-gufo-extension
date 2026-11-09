@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <limits>
 #include <numbers>
 #include <string>
 #include <vector>
@@ -17,6 +19,73 @@ void Expect(bool ok, const std::string& what) {
     std::printf("FAIL %s\n", what.c_str());
     ++failures;
   }
+}
+void Push16(std::vector<std::byte>& out, std::uint16_t v) {
+  out.push_back(std::byte(v & 255));
+  out.push_back(std::byte(v >> 8));
+}
+void Push32(std::vector<std::byte>& out, std::uint32_t v) {
+  Push16(out, std::uint16_t(v & 0xFFFF));
+  Push16(out, std::uint16_t(v >> 16));
+}
+std::vector<std::byte> Bytes(const char* s) {
+  std::vector<std::byte> out;
+  for (; *s; ++s)
+    out.push_back(std::byte(*s));
+  return out;
+}
+// A RIFF/WAVE with one fmt chunk and one data chunk. A zero block_align
+// derives the canonical channels * bytes per sample.
+std::vector<std::byte> MakeWav(std::uint16_t format, std::uint16_t channels,
+                               std::uint32_t rate, std::uint16_t bits,
+                               std::vector<std::byte> data,
+                               std::uint16_t block_align = 0,
+                               std::uint32_t fmt_size = 16,
+                               const std::vector<std::byte>& fmt_ext = {}) {
+  if (!block_align)
+    block_align = std::uint16_t(channels * (bits / 8));
+  auto chunk = [&](const char* id, const std::vector<std::byte>& body) {
+    auto out = Bytes(id);
+    Push32(out, std::uint32_t(body.size()));
+    out.insert(out.end(), body.begin(), body.end());
+    if (body.size() & 1)
+      out.push_back(std::byte(0));
+    return out;
+  };
+  std::vector<std::byte> fmt;
+  Push16(fmt, format);
+  Push16(fmt, channels);
+  Push32(fmt, rate);
+  Push32(fmt, rate * block_align);
+  Push16(fmt, block_align);
+  Push16(fmt, bits);
+  fmt.insert(fmt.end(), fmt_ext.begin(), fmt_ext.end());
+  fmt.resize(fmt_size);  // Truncates, or zero-pads an extension area.
+  auto body = Bytes("WAVE");
+  for (const auto& c : {chunk("fmt ", fmt), chunk("data", data)})
+    body.insert(body.end(), c.begin(), c.end());
+  auto out = Bytes("RIFF");
+  Push32(out, std::uint32_t(body.size()));
+  out.insert(out.end(), body.begin(), body.end());
+  return out;
+}
+std::vector<std::byte> F32(std::initializer_list<float> values) {
+  std::vector<std::byte> out;
+  for (const float v : values) {
+    std::uint32_t bits{};
+    std::memcpy(&bits, &v, 4);
+    Push32(out, bits);
+  }
+  return out;
+}
+// Decodes and expects failure with this exact message.
+void ExpectRejected(const std::vector<std::byte>& wav, const char* message,
+                    const std::string& what) {
+  std::vector<float> samples;
+  std::uint32_t rate = 0;
+  std::string error;
+  Expect(!audio::DecodeWav(wav, &samples, &rate, &error), what + ": accepted");
+  Expect(error == message, what + ": " + error);
 }
 std::string Render(const std::vector<audio::PromptPiece>& pieces) {
   std::string out;
@@ -42,6 +111,71 @@ int main() {
   Expect(worst <= 1.0 / 32767, "wav quantization error");
   Expect(!audio::DecodeWav(std::span(wav).first(20), &decoded, &rate, &error),
          "truncated wav rejected");
+
+  // Shared-decoder edges, decided when switching off the local parser:
+  // WAVE_FORMAT_EXTENSIBLE is rejected even with a PCM subformat; a
+  // truncated fmt chunk is an error instead of being ignored; data that
+  // is not a whole number of frames is rejected; float samples clamp to
+  // [-1, 1] and reject non-finite values; the limits are 8 channels,
+  // 192 kHz, 300 seconds and PCM up to 32 bits.
+  {
+    const std::vector<std::byte> pcm16{std::byte(0x00), std::byte(0x20),
+                                       std::byte(0x00), std::byte(0xC0)};
+    // PCM16 subformat of WAVE_FORMAT_EXTENSIBLE (0xFFFE): cbSize 22,
+    // valid bits 16, channel mask 0, KSDATAFORMAT_SUBTYPE_PCM.
+    std::vector<std::byte> pcm_subformat;
+    Push16(pcm_subformat, 22);
+    Push16(pcm_subformat, 16);
+    Push32(pcm_subformat, 0);
+    Push32(pcm_subformat, 0x00000001);  // GUID Data1
+    Push32(pcm_subformat, 0x00100000);  // Data2, Data3
+    for (const std::uint8_t tail :
+         {0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71})
+      pcm_subformat.push_back(std::byte(tail));
+    ExpectRejected(MakeWav(0xFFFE, 1, 16000, 16, pcm16, 2, 40, pcm_subformat),
+                   "WAV format is unsupported", "extensible wav");
+    ExpectRejected(MakeWav(1, 1, 16000, 16, std::vector<std::byte>(8), 2, 8),
+                   "WAV fmt chunk is invalid", "short fmt chunk");
+    ExpectRejected(
+        MakeWav(1, 1, 16000, 16, {std::byte(0), std::byte(0x20), std::byte(0)}),
+        "WAV must be PCM16/24/32 or float32 interleaved", "partial frame");
+    ExpectRejected(MakeWav(1, 1, 16000, 16, {}), "WAV format is unsupported",
+                   "empty data");
+    ExpectRejected(MakeWav(1, 9, 16000, 16, std::vector<std::byte>(36)),
+                   "WAV format is unsupported", "9 channels");
+    ExpectRejected(MakeWav(1, 1, 192001, 16, pcm16),
+                   "WAV format is unsupported", "sample rate over 192 kHz");
+    // 301 seconds at 8 Hz stays small while exceeding the duration limit.
+    ExpectRejected(MakeWav(1, 1, 8, 16, std::vector<std::byte>(301 * 8 * 2)),
+                   "audio must contain at most 300 seconds", "too long");
+    ExpectRejected(MakeWav(1, 1, 16000, 64, std::vector<std::byte>(32)),
+                   "WAV must be PCM16/24/32 or float32 interleaved", "pcm64");
+    ExpectRejected(MakeWav(1, 2, 16000, 16, pcm16, 3),
+                   "WAV must be PCM16/24/32 or float32 interleaved",
+                   "block align mismatch");
+    // Float32: out-of-range values clamp, non-finite samples reject.
+    const auto clamped_wav = MakeWav(3, 1, 16000, 32, F32({2.0F, -3.0F, 0.5F}));
+    std::vector<float> clamped;
+    Expect(audio::DecodeWav(clamped_wav, &clamped, &rate, &error) &&
+               clamped.size() == 3 && clamped[0] == 1.0F &&
+               clamped[1] == -1.0F && clamped[2] == 0.5F,
+           "float clamp: " + error);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    ExpectRejected(MakeWav(3, 1, 16000, 32, F32({0.25F, nan})),
+                   "WAV contains non-finite samples", "float nan");
+    // Stereo downmix: the mean of the channels.
+    const auto stereo = MakeWav(1, 2, 16000, 16, [] {
+      std::vector<std::byte> d;
+      for (const std::uint16_t v : {std::uint16_t(8192), std::uint16_t(24576)})
+        Push16(d, v);
+      return d;
+    }());
+    std::vector<float> mono;
+    Expect(audio::DecodeWav(stereo, &mono, &rate, &error) && mono.size() == 1 &&
+               std::abs(mono[0] - 0.5F) < 1e-4F,
+           "stereo downmix: " + error);
+    Expect(rate == 16000, "stereo rate");
+  }
 
   // Resampling keeps an in-band tone: 1 kHz at 24 kHz to 16 kHz.
   std::vector<float> source(24000);
