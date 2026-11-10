@@ -250,6 +250,18 @@ gufo_extension_target(
     ${_gufo_lfm3_probe_libs}
 )
 
+gufo_extension_target(
+  NAME lfm3_prefix_probe
+  SOURCES
+    tests/prefix_probe.cpp
+  LINK_LIBRARIES
+    gufo_lfm3_hip
+    gufo_lfm3
+    gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
+    hip::host
+)
+
 # LFM3-Audio host helpers: WAV, resampling, prompt framing; no weights.
 gufo_extension_target(
   NAME lfm3_audio_test

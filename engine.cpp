@@ -251,9 +251,9 @@ struct Session::Impl {
         live_in[i] = need;
       }
     }
-    // x += post(branch), then z = norm(x), split for the next projections
-    // when they all read split prompt inputs, over the last rows rows.
-    // Returns whether z was split.
+    // x += post(branch), then z = norm(x), as FP16 for the next projections
+    // when they all read FP16 prompt inputs, over the last rows rows.
+    // Returns whether z was converted.
     auto residual_norm = [&](const float* branch, const Tensor* post,
                              const Tensor* next,
                              std::span<const gpu::Output> consumers,

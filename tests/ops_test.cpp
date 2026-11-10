@@ -52,6 +52,20 @@ void Projection(int n) {
       weights[i].qs[j] = int((i * 17 + j * 37) % 255) - 127;
   }
   auto x = Data(n * K, 0.07F);
+  // Prompt rows (32 or more) enter the matrix cores as FP16 after scaling
+  // each row by the power of two that puts its maximum in [2^14, 2^15);
+  // single rows and small batches keep FP32 inputs.
+  auto inputs = x;
+  if (n >= 32)
+    for (int row = 0; row < n; ++row) {
+      float maximum = 0;
+      for (int k = 0; k < K; ++k)
+        maximum = std::max(maximum, std::abs(x[row * K + k]));
+      const int e = 14 - std::ilogb(maximum);
+      for (int k = 0; k < K; ++k)
+        inputs[row * K + k] = std::ldexp(
+            float(static_cast<_Float16>(std::ldexp(x[row * K + k], e))), -e);
+    }
   std::vector<float> expected(n * M);
   for (int row = 0; row < n; ++row)
     for (int m = 0; m < M; ++m) {
@@ -59,7 +73,7 @@ void Projection(int n) {
       for (int k = 0; k < K; ++k) {
         const auto& block = weights[m * (K / 32) + k / 32];
         sum += double(gufo::quant::Fp16ToFloat(block.d)) * block.qs[k % 32] *
-               x[row * K + k];
+               inputs[row * K + k];
       }
       expected[row * M + m] = sum;
     }

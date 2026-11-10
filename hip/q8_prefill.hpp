@@ -6,31 +6,31 @@
 #include <cstddef>
 #include <cstdint>
 namespace gufo::models::lfm3::gpu {
-// Prompt activations are split into FP16 high parts and FP16 remainders,
-// [token][K] each, after scaling every row by a power of two so its maximum
-// lies in [2^14, 2^15). The pair keeps about 22 significant bits of every
-// element, not only of the row maximum. Row scales follow both planes.
-inline std::size_t SplitActivationBytes(std::size_t tokens, std::size_t K) {
-  return tokens * K * 2 * sizeof(__half) + tokens * sizeof(float);
+// Prompt activations are FP16, [token][K], after scaling every row by a
+// power of two so its maximum lies in [2^14, 2^15): every element keeps 11
+// significant bits relative to itself (FP16 subnormals start 38 binades below
+// the row maximum). Row scales follow the values.
+inline std::size_t HalfActivationBytes(std::size_t tokens, std::size_t K) {
+  return tokens * K * sizeof(__half) + tokens * sizeof(float);
 }
-// With raw, a projection reads FP32 rows and splits them while staging, with
-// the exponent from row_max (the bits of each row's maximum magnitude).
-struct SplitActivations {
-  __half *high, *low;
+// With raw, a projection reads FP32 rows and converts them while staging,
+// with the exponent from row_max (the bits of each row's maximum magnitude).
+struct HalfActivations {
+  __half* values;
   float* scale;
   const float* raw = nullptr;
   unsigned* row_max = nullptr;
-  static SplitActivations In(void* base, std::size_t tokens, std::size_t K) {
+  static HalfActivations In(void* base, std::size_t tokens, std::size_t K) {
     auto* half = static_cast<__half*>(base);
-    return {half, half + tokens * K,
-            reinterpret_cast<float*>(half + 2 * tokens * K), nullptr, nullptr};
+    return {half, reinterpret_cast<float*>(half + tokens * K), nullptr,
+            nullptr};
   }
 };
-__device__ __forceinline__ int SplitExponent(float maximum) {
+__device__ __forceinline__ int RowExponent(float maximum) {
   return maximum > 0 ? 14 - ilogbf(maximum) : 0;
 }
-__global__ void SplitRows(const float* __restrict__ x, SplitActivations out,
-                          int K) {
+__global__ void HalfRows(const float* __restrict__ x, HalfActivations out,
+                         int K) {
   const int row = blockIdx.x, tid = threadIdx.x;
   const float* src = x + std::size_t(row) * K;
   float maximum = 0;
@@ -45,15 +45,11 @@ __global__ void SplitRows(const float* __restrict__ x, SplitActivations out,
   maximum = 0;
   for (float v : maxima)
     maximum = fmaxf(maximum, v);
-  const int e = SplitExponent(maximum);
+  const int e = RowExponent(maximum);
   if (!tid)
     out.scale[row] = ldexpf(1.0F, -e);
-  for (int k = tid; k < K; k += 256) {
-    const float v = ldexpf(src[k], e);
-    const __half h = __float2half_rn(v);
-    out.high[std::size_t(row) * K + k] = h;
-    out.low[std::size_t(row) * K + k] = __float2half_rn(v - __half2float(h));
-  }
+  for (int k = tid; k < K; k += 256)
+    out.values[std::size_t(row) * K + k] = __float2half_rn(ldexpf(src[k], e));
 }
 namespace detail {
 using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
@@ -74,7 +70,7 @@ __device__ __forceinline__ void Codes(std::uint32_t codes, __half2& lo,
   hi = __hadd2(__builtin_bit_cast(__half2, p1), magic);
 }
 }  // namespace detail
-// Up to four projections of the same split input share one launch; each
+// Up to four projections of the same FP16 input share one launch; each
 // owns a contiguous range of row blocks.
 struct Projection {
   const void* weight;
@@ -96,9 +92,9 @@ struct SplitK {
   float* partial = nullptr;
   unsigned* tickets = nullptr;
 };
-// Q8_0 weights x split activations. For each K32 block the low and high
-// products chain into one FP32 WMMA accumulator, which is then scaled by the
-// block's weight scale; row scales apply after the K reduction. Block = BM
+// Q8_0 weights x FP16 activations. For each K32 block the two K16 products
+// chain into one FP32 WMMA accumulator, which is then scaled by the block's
+// weight scale; row scales apply after the K reduction. Block = BM
 // rows x BN tokens, waves = WM row groups x WN token groups. Global loads for
 // the next K block are issued before the current block's matrix work, and two
 // LDS stages leave one barrier per K block. With kSwiGLU, job 0 is the FFN
@@ -107,18 +103,20 @@ struct SplitK {
 template<int BM, int BN, int WM, int WN, bool kSwiGLU = false,
          bool kRaw = false>
 __launch_bounds__(256) __global__
-    void SplitQ8Gemm(Projections jobs, SplitActivations x, int tokens, int K,
+    void TiledQ8Gemm(Projections jobs, HalfActivations x, int tokens, int K,
                      SplitK sk) {
   using detail::v16h;
   using detail::v8f;
   static_assert(WM * WN == 8 && (!kSwiGLU || WM % 2 == 0));
   constexpr int RM = BM / 16 / WM, RN = BN / 16 / WN;
-  constexpr int kAPer = (BM + 255) / 256, kBPer = (2 * BN + 255) / 256;
+  // A B unit is one token's FP16 K block, or with kRaw half of its FP32 one.
+  constexpr int kBUnits = kRaw ? 2 * BN : BN;
+  constexpr int kAPer = (BM + 255) / 256, kBPer = (kBUnits + 255) / 256;
   constexpr int kTileRows = kSwiGLU ? BM / 2 : BM;
   // One K block of a row or token is four 16-byte chunks; neighbouring rows
   // permute them so fragment reads cover all bank groups.
   __shared__ __attribute__((aligned(16))) uint4 s_a[2][BM][4];
-  __shared__ __attribute__((aligned(16))) uint4 s_b[2][2][BN][4];
+  __shared__ __attribute__((aligned(16))) uint4 s_b[2][BN][4];
   __shared__ float s_d[2][BM];
   const auto swizzle = [](int row, int c) { return c ^ ((row >> 1) & 3); };
   const int blocks = K / 32, tid = threadIdx.x, lane = tid & 31,
@@ -152,20 +150,17 @@ __launch_bounds__(256) __global__
     a_ptr[p] = static_cast<const std::uint8_t*>(jobs.job[source].weight) +
                std::size_t(a_live[p] ? r : M - 1) * blocks * 34;
   }
-  // Each B unit is one token's high or low K block, or with kRaw one half
-  // of its FP32 K block.
   const void* b_ptr[kBPer];
   [[maybe_unused]] int b_exponent[kBPer];
 #pragma unroll
   for (int p = 0; p < kBPer; ++p) {
     const int idx = p * 256 + tid, t = t_block + idx % BN;
-    const bool live = idx < 2 * BN && t < tokens;
+    const bool live = idx < kBUnits && t < tokens;
     if constexpr (kRaw) {
       b_ptr[p] = live ? x.raw + std::size_t(t) * K + idx / BN * 16 : nullptr;
-      b_exponent[p] = live ? SplitExponent(__uint_as_float(x.row_max[t])) : 0;
+      b_exponent[p] = live ? RowExponent(__uint_as_float(x.row_max[t])) : 0;
     } else
-      b_ptr[p] =
-          live ? (idx / BN ? x.low : x.high) + std::size_t(t) * K : nullptr;
+      b_ptr[p] = live ? x.values + std::size_t(t) * K : nullptr;
   }
   uint4 a_codes[kAPer][2];
   std::uint16_t a_d[kAPer];
@@ -218,34 +213,28 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int p = 0; p < kBPer; ++p) {
       const int idx = p * 256 + tid;
-      if (idx >= 2 * BN)
+      if (idx >= kBUnits)
         break;
       const int t = idx % BN;
       if constexpr (kRaw) {
-        // SplitRows' rounding: scale, round high, round the remainder.
+        // HalfRows' rounding: scale by the row's power of two, round.
         float v[16];
         __builtin_memcpy(v, b_data[p], sizeof(v));
-        __half high[16], low[16];
+        __half h[16];
 #pragma unroll
-        for (int e = 0; e < 16; ++e) {
-          const float scaled = ldexpf(v[e], b_exponent[p]);
-          high[e] = __float2half_rn(scaled);
-          low[e] = __float2half_rn(scaled - __half2float(high[e]));
-        }
+        for (int e = 0; e < 16; ++e)
+          h[e] = __float2half_rn(ldexpf(v[e], b_exponent[p]));
         const int k_half = idx / BN;
 #pragma unroll
         for (int c = 0; c < 2; ++c) {
-          uint4 h, l;
-          __builtin_memcpy(&h, high + 8 * c, 16);
-          __builtin_memcpy(&l, low + 8 * c, 16);
-          s_b[stage][0][t][swizzle(t, 2 * k_half + c)] = h;
-          s_b[stage][1][t][swizzle(t, 2 * k_half + c)] = l;
+          uint4 u;
+          __builtin_memcpy(&u, h + 8 * c, 16);
+          s_b[stage][t][swizzle(t, 2 * k_half + c)] = u;
         }
       } else {
-        const int plane = idx / BN;
 #pragma unroll
         for (int c = 0; c < 4; ++c)
-          s_b[stage][plane][t][swizzle(t, c)] = b_data[p][c];
+          s_b[stage][t][swizzle(t, c)] = b_data[p][c];
       }
     }
   };
@@ -278,22 +267,19 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int j = 0; j < RN; ++j) {
       const int t = (wt * RN + j) * 16 + sub;
-      v16h b[2][2];
-#pragma unroll
-      for (int plane = 0; plane < 2; ++plane) {
+      v16h b[2];
+      {
         uint4 c[4];
 #pragma unroll
         for (int q = 0; q < 4; ++q)
-          c[q] = s_b[stage][plane][t][swizzle(t, q)];
-        __builtin_memcpy(&b[plane][0], &c[0], 32);
-        __builtin_memcpy(&b[plane][1], &c[2], 32);
+          c[q] = s_b[stage][t][swizzle(t, q)];
+        __builtin_memcpy(&b[0], &c[0], 32);
+        __builtin_memcpy(&b[1], &c[2], 32);
       }
 #pragma unroll
       for (int i = 0; i < RM; ++i) {
-        v8f c = detail::Wmma(a0[i], b[1][0], zero);
-        c = detail::Wmma(a1[i], b[1][1], c);
-        c = detail::Wmma(a0[i], b[0][0], c);
-        c = detail::Wmma(a1[i], b[0][1], c);
+        v8f c = detail::Wmma(a0[i], b[0], zero);
+        c = detail::Wmma(a1[i], b[1], c);
 #pragma unroll
         for (int l = 0; l < 8; ++l)
           acc[i][j][l] = fmaf(d[i][l], c[l], acc[i][j][l]);
@@ -354,10 +340,9 @@ __launch_bounds__(256) __global__
         const int local = (wt * RN + j) * 16 + sub, token = t_block + local;
         float scale = 0;
         if (token < tokens)
-          scale =
-              kRaw ? ldexpf(1.0F,
-                            -SplitExponent(__uint_as_float(x.row_max[token])))
-                   : x.scale[token];
+          scale = kRaw ? ldexpf(1.0F,
+                                -RowExponent(__uint_as_float(x.row_max[token])))
+                       : x.scale[token];
         [[maybe_unused]] float token_max = 0;
 #pragma unroll
         for (int i = 0; i < RM; ++i)
@@ -384,7 +369,7 @@ __launch_bounds__(256) __global__
     float scale = 0;
     if (token < tokens)
       scale =
-          kRaw ? ldexpf(1.0F, -SplitExponent(__uint_as_float(x.row_max[token])))
+          kRaw ? ldexpf(1.0F, -RowExponent(__uint_as_float(x.row_max[token])))
                : x.scale[token];
     [[maybe_unused]] float token_max = 0;
 #pragma unroll
@@ -430,34 +415,36 @@ __launch_bounds__(256) __global__
       }
     }
     if constexpr (kSwiGLU) {
-      // Row maxima let the down projection split this output while staging.
+      // Row maxima let the down projection convert this output while staging.
       token_max = fmaxf(token_max, other_half(token_max));
       if (x.row_max && !half && token < tokens)
         atomicMax(x.row_max + token, __float_as_uint(token_max));
     }
   }
 }
-// Q8_0 weights x split activations with register-resident weights. Every
+// Q8_0 weights x FP16 activations with register-resident weights. Every
 // wave owns its weight rows, so only the activations (shared by all waves)
 // pass through LDS. Products are transposed (activations as the WMMA A
 // operand): lane L then holds weight row L % 16 for alternate tokens, so
 // each lane scales by its own row's Q8 scale. As the B operand, element k
 // of column n is read from lane n for even k and lane n + 16 for odd k, so
 // both lanes of a row decode all 32 codes of each K block. The sums are
-// those of SplitQ8Gemm, in its order. Block = kWaves waves x RM row tiles of
+// those of TiledQ8Gemm, in its order. Block = kWaves waves x RM row tiles of
 // 16 rows, x BN = 16 * RN tokens. With kSwiGLU a wave holds 16 gate rows
 // (tile 0) and the same 16 up rows (tile 1) and applies SwiGLU in registers.
 template<int RN, bool kSwiGLU = false, bool kRaw = false, int kWaves = 8>
 __launch_bounds__(kWaves * 32) __global__
-    void RegQ8Gemm(Projections jobs, SplitActivations x, int tokens, int K,
+    void RegQ8Gemm(Projections jobs, HalfActivations x, int tokens, int K,
                    SplitK sk) {
   using detail::v16h;
   using detail::v8f;
   constexpr int RM = 2, BN = 16 * RN;
   constexpr int T = kWaves * 32;
-  constexpr int kBPer = (2 * BN + T - 1) / T;
+  // A B unit is one token's FP16 K block, or with kRaw half of its FP32 one.
+  constexpr int kBUnits = kRaw ? 2 * BN : BN;
+  constexpr int kBPer = (kBUnits + T - 1) / T;
   constexpr int kTileRows = kWaves * 16 * (kSwiGLU ? 1 : RM);
-  __shared__ __attribute__((aligned(16))) uint4 s_b[2][2][BN][4];
+  __shared__ __attribute__((aligned(16))) uint4 s_b[2][BN][4];
   const auto swizzle = [](int row, int c) { return c ^ ((row >> 1) & 3); };
   const int blocks = K / 32, tid = threadIdx.x, lane = tid & 31,
             wave = tid >> 5, sub = lane & 15, half = lane >> 4;
@@ -494,13 +481,12 @@ __launch_bounds__(kWaves * 32) __global__
 #pragma unroll
   for (int p = 0; p < kBPer; ++p) {
     const int idx = p * T + tid, t = t_block + idx % BN;
-    const bool live = idx < 2 * BN && t < tokens;
+    const bool live = idx < kBUnits && t < tokens;
     if constexpr (kRaw) {
       b_ptr[p] = live ? x.raw + std::size_t(t) * K + idx / BN * 16 : nullptr;
-      b_exponent[p] = live ? SplitExponent(__uint_as_float(x.row_max[t])) : 0;
+      b_exponent[p] = live ? RowExponent(__uint_as_float(x.row_max[t])) : 0;
     } else
-      b_ptr[p] =
-          live ? (idx / BN ? x.low : x.high) + std::size_t(t) * K : nullptr;
+      b_ptr[p] = live ? x.values + std::size_t(t) * K : nullptr;
   }
   uint4 w_codes[RM][2];
   std::uint16_t w_d[RM];
@@ -535,34 +521,28 @@ __launch_bounds__(kWaves * 32) __global__
 #pragma unroll
     for (int p = 0; p < kBPer; ++p) {
       const int idx = p * T + tid;
-      if (idx >= 2 * BN)
+      if (idx >= kBUnits)
         break;
       const int t = idx % BN;
       if constexpr (kRaw) {
-        // SplitRows' rounding: scale, round high, round the remainder.
+        // HalfRows' rounding: scale by the row's power of two, round.
         float v[16];
         __builtin_memcpy(v, b_data[p], sizeof(v));
-        __half high[16], low[16];
+        __half h[16];
 #pragma unroll
-        for (int e = 0; e < 16; ++e) {
-          const float scaled = ldexpf(v[e], b_exponent[p]);
-          high[e] = __float2half_rn(scaled);
-          low[e] = __float2half_rn(scaled - __half2float(high[e]));
-        }
+        for (int e = 0; e < 16; ++e)
+          h[e] = __float2half_rn(ldexpf(v[e], b_exponent[p]));
         const int k_half = idx / BN;
 #pragma unroll
         for (int c = 0; c < 2; ++c) {
-          uint4 h, l;
-          __builtin_memcpy(&h, high + 8 * c, 16);
-          __builtin_memcpy(&l, low + 8 * c, 16);
-          s_b[stage][0][t][swizzle(t, 2 * k_half + c)] = h;
-          s_b[stage][1][t][swizzle(t, 2 * k_half + c)] = l;
+          uint4 u;
+          __builtin_memcpy(&u, h + 8 * c, 16);
+          s_b[stage][t][swizzle(t, 2 * k_half + c)] = u;
         }
       } else {
-        const int plane = idx / BN;
 #pragma unroll
         for (int c = 0; c < 4; ++c)
-          s_b[stage][plane][t][swizzle(t, c)] = b_data[p][c];
+          s_b[stage][t][swizzle(t, c)] = b_data[p][c];
       }
     }
   };
@@ -602,22 +582,19 @@ __launch_bounds__(kWaves * 32) __global__
       if (!wave_live)
         break;
       const int t = j * 16 + sub;
-      v16h b[2][2];
-#pragma unroll
-      for (int plane = 0; plane < 2; ++plane) {
+      v16h b[2];
+      {
         uint4 c[4];
 #pragma unroll
         for (int q = 0; q < 4; ++q)
-          c[q] = s_b[stage][plane][t][swizzle(t, q)];
-        __builtin_memcpy(&b[plane][0], &c[0], 32);
-        __builtin_memcpy(&b[plane][1], &c[2], 32);
+          c[q] = s_b[stage][t][swizzle(t, q)];
+        __builtin_memcpy(&b[0], &c[0], 32);
+        __builtin_memcpy(&b[1], &c[2], 32);
       }
 #pragma unroll
       for (int i = 0; i < RM; ++i) {
-        v8f c = detail::Wmma(b[1][0], w[i][0], zero);
-        c = detail::Wmma(b[1][1], w[i][1], c);
-        c = detail::Wmma(b[0][0], w[i][0], c);
-        c = detail::Wmma(b[0][1], w[i][1], c);
+        v8f c = detail::Wmma(b[0], w[i][0], zero);
+        c = detail::Wmma(b[1], w[i][1], c);
 #pragma unroll
         for (int l = 0; l < 8; ++l)
           acc[i][j][l] = fmaf(d[i], c[l], acc[i][j][l]);
@@ -673,9 +650,9 @@ __launch_bounds__(kWaves * 32) __global__
       const int token = t_block + j * 16 + 2 * l + half;
       float scale = 0;
       if (token < tokens)
-        scale = kRaw ? ldexpf(1.0F,
-                              -SplitExponent(__uint_as_float(x.row_max[token])))
-                     : x.scale[token];
+        scale =
+            kRaw ? ldexpf(1.0F, -RowExponent(__uint_as_float(x.row_max[token])))
+                 : x.scale[token];
       if constexpr (kSwiGLU) {
         // The separate SwiGLU kernel's formula.
         const float g = acc[0][j][l] * scale, u = acc[1][j][l] * scale;
@@ -683,7 +660,7 @@ __launch_bounds__(kWaves * 32) __global__
         const float value = (g * sig_g) * u;
         if (token < tokens && row[0] < M)
           y[std::size_t(token) * M + row[0]] = value;
-        // Row maxima let the down projection split this output while
+        // Row maxima let the down projection convert this output while
         // staging.
         float m = row[0] < M ? fabsf(value) : 0.0F;
 #pragma unroll

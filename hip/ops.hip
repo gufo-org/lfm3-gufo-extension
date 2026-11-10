@@ -832,13 +832,13 @@ __device__ float RowSquares(float sum, float* scratch) {
 }
 constexpr int kNormItems = 16;
 // One block per row: x += post_norm(branch), then z = norm(x) as FP32 rows
-// or as split prompt activations. A null branch only normalizes x; a null
+// or as FP16 prompt activations. A null branch only normalizes x; a null
 // norm weight only updates x. Each step keeps the separate kernels' rounding.
 __global__ void ResidualNormKernel(const float* __restrict__ branch,
                                    const float* __restrict__ post_weight,
                                    float* __restrict__ x,
                                    const float* __restrict__ weight, float* z,
-                                   SplitActivations split, int H, float eps) {
+                                   HalfActivations split, int H, float eps) {
   __shared__ float scratch[256];
   const int row = blockIdx.x, tid = threadIdx.x, items = H / 256;
   float* xr = x + std::size_t(row) * H;
@@ -892,13 +892,9 @@ __global__ void ResidualNormKernel(const float* __restrict__ branch,
   const int e = maximum > 0 ? 14 - ilogbf(maximum) : 0;
   if (!tid)
     split.scale[row] = ldexpf(1.0F, -e);
-  for (int i = 0; i < items; ++i) {
-    const float scaled = ldexpf(v[i], e);
-    const __half h = __float2half_rn(scaled);
-    const auto at = std::size_t(row) * H + tid + 256 * i;
-    split.high[at] = h;
-    split.low[at] = __float2half_rn(scaled - __half2float(h));
-  }
+  for (int i = 0; i < items; ++i)
+    split.values[std::size_t(row) * H + tid + 256 * i] =
+        __float2half_rn(ldexpf(v[i], e));
 }
 // One thread per (row, channel): earlier rows' B*x products are recomputed
 // from the projection, or read from the history before the chunk. The FMA
@@ -1919,7 +1915,7 @@ void Embed(const Tensor& w, const std::uint32_t* tokens, float* out, int n,
                                                                   out, n);
 }
 std::size_t DenseWorkspaceBytes(std::size_t rows, std::size_t K) {
-  return SplitActivationBytes(rows, K);
+  return HalfActivationBytes(rows, K);
 }
 // The widest tile keeps 64 accumulators in each of 256 threads.
 std::size_t SplitPartialBytes() {
@@ -1976,7 +1972,7 @@ SplitK PlanSplit(int token_blocks, int tiles, int k_blocks, int resident,
   return plan;
 }
 template<bool kSwiGLU = false, bool kRaw = false>
-void LaunchSplit(std::span<const Output> outputs, SplitActivations split, int n,
+void LaunchSplit(std::span<const Output> outputs, HalfActivations split, int n,
                  int K, hipStream_t s, DenseWorkspace workspace = {}) {
   constexpr int BN = 64;
   Projections jobs{};
@@ -2006,7 +2002,7 @@ void LaunchSplit(std::span<const Output> outputs, SplitActivations split, int n,
   if (wide)
     launch.template operator()<RegQ8Gemm<BN / 16, kSwiGLU, kRaw>>();
   else
-    launch.template operator()<SplitQ8Gemm<64, BN, 4, 2, kSwiGLU, kRaw>>();
+    launch.template operator()<TiledQ8Gemm<64, BN, 4, 2, kSwiGLU, kRaw>>();
 }
 }  // namespace
 // One-row Q8_0 projections of one input in a single launch; false when the
@@ -2053,7 +2049,7 @@ bool ResidualNorm(const float* branch, const Tensor* post_norm, float* x,
   ResidualNormKernel<<<n, 256, 0, s>>>(
       branch, post_norm ? static_cast<const float*>(post_norm->data) : nullptr,
       x, norm ? static_cast<const float*>(norm->data) : nullptr,
-      split ? nullptr : z, SplitActivations::In(workspace.quantized, n, H), H,
+      split ? nullptr : z, HalfActivations::In(workspace.quantized, n, H), H,
       eps);
   return true;
 }
@@ -2067,9 +2063,9 @@ void Project(std::span<const Output> outputs, const float* x, int n,
       Dense(*o.weight, x, o.out, n, s, workspace);
     return;
   }
-  const auto split = SplitActivations::In(workspace.quantized, n, K);
+  const auto split = HalfActivations::In(workspace.quantized, n, K);
   if (!split_ready)
-    SplitRows<<<n, 256, 0, s>>>(x, split, K);
+    HalfRows<<<n, 256, 0, s>>>(x, split, K);
   // With one wide projection all of them share its tiles; waves past a
   // narrow projection's rows skip their products.
   LaunchSplit(outputs, split, n, K, s, workspace);
@@ -2079,9 +2075,9 @@ void ProjectSwiGLU(const Tensor& gate, const Tensor& up, const float* x,
                    DenseWorkspace workspace, bool split_ready) {
   const Output outputs[] = {{&gate, out}, {&up, nullptr}};
   if (SharesSplit(outputs, n, workspace) && gate.rows == up.rows) {
-    const auto split = SplitActivations::In(workspace.quantized, n, gate.cols);
+    const auto split = HalfActivations::In(workspace.quantized, n, gate.cols);
     if (!split_ready)
-      SplitRows<<<n, 256, 0, s>>>(x, split, gate.cols);
+      HalfRows<<<n, 256, 0, s>>>(x, split, gate.cols);
     LaunchSplit<true>(outputs, split, n, gate.cols, s);
     return;
   }
@@ -2100,13 +2096,13 @@ void ProjectFfn(const Tensor& gate, const Tensor& up, const Tensor& down,
   if (workspace.row_max && SharesSplit(first, n, workspace) &&
       gate.rows == up.rows && SplitPrompt(down, n, workspace) &&
       down.cols == gate.rows) {
-    auto split = SplitActivations::In(workspace.quantized, n, gate.cols);
+    auto split = HalfActivations::In(workspace.quantized, n, gate.cols);
     if (!split_ready)
-      SplitRows<<<n, 256, 0, s>>>(x, split, gate.cols);
+      HalfRows<<<n, 256, 0, s>>>(x, split, gate.cols);
     split.row_max = workspace.row_max;
     (void)hipMemsetAsync(workspace.row_max, 0, std::size_t(n) * 4, s);
     LaunchSplit<true>(first, split, n, gate.cols, s);
-    SplitActivations raw{};
+    HalfActivations raw{};
     raw.raw = hidden;
     raw.row_max = workspace.row_max;
     const Output second[] = {{&down, out}};

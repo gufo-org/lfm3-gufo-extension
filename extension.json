@@ -20,6 +20,7 @@
     "lfm3_continuation_adapter_test": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_session_test": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_probe": { "requires": ["testing"], "role": "test" },
+    "lfm3_prefix_probe": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_audio_test": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_audio_probe": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_audio_batch_bench": { "requires": ["hip", "testing"], "role": "test" },
