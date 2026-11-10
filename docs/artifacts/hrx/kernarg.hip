@@ -27,6 +27,26 @@ __device__ __forceinline__ void Body(const Jobs& jobs, std::size_t per_block) {
 }
 
 __global__ void ByValue(Jobs jobs, std::size_t per_block) { Body(jobs, per_block); }
+// Per-wave (divergent) job index into the by-value table, as Q8_0MultiGEMV's
+// SwiGLU path does with jobs.job[source]: forces vector loads of kernel args.
+__global__ void ByValueWave(Jobs jobs, std::size_t per_block) {
+  const int j = (threadIdx.x >> 5) & 3;
+  const Job& job = jobs.job[j];
+  const std::size_t base = blockIdx.x * per_block;
+  float acc = 0;
+  for (std::size_t i = threadIdx.x; i < per_block; i += blockDim.x)
+    acc += job.src[(base + i) % job.rows];
+  if (acc == 1234.5f) job.dst[0] = acc;
+}
+__global__ void ByPointerWave(const Jobs* __restrict__ jobs, std::size_t per_block) {
+  const int j = (threadIdx.x >> 5) & 3;
+  const Job& job = jobs->job[j];
+  const std::size_t base = blockIdx.x * per_block;
+  float acc = 0;
+  for (std::size_t i = threadIdx.x; i < per_block; i += blockDim.x)
+    acc += job.src[(base + i) % job.rows];
+  if (acc == 1234.5f) job.dst[0] = acc;
+}
 __global__ void ByPointer(const Jobs* __restrict__ jobs, std::size_t per_block) {
   Body(*jobs, per_block);
 }
@@ -63,8 +83,10 @@ int main() {
       OK(hipMemcpy(djobs, &jobs, sizeof(Jobs), hipMemcpyHostToDevice));
       const float tv = Median([&] { ByValue<<<blocks, 64>>>(jobs, per_block); });
       const float tp = Median([&] { ByPointer<<<blocks, 64>>>(djobs, per_block); });
-      std::printf("blocks %5d per_block %5zu: by value %7.2f us  by pointer %7.2f us  (%+.1f%%)\n",
-                  blocks, per_block, tv, tp, 100.0 * (tv - tp) / tp);
+      const float twv = Median([&] { ByValueWave<<<blocks, 128>>>(jobs, per_block); });
+      const float twp = Median([&] { ByPointerWave<<<blocks, 128>>>(djobs, per_block); });
+      std::printf("blocks %5d per_block %5zu: uniform value %7.2f ptr %7.2f | per-wave value %7.2f ptr %7.2f us (%+.0f%%)\n",
+                  blocks, per_block, tv, tp, twv, twp, 100.0 * (twv - twp) / twp);
       OK(hipFree(djobs));
     }
   }

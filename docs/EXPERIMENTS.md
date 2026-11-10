@@ -352,7 +352,36 @@ single-output GEMV runs at the same speed. Ruled out, each by A/B on
 | HRX's dispatch registers | `FORCE_SIMD_DIST` (`COMPUTE_RESOURCE_LIMITS` bit 23), `ORDER_MODE` | tg128 95.4-96.1 and 95.9-96.4 against 95.7-96.3 |
 | HRX setting `SIMD_DEST_CNTL` for wave counts divisible by four | clear bit 22 | tg128 96.0-96.4 against 95.9-96.3 |
 
-Open: the remaining suspect is memory throughput of HRX-launched,
-bandwidth-bound kernels (the largest streaming case of `kernarg.hip` is 6%
-slower on HRX, 133.8 against 126.0 µs). Next: an instruction-level thread
-trace of `Q8_0MultiGEMV` under both runtimes.
+A standalone copy of the kernels at LFM3-1.7B shapes (gate and up 8,192 x
+2,048 Q8_0, weights written device-to-device;
+[`multigemv.hip`](artifacts/hrx/multigemv.hip)) reproduces it, so it is not
+the model's state:
+
+| Kernel | HIP | HRX |
+| --- | ---: | ---: |
+| `Q8_0MultiGEMV` SwiGLU, 8-wave workgroups (LFM3's FFN route) | 92.3-93.8 µs | 174.5-187.8 µs |
+| `Q8_0MultiGEMV` SwiGLU, 4-wave workgroups | 79.5-88.6 µs | 219.2-234.9 µs |
+| `Q8_0MultiGEMV` pair, 4-wave workgroups | 73.4-86.8 µs | 77.8-90.1 µs |
+| 2 x `Q8_0GEMV`, 4-wave workgroups | 75.3-87.3 µs | 79.1-90.4 µs |
+| 2 x `Q8_0GEMV`, 8-wave workgroups | 82.1-83.0 µs | 75.7-87.6 µs |
+
+Only the SwiGLU path, where each workgroup streams rows of both matrices
+(gate waves and up waves) and joins them through a 16-byte `__shared__`
+array and a barrier, is slow on HRX; HIP pays about 25% for that pattern
+against the pair route, HRX about 2x. Ruled out within it:
+
+- Shared memory and the barrier on their own
+  ([`ldsbarrier.hip`](artifacts/hrx/ldsbarrier.hip)): a streaming kernel with
+  and without a static `__shared__` array and `__syncthreads()` runs within 5%
+  on both runtimes.
+- Scratch: every variant has `private_segment_fixed_size` 0.
+- The per-wave `jobs.job[source].weight` load from the by-value argument.
+  Divergent indexing into by-value kernel arguments is slow on HRX in general
+  ([`kernarg.hip`](artifacts/hrx/kernarg.hip): 8-33% slower than through a
+  device pointer, against at most 4% on HIP), but loading both pointers as
+  uniform scalars and selecting per wave leaves the SwiGLU kernel as slow
+  (219.2 and 194.7 µs) and costs HIP 9-28%, so it is not kept.
+
+Open: the two-matrix access pattern under HRX's dispatch. The reproducer is
+small enough to report upstream; a dispatch-order or MALL-allocation
+difference is the next suspect.
