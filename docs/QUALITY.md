@@ -8,8 +8,38 @@ Since November 8, 2026 every attention K/V cache is F16 (llama.cpp's default);
 the teacher comparisons below were measured with the earlier FP32 caches and
 were not repeated. The F16 path is gated by FP64 operator references over the
 stored F16 rows (decode `2e-6`, matrix-core prompts `1e-3`), the 513-token
-chunked/serial session gate (`0.002`; 0.00136 Q8_0, 0.00175 BF16) and the
-functional suites (see EXPERIMENTS.md).
+chunked/serial session check and the functional suites (see EXPERIMENTS.md).
+
+## FP16 prompt activations
+
+Since November 10, 2026 Q8 prompt projections read one row-scaled FP16 plane
+instead of the 22-bit high/remainder pair, and matrix-core prompt attention
+reads one F16 query instead of two. Both were accepted on distribution
+evidence from `lfm3_prefix_probe` ([source](../tests/prefix_probe.cpp)): it
+prefills every prefix of a text at a fixed stride, teacher-forces the next
+decode steps and keeps all 128000 logits of every row. The reference is the
+BF16 checkpoint through the same engine (exact FP32 BF16 projections).
+
+| Q8_0 against BF16 | Rows | KL mean | KL max | Top-1 | NLL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 5.9K-token text, 22-bit activations | 171 | 1.252e-3 | 1.80e-2 | 96.5% | 2.7753 |
+| 5.9K-token text, FP16 activations | 171 | 1.255e-3 | 1.79e-2 | 96.5% | 2.7747 |
+| 27K-token text, split query | 90 | 9.79e-4 | 8.35e-3 | 96.7% | 2.7726 |
+| 27K-token text, F16 query | 90 | 9.72e-4 | 8.57e-3 | 96.7% | 2.7727 |
+
+BF16 NLL is 2.7716 and 2.7733. The 27K rows both use FP16 projection
+activations and isolate the query. Directly against the previous Q8_0
+path, the FP16 projections differ by KL `2.4e-6` (maximum `2.3e-5`) and the
+F16 query by `1.5e-6`, about 500 times below the Q8_0 quantization KL, with
+identical top-1 on every row. Prefixes cross 512-token chunks at every stride;
+texts are Gufo documentation and C++ source.
+
+The single-row maximum logit change is no longer a useful gate at this
+precision, so the chunked/serial and continuation checks now require KL
+below `1e-6`, matching argmax and at most `0.02` per logit (measured Q8_0
+`0.0078` with KL `2.5e-9`, BF16 `0.0021` with KL `6.9e-10`). The projection
+operator check compares prompt rows with an FP64 product over their FP16-rounded
+row-scaled inputs, at the unchanged `1e-4`.
 
 ## Independent checks
 
