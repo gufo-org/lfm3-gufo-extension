@@ -1,0 +1,38 @@
+diff --git a/upload.cpp b/upload.cpp
+index 428dba2..ab47a8f 100644
+--- a/upload.cpp
++++ b/upload.cpp
+@@ -3,6 +3,7 @@
+ #include <hip/hip_runtime.h>
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <functional>
+ #include <gufo/ext/experimental/weight_upload.hpp>
+ #include <stdexcept>
+@@ -65,6 +66,25 @@ void DeviceWeights::Upload(const core::GgufReader& reader) {
+   // Finish waits for queued copies even after a failed one.
+   if (uploader && (!uploader->Finish(&error) || !queued))
+     throw std::runtime_error("LFM3 weight upload failed: " + error);
++  // PROBE (not for landing): GUFO_PROBE_REWRITE_WEIGHTS=1 rewrites every
++  // weight segment on the GPU (device-to-device out and back) so no state
++  // left by the host upload remains (hrx-system#2984).
++  if (std::getenv("GUFO_PROBE_REWRITE_WEIGHTS") != nullptr) {
++    void* scratch = nullptr;
++    Check(hipMalloc(&scratch, kSegmentBytes));
++    for (auto* segment : segments_) {
++      std::size_t size = 0;
++      Check(hipMemPtrGetInfo(segment, &size));
++      for (std::size_t offset = 0; offset < size; offset += kSegmentBytes) {
++        const auto n = std::min(kSegmentBytes, size - offset);
++        auto* p = static_cast<char*>(segment) + offset;
++        Check(hipMemcpy(scratch, p, n, hipMemcpyDeviceToDevice));
++        Check(hipMemcpy(p, scratch, n, hipMemcpyDeviceToDevice));
++      }
++    }
++    Check(hipDeviceSynchronize());
++    Check(hipFree(scratch));
++  }
+ }
+ void DeviceWeights::Resolve(Tensor& tensor) const {
+   if (tensor.data)

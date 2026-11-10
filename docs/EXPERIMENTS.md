@@ -256,3 +256,132 @@ pass time:
 | --- | --- |
 | FP16 prompt activations from 16 rows instead of 32 (`kPromptRows`): the exact small-batch kernels cost about 0.8 ms per row and passed the FP16 route at 16 | Retained. KL against BF16 for 16–31-token prefixes 2.350e-3 → 2.314e-3, same top-1 (QUALITY.md); other rows bit-identical. 13–15 rows would save about 1 ms and stay exact. |
 
+
+## November 10 pass: GPU and NPU efficiency on HRX
+
+The question is speed per watt, not peak speed: a slower device that produces
+more tokens for the same energy can be the better choice for small models.
+Strix Halo `gfx1151`, Gufo `3edc2eff` with this extension at `debba20`,
+LFM3-1.7B Q8_0. HRX is AMD's alternative HIP runtime on its native libamdf
+driver (hrx-system `dd9572875f`, Gufo's experimental `.#hrx` package; see
+Gufo's `docs/internal/hrx-migration.md`). Power is the amdgpu `power1_average`
+socket sensor, which covers the whole APU. With no Gufo process and a cooled
+GPU the socket draws 9-12 W.
+
+### GPU, HIP against HRX
+
+`gufo serve llm` with one session, single-stream HTTP requests: prefill is
+about 2,000-token prompts with `max_tokens=1`, decode 256 greedy tokens; each
+phase runs 20 s with its own power average.
+
+| Runtime | Phase | Speed (tok/s) | Socket power | Energy per token |
+| --- | --- | ---: | ---: | ---: |
+| HIP | prefill | 7,821.3 | 140.6 W | 18.0 mJ |
+| HIP | decode | 111.8 | 100.4 W | 898 mJ |
+| HRX | prefill | 7,054.4 | 139.5 W | 19.8 mJ |
+| HRX | decode | 95.6 | 96.6 W | 1,011 mJ |
+| HRX, queue pool | prefill | 7,489.8 | 140.5 W | 18.8 mJ |
+| HRX, queue pool | decode | 95.8 | 97.2 W | 1,014 mJ |
+
+`gufo bench` agrees on the speeds: HIP pp2048 9,063-9,196 and tg128
+111.3-112.0, HRX 8,720-8,843 and 96.1-96.2 tok/s. HRX decodes LFM3 about 14%
+slower, more than on Qwen3.8-Flash-Next, consistent with its higher per-launch
+cost on small kernels.
+
+The HRX build used here gave every created stream its own hardware queue.
+LFM3 creates about 70 streams, and with that many queues mapped the GPU stays
+100% busy at 2.9 GHz with no work queued: an idle server drew 39-41 W against
+11-12 W on HIP. A pool of at most four queues idles normally (0% busy,
+11-12 W); sixteen spins again. The two "HRX" rows above used the queue per
+stream; the "HRX, queue pool" rows use the pooled package
+(gufo-org/gufo#1147), with which an idle LFM3 server draws 13 W at 0% busy.
+The pool lifts prefill by 6% and leaves decode unchanged.
+
+### NPU
+
+There is no Loom NPU program for LFM3 yet. The closest working NPU model is
+Loom's Qwen3-Embedding-0.6B on the XDNA NPU (hrx-loom-library `8ef2e49`,
+eight columns by four core rows, original BF16 weights), measured with the
+same sensor:
+
+| Load | Socket power | Throughput | Energy per token |
+| --- | ---: | ---: | ---: |
+| 8 inputs of 15 tokens per call | 20.1 W | 2,047 tok/s | 9.8 mJ |
+| 1 input of about 120 tokens per call | 20.2 W | 2,144 tok/s | 9.4 mJ |
+
+Every 128-slot cohort takes about 57 ms whatever it holds, consistent with
+streaming the 1.2 GB of weights at about 21 GB/s per cohort.
+
+Projection for LFM3 on the NPU, if that 21 GB/s is the NPU's sustained weight
+bandwidth: decode reads about 1.8 GB per token, so about 12 tok/s at about
+20 W, or about 1.7 J per token, worse than the GPU's 0.9 J. Prefill at the
+embedding's arithmetic rate would be several hundred tok/s at about 20 W,
+around 25-40 mJ per token, also short of the GPU's 18 mJ. The NPU wins on
+efficiency only if its weight bandwidth is well above what the embedding
+program reaches; it wins on concurrency regardless, since it leaves the GPU
+free.
+
+Next: measure the NPU's DRAM-to-tile bandwidth directly, then port one LFM3
+SwiGLU block to the NPU in Loom and measure tokens per joule against the
+GPU's 898 mJ decode figure.
+
+### Why HRX decodes LFM3 14% slower
+
+HRX dispatch profile against a rocprofv3 trace of the same `gufo bench`
+(decode window, the last 40% of dispatches; rocprof adds 2-3% on HIP):
+
+| Kernel family | Calls | HIP median | HRX median | HIP total | HRX total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `Q8_0MultiGEMV` | 2,647 | 144.6 µs | 163.1 µs | 253.6 ms | 325.2 ms |
+| `Q8_0GEMV` | 2,704 | 74.5 µs | 74.9 µs | 217.6 ms | 197.2 ms |
+| `ResidualNormKernel` | 2,703 | 6.7 µs | 8.0 µs | 19.5 ms | 22.2 ms |
+| `DecodeWaves` | 607 | 9.2 µs | 14.2 µs | 6.5 ms | 8.4 ms |
+
+Decode is about 194 kernels per token and 93% GPU-busy on HRX (launch gaps
+median 3.6 µs, 7% of the window), so a decode graph would recover at most
+about 7%. The deficit is `Q8_0MultiGEMV`, 13% slower per call, while the
+single-output GEMV runs at the same speed. Ruled out, each by A/B on
+`gufo bench -p 2048 -n 128 -r 3` or a microbenchmark in
+[`artifacts/hrx/`](artifacts/hrx/):
+
+| Hypothesis | Test | Result |
+| --- | --- | --- |
+| HRX's host-upload cache state (hrx-system#2984) | rewrite every weight segment device-to-device after upload ([`rewrite-weights-probe.diff`](artifacts/hrx/rewrite-weights-probe.diff)) | tg128 95.3-96.0 against 95.8-96.5 without; HIP 111.4-112.0 either way |
+| Small grids placed on fewer compute units | 1-80 long workgroups ([`spread.hip`](artifacts/hrx/spread.hip)) | identical on both runtimes: up to 40 run in parallel on all 10 WGP slots and both shader engines |
+| Per-workgroup reads of the by-value `Projections` argument | by-value against by-pointer job tables ([`kernarg.hip`](artifacts/hrx/kernarg.hip)) | at most 4% apart on HRX, same pattern on HIP |
+| HRX's dispatch registers | `FORCE_SIMD_DIST` (`COMPUTE_RESOURCE_LIMITS` bit 23), `ORDER_MODE` | tg128 95.4-96.1 and 95.9-96.4 against 95.7-96.3 |
+| HRX setting `SIMD_DEST_CNTL` for wave counts divisible by four | clear bit 22 | tg128 96.0-96.4 against 95.9-96.3 |
+
+A standalone copy of the kernels at LFM3-1.7B shapes (gate and up 8,192 x
+2,048 Q8_0, weights written device-to-device;
+[`multigemv.hip`](artifacts/hrx/multigemv.hip)) reproduces it, so it is not
+the model's state:
+
+| Kernel | HIP | HRX |
+| --- | ---: | ---: |
+| `Q8_0MultiGEMV` SwiGLU, 8-wave workgroups (LFM3's FFN route) | 92.3-93.8 µs | 174.5-187.8 µs |
+| `Q8_0MultiGEMV` SwiGLU, 4-wave workgroups | 79.5-88.6 µs | 219.2-234.9 µs |
+| `Q8_0MultiGEMV` pair, 4-wave workgroups | 73.4-86.8 µs | 77.8-90.1 µs |
+| 2 x `Q8_0GEMV`, 4-wave workgroups | 75.3-87.3 µs | 79.1-90.4 µs |
+| 2 x `Q8_0GEMV`, 8-wave workgroups | 82.1-83.0 µs | 75.7-87.6 µs |
+
+Only the SwiGLU path, where each workgroup streams rows of both matrices
+(gate waves and up waves) and joins them through a 16-byte `__shared__`
+array and a barrier, is slow on HRX; HIP pays about 25% for that pattern
+against the pair route, HRX about 2x. Ruled out within it:
+
+- Shared memory and the barrier on their own
+  ([`ldsbarrier.hip`](artifacts/hrx/ldsbarrier.hip)): a streaming kernel with
+  and without a static `__shared__` array and `__syncthreads()` runs within 5%
+  on both runtimes.
+- Scratch: every variant has `private_segment_fixed_size` 0.
+- The per-wave `jobs.job[source].weight` load from the by-value argument.
+  Divergent indexing into by-value kernel arguments is slow on HRX in general
+  ([`kernarg.hip`](artifacts/hrx/kernarg.hip): 8-33% slower than through a
+  device pointer, against at most 4% on HIP), but loading both pointers as
+  uniform scalars and selecting per wave leaves the SwiGLU kernel as slow
+  (219.2 and 194.7 µs) and costs HIP 9-28%, so it is not kept.
+
+Open: the two-matrix access pattern under HRX's dispatch. The reproducer is
+small enough to report upstream; a dispatch-order or MALL-allocation
+difference is the next suspect.
