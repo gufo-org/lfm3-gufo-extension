@@ -241,3 +241,18 @@ ceiling, and Gufo's 2 GiB RAM-cache reserve, prepared before readiness
 (about 300 ms of page population). With the file already in the page cache,
 loading takes 0.82–0.88 s against 0.80–0.95 s before: unbuffered reads skip
 the cache, as for Gufo's own models.
+
+## November 10 pass: short prompts
+
+Gufo `bd6b0fdd`, against extension `9506e27`. Q8_0 `gufo bench`, prompt
+pass time:
+
+| Rows | 12 | 16 | 20 | 24 | 29 | 32 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Before (ms) | 11.3 | 14.8 | 18.7 | 21.3 | 26.1 | 13.4 |
+| After (ms) | 11.3 | 12.7 | 12.9 | 13.0 | 13.1 | 13.1 |
+
+| Mechanism | Decision and evidence |
+| --- | --- |
+| FP16 prompt activations from 16 rows instead of 32 (`kPromptRows`): the exact small-batch kernels cost about 0.8 ms per row and passed the FP16 route at 16 | Retained. KL against BF16 for 16–31-token prefixes 2.350e-3 → 2.314e-3, same top-1 (QUALITY.md); other rows bit-identical. 13–15 rows would save about 1 ms and stay exact. |
+
