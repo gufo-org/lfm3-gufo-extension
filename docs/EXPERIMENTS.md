@@ -350,6 +350,7 @@ single-output GEMV runs at the same speed. Ruled out, each by A/B on
 | Small grids placed on fewer compute units | 1-80 long workgroups ([`spread.hip`](artifacts/hrx/spread.hip)) | identical on both runtimes: up to 40 run in parallel on all 10 WGP slots and both shader engines |
 | Per-workgroup reads of the by-value `Projections` argument | by-value against by-pointer job tables ([`kernarg.hip`](artifacts/hrx/kernarg.hip)) | at most 4% apart on HRX, same pattern on HIP |
 | HRX's dispatch registers | `FORCE_SIMD_DIST` (`COMPUTE_RESOURCE_LIMITS` bit 23), `ORDER_MODE` | tg128 95.4-96.1 and 95.9-96.4 against 95.7-96.3 |
+| HRX setting `SIMD_DEST_CNTL` for wave counts divisible by four | clear bit 22 | tg128 96.0-96.4 against 95.9-96.3 |
 
 Open: the remaining suspect is memory throughput of HRX-launched,
 bandwidth-bound kernels (the largest streaming case of `kernarg.hip` is 6%
