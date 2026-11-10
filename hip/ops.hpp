@@ -25,6 +25,11 @@ struct DenseWorkspace {
 };
 std::size_t DenseWorkspaceBytes(std::size_t rows, std::size_t K);
 inline constexpr int kMaxSplitParts = 8, kMaxSplitUnits = 192;
+// Q8_0 projections of at least this many rows read FP16 prompt activations
+// on the matrix cores; fewer rows take the exact FP32 small-batch kernels,
+// which are compute bound (about 0.8 ms per row over LFM3 1.7B) and slower
+// from 16 rows on.
+inline constexpr int kPromptRows = 16;
 std::size_t SplitPartialBytes();
 struct Output {
   const Tensor* weight;

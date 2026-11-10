@@ -74,3 +74,27 @@ Totals (HTTP, transcript complete): 16 kHz clips −4 to −22% (the fixture
 first text / first audio 67 / 133 → 33 / 99 ms; greedy TTS stays
 byte-identical. Text replies remain the bulk of a transcription: each token
 costs 9.1 ms, with the backbone and head GEMVs at about 220 GB/s.
+
+## November 10 pass: speech synthesis latency
+
+Gufo `bd6b0fdd`, release build, against extension `9506e27`. First audio
+over HTTP (median of three seeded streamed requests after a warmup) was
+40.3, 28.7 and 30.5 ms for 12-, 104- and 246-character inputs. A profile of
+the 104-character request: a 49-row prompt pass (14.8 ms), the first depth
+frame (3.3 ms), the one-frame codec chunk (1.2 ms), then the first audio
+waited for the next backbone step (8.7 ms) before it was handed out.
+
+| Change | Result | Decision |
+| --- | --- | --- |
+| Join the codec of the first chunk before the next (blocking) backbone step instead of after it | First audio −7 to −8 ms; the backbone starts about 1 ms later once per reply | Kept |
+| FP16 prompt activations (`RegQ8Gemm`) from 16 rows instead of 32 | 16–31-row prompt passes cost 14.8–26.1 ms in the exact small-batch kernels and 12.6–13.1 ms now; the 12-character TTS prompt (29 tokens) 27.5 → 13.1 ms. Against the BF16 reference (`lfm3_prefix_probe`, every prefix of three texts) the 16–31-row rows' KL is 2.31e-3 vs 2.35e-3 before, top-1 unchanged; all other rows bit-identical. Greedy TTS is byte-identical; short sampled outputs change, all 24 short-sentence samples transcribe exactly (Qwen3-ASR) before and after | Kept |
+| FP16 from 13 rows | About 1 ms per 13–15-row pass | Rejected: the live ASR chunk (13 rows) stays exact |
+| Four-wave `RegQ8Gemm` blocks for one-token-block prompts (twice the blocks), split-K for the SwiGLU projection (forced 2 or 3 parts) | 49-row pass −2%; SwiGLU 265 → 248 µs at best | Rejected: at 49 rows the kernel is neither occupancy- nor K-latency-bound |
+| Depth decoder 12-row projections (`K = 1024`): activations staged in LDS once per block, waves stream weight rows without per-tile barriers, one persistent block per compute unit | Counters showed the stock kernel's waves waiting 92% of their cycles, one weight round trip per 256 columns. 2816 × 1024 71 → 36 µs, 1024 × 1024 27 → 20 µs in isolation; depth 3.55 → 2.80 ms per frame. Same lane order and reduction: audio byte-identical | Kept |
+| Other shapes of the stock kernel: 8 × 1, 4 × 2, 8 × 2, 16 × 1 waves × rows, plain loads, one-tile prefetch, four- and eight-tile load groups | All byte-identical, none faster (the register copy of a prefetched tile waits for it) | Rejected |
+
+Totals: HTTP first audio 19.8 / 20.4 / 21.9 ms (−51%, −29%, −28%), real time
+6.62–6.69× → 7.08–7.14× for the two longer inputs. The prompt pass is now
+most of the first audio: at 16–64 rows `RegQ8Gemm` reads the backbone at
+about 130 GB/s, about twice its bandwidth floor.
+

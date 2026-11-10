@@ -52,11 +52,11 @@ void Projection(int n) {
       weights[i].qs[j] = int((i * 17 + j * 37) % 255) - 127;
   }
   auto x = Data(n * K, 0.07F);
-  // Prompt rows (32 or more) enter the matrix cores as FP16 after scaling
-  // each row by the power of two that puts its maximum in [2^14, 2^15);
+  // Prompt rows (kPromptRows or more) enter the matrix cores as FP16 after
+  // scaling each row by the power of two that puts its maximum in [2^14, 2^15);
   // single rows and small batches keep FP32 inputs.
   auto inputs = x;
-  if (n >= 32)
+  if (n >= g::kPromptRows)
     for (int row = 0; row < n; ++row) {
       float maximum = 0;
       for (int k = 0; k < K; ++k)
@@ -221,7 +221,7 @@ void Attention(int n, int window, int P = 259, int H = 4, int KH = 2) {
 }  // namespace
 int main() {
   try {
-    for (int n : {1, 8, 9, 32, 33, 128, 512}) {
+    for (int n : {1, 8, 9, 15, 16, 29, 32, 33, 128, 512}) {
       std::cerr << "conv " << n << "\n";
       Projection(n);
       Conv(n);

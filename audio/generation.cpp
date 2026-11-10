@@ -597,6 +597,10 @@ bool Generator::Continue(const GenerateOptions& o,
           if (unsent.size() >= chunk * AudioWeights::kCodebooks)
             decode(false);
         }
+        // The backbone step blocks this thread: the first audio leaves
+        // before it instead of after.
+        if (result->timings.first_audio_ms < 0)
+          join();
         if (check_cancel())
           break;
         if (step + 1 == o.max_new_tokens)
@@ -951,6 +955,9 @@ bool SpeechBatch::Step(std::string* error) {
                              : st->options.chunk_frames;
       if (st->unsent.size() >= chunk * AudioWeights::kCodebooks)
         impl.Decode(*st, false);
+      // The first audio leaves before the blocking backbone step.
+      if (st->result.timings.first_audio_ms < 0)
+        impl.Join(*st);
       if (++st->steps >= st->options.max_new_tokens ||
           st->g().session->Position() >= st->g().context)
         impl.Finish(*st, true, {});

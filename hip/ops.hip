@@ -590,6 +590,84 @@ __launch_bounds__(WavesPerBlock * 32, 1) __global__
   }
 }
 
+// Exact small-batch BF16 GEMM when the whole activation block fits in LDS:
+// it is staged once per block, so waves stream their weight rows without the
+// per-tile barriers of BatchedExactBf16GEMMFp32VecKernel, whose waves waited
+// on one weight round trip per 256 columns. Blocks persist across row blocks
+// (one per compute unit). Per output, lane L sums vectors L, L + 32, ... in
+// order and the lanes reduce by the same butterfly: the results are those of
+// BatchedExactBf16GEMMFp32VecKernel bit for bit.
+template<std::uint32_t Waves, std::size_t Batch, std::size_t Rows>
+__launch_bounds__(Waves * 32) __global__
+    void StagedExactBf16GEMMFp32Kernel(const hip_bfloat16* __restrict__ A,
+                                       const float* __restrict__ X,
+                                       float* __restrict__ Y, std::size_t M,
+                                       std::size_t K) {
+  extern __shared__ float4 staged4[];
+  const float* staged = reinterpret_cast<const float*>(staged4);
+  for (std::size_t i = threadIdx.x; i < Batch * K / 4; i += blockDim.x)
+    staged4[i] = reinterpret_cast<const float4*>(X)[i];
+  __syncthreads();
+  const std::size_t lane = threadIdx.x & 31u, wave = threadIdx.x >> 5u;
+  const std::size_t vector_count = K / 8;
+  for (std::size_t block = blockIdx.x; block * Waves * Rows < M;
+       block += gridDim.x) {
+    const std::size_t row_base = (block * Waves + wave) * Rows;
+    if (row_base >= M)
+      continue;
+    float sums[Rows][Batch] = {};
+    const uint4* rows[Rows];
+#pragma unroll
+    for (std::size_t r = 0; r < Rows; ++r)
+      rows[r] =
+          reinterpret_cast<const uint4*>(A + std::min(row_base + r, M - 1) * K);
+#pragma unroll 2
+    for (std::size_t vector = lane; vector < vector_count; vector += 32) {
+      uint4 packed[Rows];
+#pragma unroll
+      for (std::size_t r = 0; r < Rows; ++r) {
+        typedef std::uint32_t PackedWeights
+            __attribute__((ext_vector_type(4), may_alias));
+        const auto words = __builtin_nontemporal_load(
+            reinterpret_cast<const PackedWeights*>(rows[r] + vector));
+        packed[r] = {words[0], words[1], words[2], words[3]};
+      }
+#pragma unroll
+      for (std::size_t token = 0; token < Batch; ++token) {
+        const float* input = staged + token * K + vector * 8;
+        const float4 x0 = *reinterpret_cast<const float4*>(input);
+        const float4 x1 = *reinterpret_cast<const float4*>(input + 4);
+#pragma unroll
+        for (std::size_t r = 0; r < Rows; ++r) {
+          const auto* weights =
+              reinterpret_cast<const hip_bfloat16*>(&packed[r]);
+          sums[r][token] += (static_cast<float>(weights[0]) * x0.x) +
+                            (static_cast<float>(weights[1]) * x0.y) +
+                            (static_cast<float>(weights[2]) * x0.z) +
+                            (static_cast<float>(weights[3]) * x0.w) +
+                            (static_cast<float>(weights[4]) * x1.x) +
+                            (static_cast<float>(weights[5]) * x1.y) +
+                            (static_cast<float>(weights[6]) * x1.z) +
+                            (static_cast<float>(weights[7]) * x1.w);
+        }
+      }
+    }
+#pragma unroll
+    for (std::size_t r = 0; r < Rows; ++r)
+#pragma unroll
+      for (std::size_t token = 0; token < Batch; ++token)
+        for (int offset = 16; offset > 0; offset >>= 1)
+          sums[r][token] += __shfl_xor(sums[r][token], offset);
+    if (lane == 0)
+#pragma unroll
+      for (std::size_t r = 0; r < Rows; ++r)
+        if (row_base + r < M)
+#pragma unroll
+          for (std::size_t token = 0; token < Batch; ++token)
+            Y[(token * M) + row_base + r] = sums[r][token];
+  }
+}
+
 template<std::uint32_t WavesPerBlock, std::size_t Batch,
          std::size_t RowsPerWave, bool NarrowIndex = false,
          bool XorStage = false, std::uint32_t HardwareWaveSize = 32,
@@ -1856,12 +1934,34 @@ void LaunchExactBf16GEMMFp32SmallBatch(const void* A, const float* X, float* Y,
   }
   constexpr std::uint32_t kVecWaves = 16;
   constexpr std::size_t kVecRowsPerWave = 2;
+  constexpr std::size_t kStagedBytes = 48 * 1024;
   constexpr std::size_t kVecRowsPerBlock = kVecWaves * kVecRowsPerWave;
   const unsigned int vec_blocks =
       static_cast<unsigned int>((M + kVecRowsPerBlock - 1) / kVecRowsPerBlock);
   const auto* a_vec = static_cast<const hip_bfloat16*>(A);
   switch (batch_size) {
     case 12:
+      // The depth decoder's 12 codebook rows (K = 1024) fit in LDS.
+      if (K % 8 == 0 && 12 * K * sizeof(float) <= kStagedBytes) {
+        constexpr std::uint32_t kWaves = 8;
+        constexpr std::size_t kRows = 2;
+        static const unsigned units = [] {
+          int device = 0, count = 0;
+          return hipGetDevice(&device) == hipSuccess &&
+                         hipDeviceGetAttribute(
+                             &count, hipDeviceAttributeMultiprocessorCount,
+                             device) == hipSuccess &&
+                         count > 0
+                     ? unsigned(count)
+                     : 40U;
+        }();
+        const auto blocks =
+            unsigned((M + kWaves * kRows - 1) / (kWaves * kRows));
+        StagedExactBf16GEMMFp32Kernel<kWaves, 12, kRows>
+            <<<std::min(blocks, units), kWaves * 32, 12 * K * sizeof(float),
+               stream>>>(a_vec, X, Y, M, K);
+        return;
+      }
       BatchedExactBf16GEMMFp32VecKernel<kVecWaves, 12, kVecRowsPerWave>
           <<<vec_blocks, kVecWaves * 32, 0, stream>>>(a_vec, X, Y, M, K);
       return;
@@ -1918,7 +2018,8 @@ std::size_t SplitPartialBytes() {
 }
 namespace {
 bool SplitPrompt(const Tensor& w, int n, DenseWorkspace workspace) {
-  return n >= 32 && w.type == core::GgmlType::kQ8_0 && workspace.quantized;
+  return n >= kPromptRows && w.type == core::GgmlType::kQ8_0 &&
+         workspace.quantized;
 }
 // Blocks of kernel resident at once on the device.
 template<auto kernel>

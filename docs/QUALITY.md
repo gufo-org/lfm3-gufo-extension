@@ -26,13 +26,18 @@ BF16 checkpoint through the same engine (exact FP32 BF16 projections).
 | 5.9K-token text, FP16 activations | 171 | 1.255e-3 | 1.79e-2 | 96.5% | 2.7747 |
 | 27K-token text, split query | 90 | 9.79e-4 | 8.35e-3 | 96.7% | 2.7726 |
 | 27K-token text, F16 query | 90 | 9.72e-4 | 8.57e-3 | 96.7% | 2.7727 |
+| Prefixes of 16–31 tokens, exact FP32 small-batch kernels | 48 | 2.350e-3 | 3.84e-2 | 97.9% | |
+| Prefixes of 16–31 tokens, FP16 activations | 48 | 2.314e-3 | 3.60e-2 | 97.9% | |
 
 BF16 NLL is 2.7716 and 2.7733. The 27K rows both use FP16 projection
 activations and isolate the query. Directly against the previous Q8_0
 path, the FP16 projections differ by KL `2.4e-6` (maximum `2.3e-5`) and the
 F16 query by `1.5e-6`, about 500 times below the Q8_0 quantization KL, with
 identical top-1 on every row. Prefixes cross 512-token chunks at every stride;
-texts are Gufo documentation and C++ source.
+texts are Gufo documentation and C++ source. Since the TTS latency pass, prompts of 16 rows or more
+(`kPromptRows`, previously 32) take the FP16 activations: the 16–31-token
+rows are every prefix of three short texts (prose, Python, a TTS chat prompt),
+stride 1, one decode step each; rows outside that range are bit-identical.
 
 The single-row maximum logit change is no longer a useful gate at this
 precision, so the chunked/serial and continuation checks now require KL
