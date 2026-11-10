@@ -1,9 +1,11 @@
 # LFM3-Audio 2B benchmarks
 
 AMD Strix Halo `gfx1151`, 128 GB unified memory. Official `Q8_0` backbone
-and BF16 projector (`02355c1a`). Gufo `12f8d8ab` with this extension
-(November 8, 2026), Nix development build. One process per CLI measurement,
-so first requests include lazy kernel loading. Positive gain favors Gufo.
+and BF16 projector (`02355c1a`). ASR and voice chat rows: Gufo `bd6b0fdd`
+with this extension (November 10, 2026), release build. Speech synthesis
+rows: Gufo `12f8d8ab` (November 8, 2026), Nix development build. One
+process per CLI measurement, so first requests include lazy kernel loading.
+Positive gain favors Gufo.
 **TODO** means unmeasured: the llama.cpp reference (b12205 or newer, which
 serves LFM3-Audio transcription) has not been run yet.
 
@@ -11,22 +13,30 @@ serves LFM3-Audio transcription) has not been run yet.
 
 | Workload | Gufo | llama.cpp | Gain |
 | --- | ---: | ---: | ---: |
-| ASR, 10.0 s English clip, mean of 5 after 1 warmup | 284.7 ms (35.1× real time) | TODO | TODO |
-| ASR audio encoder (mel, towers, projector) | 17.2 ms | TODO | TODO |
+| ASR, 10.0 s English clip, mean of 5 after 1 warmup | 230.7 ms (43.3× real time) | TODO | TODO |
+| ASR audio encoder (mel, towers, projector) | 7.4 ms | TODO | TODO |
+| ASR first text over HTTP (streamed), 10.0 s clip at 16 kHz | 34.4 ms | TODO | TODO |
+| ASR first text over HTTP (streamed), 28.0 s clip at 24 kHz | 68.6 ms | TODO | TODO |
+| Live ASR of the 28.0 s clip in 100 ms pieces: compute / slowest piece | 1977 / 62.8 ms | N/A | N/A |
 | TTS, 104-character sentence, seeds 1–3 | 6.47–6.49× real time | N/A | N/A |
 | TTS time to first audio (prompt to first 80 ms frame) | 36.3–36.5 ms | N/A | N/A |
 | TTS backbone step per frame | 8.59–8.60 ms | N/A | N/A |
 | TTS depth decoder per frame (3 MaskGIT passes, sampling) | 3.51–3.52 ms | N/A | N/A |
-| Voice chat, 2.24 s spoken question: first text / first audio | 69.0 / 138.4 ms | N/A | N/A |
+| Voice chat, 2.0 s spoken question: first text / first audio | 33.3 / 99.0 ms | N/A | N/A |
 
-llama-server has no speech-synthesis endpoint, so the TTS and voice chat
-rows have no reference. The voice-chat question is the model's own seed-7
-reading of "What is the capital of France?". The interleaved reply starts
-with six text tokens, so its first audio follows the first text block.
+First text is the median of five `/v1/audio/transcriptions` requests with
+`stream=true` (one warmup), from the upload to the first text delta; the
+24 kHz clip is audio.cpp's `four_speaker_short.wav`. llama-server has no
+speech-synthesis endpoint, so the TTS and voice chat rows have no reference.
+The voice-chat question is the model's own seed-7 reading of "What is the
+capital of France?". The interleaved reply starts with six text tokens, so
+its first audio follows the first text block.
 
 ```sh
 gufo transcribe --model $M --mmproj $P --language en --repeat 5 --warmup 1 \
   --format json tests/functional/fixtures/audio/clear-english-voice.wav
+gufo transcribe --model $M --mmproj $P --live --repeat 3 --warmup 1 \
+  --format json four_speaker_short.wav
 gufo speak --model $M --mmproj $P --seed 1 --format json --output tts.wav \
   --text 'The quick brown fox jumps over the lazy dog. Then it runs back home through the forest, happy and tired.'
 gufo speak --model $M --mmproj $P --mode chat --audio question.wav \

@@ -79,6 +79,18 @@ public:
   bool ForwardEmbeddings(std::span<const float> rows, bool on_device = false,
                          std::span<float> logits = {},
                          std::string* error = nullptr);
+  // A run of inputs: token IDs, or rows of input embeddings (hidden floats
+  // each) in host memory.
+  struct Input {
+    std::span<const std::uint32_t> tokens;
+    std::span<const float> rows;
+  };
+  // Advances runs of tokens and embedding rows in order. Adjacent runs share
+  // their passes (kPrefillChunk rows each), so a prompt mixing text and
+  // embeddings reads the weights once per pass rather than once per run.
+  bool ForwardInputs(std::span<const Input> inputs,
+                     std::span<float> logits = {},
+                     std::string* error = nullptr);
   // Final-normed hidden state of the last advanced row (hidden floats).
   bool ReadHidden(std::span<float> hidden, std::string* error = nullptr) const;
   // Device copy of the same hidden state, valid until the next forward.

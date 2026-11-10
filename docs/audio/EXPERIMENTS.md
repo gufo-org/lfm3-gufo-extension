@@ -46,3 +46,31 @@ projections ([VL experiments](../vl/EXPERIMENTS.md)): the 10.0 s ASR clip
 profile of one sentence puts every frame at its bandwidth floor: backbone
 Q8_0 GEMVs at about 220 GB/s and the 267 MB BF16 depth decoder streamed
 once per MaskGIT pass; the GPU is busy for the whole request.
+
+## November 10 pass: transcription latency
+
+Gufo `bd6b0fdd`, release build, against extension `18ca844`. First text is
+the median of five streamed HTTP requests after a warmup; transcripts of all
+14 clips (the fixture, four LibriSpeech utterances and nine 16, 24 and
+48 kHz clips from audio.cpp) are identical to the previous build. The 10.0 s
+fixture took 51 ms to its first logits: 8.4 ms of encoder, then the system
+turn (15 tokens, 14.7 ms), the 125 audio rows (17.1 ms) and the 5-token
+assistant header (9.4 ms) in three passes, and 1.2 ms for the head.
+
+| Change | Result | Decision |
+| --- | --- | --- |
+| Prompt runs (text, audio rows, text) in shared passes (`Session::ForwardInputs`) instead of one pass per run: short runs fell to the exact FP32 small-batch kernels, which read every weight per pass | Fixture first text 54.4 → 35.1 ms; prompt passes 41.2 → 21.8 ms. A live chunk (its pending `<|text_end|>` and 12 audio rows) 20.5 → 15.1 ms. Versus the separate passes (`lfm3_asr_probe`), greedy tokens are identical on all clips, KL ≤ 1.5e-6 per step (mean ≤ 1.1e-7), largest log-probability difference 0.017: the text rows take the FP16 prompt activations already used for the audio rows | Kept |
+| Next text token's logits computed by its own forward pass instead of a separate head launch and stream synchronization | Same tokens; part of the totals below | Kept |
+| Resampler filter tabulated per output phase (2 for 24 kHz, 1 for 48 kHz, 160 for 44.1 kHz), outputs at exact integer positions, eight partial sums, and one-shot calls spread over up to eight threads | 28 s at 24 kHz 473 → 2.6 ms, at 48 kHz 952 → 3.9 ms; 24, 48 and 8 kHz output bit-identical, 44.1/22.05/11.025 kHz within one float ulp on 0.1% of samples; streamed pieces still equal one call. 24 kHz clips: first text 156–571 → 27–69 ms | Kept |
+| Encoder BF16 projections (`Split3Gemm`) with smaller tiles for inputs of up to 256 tokens, chosen by the fewest waves of about 56 resident blocks times the tile's work; 64 × 128 tiles filled 12–36 of the device's slots for a 10 s clip | Encoder 8.5 → 7.4 ms (10 s), first text −0.2 to −1.5 ms; output bit-identical (per-output sums are the same for every tile). Within 5% of the best measured shape per launch; 64 × 128 stays above 256 tokens, where it measured as good or better | Kept |
+| `RegQ8Gemm` skips the products of 16-token sub-tiles past the prompt in the last token block | 145-row pass 21.3 → 20.9 ms, bit-identical | Kept |
+| Ragged exact small-batch passes: 9–11 rows in one 12-row pass instead of 8 rows and a second pass over the weights | Identical text logprobs over HTTP | Kept |
+| 13–15 rows (a live chunk with its pending `<|text_end|>`) in one ragged 16-row pass | 25.1 ms per chunk against 15.1 ms for 12 and 1 rows: these kernels are compute bound, about 0.8 ms per row over the backbone | Rejected |
+| FP16 prompt activations (`RegQ8Gemm`) from 9 rows instead of 32, for live chunks | Live chunk 15.1 → 14.2 ms, for FP16 activations in every 9–31-row prefill of all LFM3 models | Rejected |
+
+Totals (HTTP, transcript complete): 16 kHz clips −4 to −22% (the fixture
+255.8 → 235.1 ms), resampled clips −33 to −49%. Live transcription of the
+28 s clip: compute 2732 → 1977 ms, slowest piece 70.5 → 62.8 ms. Voice chat
+first text / first audio 67 / 133 → 33 / 99 ms; greedy TTS stays
+byte-identical. Text replies remain the bulk of a transcription: each token
+costs 9.1 ms, with the backbone and head GEMVs at about 220 GB/s.

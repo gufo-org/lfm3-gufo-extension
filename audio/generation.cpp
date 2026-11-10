@@ -334,16 +334,30 @@ std::vector<Generator::Impl::Run> Generator::Impl::Prepare(
   flush();
   return runs;
 }
+// All runs advance together: a prompt of text around a clip shares its
+// passes instead of reading the weights once per run.
 void Generator::Impl::Feed(const std::vector<Run>& runs) {
   std::size_t rows = 0;
-  for (const auto& run : runs)
+  std::vector<lfm3::Session::Input> inputs;
+  for (const auto& run : runs) {
     rows += run.tokens.size() + run.rows.size() / Hidden();
+    if (!run.tokens.empty() || !run.rows.empty())
+      inputs.push_back({run.tokens, run.rows});
+  }
+  if (!rows)
+    return;
   Room(rows);
-  for (const auto& run : runs)
-    if (run.rows.empty())
-      Tokens(run.tokens);
-    else
-      Rows(run.rows, model->tokens().audio);
+  std::string failure;
+  Fail(session->ForwardInputs(inputs, {}, &failure), failure);
+  for (const auto& run : runs) {
+    if (!run.tokens.empty()) {
+      Record(run.tokens);
+      last_token = run.tokens.back();
+    } else if (!run.rows.empty()) {
+      Record(run.rows);
+      last_token = model->tokens().audio;
+    }
+  }
 }
 bool Generator::Append(std::span<const PromptPiece> prompt,
                        GenerateResult* result, std::string* error) {
@@ -496,6 +510,7 @@ bool Generator::Continue(const GenerateOptions& o,
     bool speaking = false, text_done = false, finished = false;
     std::deque<std::uint32_t> text_history;
     std::vector<float> logits(config.vocab);
+    bool have_logits = false;  // logits hold the frontier's
     std::vector<float> frame_row(config.hidden);
     std::vector<std::int32_t> unsent;  // frames not yet decoded
     std::string text_bytes;            // decoded but not yet emitted
@@ -594,6 +609,7 @@ bool Generator::Continue(const GenerateOptions& o,
         ok(session.ForwardEmbeddings(
             {impl.frame_embedding, std::size_t(config.hidden)}, true, {},
             &failure));
+        have_logits = false;
         // The frame embedding stays recorded for Replace.
         if (hipMemcpyAsync(frame_row.data(), impl.frame_embedding,
                            frame_row.size() * 4, hipMemcpyDeviceToHost,
@@ -608,7 +624,9 @@ bool Generator::Continue(const GenerateOptions& o,
         join();
       } else {
         auto t = Clock::now();
-        ok(session.ReadLogits(logits, &failure));
+        if (!have_logits)
+          ok(session.ReadLogits(logits, &failure));
+        have_logits = false;
         if (o.repetition_penalty != 1.0F)
           for (auto id : std::unordered_set<std::uint32_t>(text_history.begin(),
                                                            text_history.end()))
@@ -686,8 +704,19 @@ bool Generator::Continue(const GenerateOptions& o,
           break;
         if (step + 1 == o.max_new_tokens || session.Position() >= impl.context)
           break;
+        // A text slot follows unless speech starts or the interleaved
+        // block switches to speech: its logits come from the same pass.
+        bool next_text = mode == Mode::kText;
+        if (mode == Mode::kInterleaved) {
+          // The last slot of a text block hands over to speech.
+          const bool switches = interleaving && !text_done && slots_left == 1;
+          next_text = switches == speaking;
+        }
         t = Clock::now();
-        ok(session.Forward({&token, 1}, {}, &failure));
+        ok(session.Forward({&token, 1},
+                           next_text ? std::span(logits) : std::span<float>{},
+                           &failure));
+        have_logits = next_text;
         impl.Record(std::span<const std::uint32_t>(&token, 1));
         impl.last_token = token;
         result->timings.backbone_ms += Ms(t);
@@ -1002,16 +1031,17 @@ struct LiveTranscriber::Impl {
       pending = prompt;
       context_audio = 0;
     }
+    // The pending tokens and the chunk's audio share one pass.
+    std::vector<lfm3::Session::Input> inputs;
     if (!pending.empty())
-      Fail(session->Forward(pending, {}, &failure), failure);
+      inputs.push_back({pending, {}});
+    if (count)
+      inputs.push_back({{}, {rows.data(), std::size_t(count) * H}});
+    if (!inputs.empty())
+      Fail(session->ForwardInputs(inputs, {}, &failure), failure);
     pending.clear();
-    if (count) {
-      Fail(session->ForwardEmbeddings({rows.data(), std::size_t(count) * H},
-                                      false, {}, &failure),
-           failure);
-      rows.erase(rows.begin(), rows.begin() + std::ptrdiff_t(count) * H);
-      context_audio += count;
-    }
+    rows.erase(rows.begin(), rows.begin() + std::ptrdiff_t(count) * H);
+    context_audio += count;
     ++chunks;
     // Before the final chunk the turn cannot end: speech and the end-of-turn
     // tokens are suppressed; placeholders always are.
@@ -1019,8 +1049,9 @@ struct LiveTranscriber::Impl {
     if (!final)
       masked.insert(masked.end(), {ids.audio_start, ids.mixed_start, ids.im_end,
                                    ids.mixed_end, ids.eos});
+    // Each step's logits come from the pass of the token before it.
+    Fail(session->ReadLogits(logits, &failure), failure);
     for (std::uint32_t n = 0; n < budget; ++n) {
-      Fail(session->ReadLogits(logits, &failure), failure);
       for (auto id : masked)
         logits[id] = -INFINITY;
       const auto token = std::uint32_t(
@@ -1044,7 +1075,11 @@ struct LiveTranscriber::Impl {
       }
       if (session->Position() >= kContext)
         break;
-      Fail(session->Forward({&token, 1}, {}, &failure), failure);
+      Fail(session->Forward(
+               {&token, 1},
+               n + 1 < budget ? std::span(logits) : std::span<float>{},
+               &failure),
+           failure);
     }
     if (!final)
       pending = {ids.text_end};

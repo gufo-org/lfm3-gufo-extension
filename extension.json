@@ -23,6 +23,7 @@
     "lfm3_prefix_probe": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_audio_test": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_audio_probe": { "requires": ["hip", "testing"], "role": "test" },
+    "lfm3_asr_probe": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_audio_batch_bench": { "requires": ["hip", "testing"], "role": "test" },
     "lfm3_vl_contract_test": { "requires": ["testing"], "role": "test" },
     "lfm3_vl_probe": { "requires": ["hip", "testing"], "role": "test" },

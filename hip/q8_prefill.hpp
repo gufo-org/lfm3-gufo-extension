@@ -455,6 +455,10 @@ __launch_bounds__(kWaves * 32) __global__
   const int kb_begin = part * blocks / parts,
             kb_end = (part + 1) * blocks / parts;
   const bool wave_live = r_block + (kSwiGLU ? wave * 16 : wave * RM * 16) < M;
+  // 16-token sub-tiles past the prompt (in its last token block) are never
+  // stored, so they skip their products.
+  const int live_tiles =
+      tokens - t_block >= BN ? RN : (tokens - t_block + 15) / 16;
   // This lane's row of tile i.
   int row[RM];
   const std::uint8_t* w_ptr[RM];
@@ -543,7 +547,7 @@ __launch_bounds__(kWaves * 32) __global__
     __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
     for (int j = 0; j < RN; ++j) {
-      if (!wave_live)
+      if (!wave_live || j >= live_tiles)
         break;
       const int t = j * 16 + sub;
       v16h b[2];
