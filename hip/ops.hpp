@@ -12,8 +12,8 @@ namespace gufo::models::lfm3::gpu {
 void Embed(const Tensor& weight, const std::uint32_t* tokens, float* out, int n,
            hipStream_t stream);
 // Prompt projections of n rows need HalfActivationBytes(n, K) here.
-// row_max (one word per prompt row) lets the FFN down projection convert its
-// input while staging.
+// row_max (one word per prompt row) collects the FFN hidden rows' maxima so
+// they convert to FP16 for the down projection without another reduction.
 // With partial (SplitPartialBytes) and zeroed tickets (kMaxSplitUnits
 // words), projections whose tiles leave the last wave of resident blocks
 // partly idle split those tiles across K.

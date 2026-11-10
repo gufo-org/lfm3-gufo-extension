@@ -13,17 +13,15 @@ namespace gufo::models::lfm3::gpu {
 inline std::size_t HalfActivationBytes(std::size_t tokens, std::size_t K) {
   return tokens * K * sizeof(__half) + tokens * sizeof(float);
 }
-// With raw, a projection reads FP32 rows and converts them while staging,
-// with the exponent from row_max (the bits of each row's maximum magnitude).
+// row_max, when set, collects the FP32 bits of each output row's maximum
+// magnitude (SwiGLU projections) for HalfRowsFromMax.
 struct HalfActivations {
   __half* values;
   float* scale;
-  const float* raw = nullptr;
   unsigned* row_max = nullptr;
   static HalfActivations In(void* base, std::size_t tokens, std::size_t K) {
     auto* half = static_cast<__half*>(base);
-    return {half, reinterpret_cast<float*>(half + tokens * K), nullptr,
-            nullptr};
+    return {half, reinterpret_cast<float*>(half + tokens * K), nullptr};
   }
 };
 __device__ __forceinline__ int RowExponent(float maximum) {
@@ -50,6 +48,29 @@ __global__ void HalfRows(const float* __restrict__ x, HalfActivations out,
     out.scale[row] = ldexpf(1.0F, -e);
   for (int k = tid; k < K; k += 256)
     out.values[std::size_t(row) * K + k] = __float2half_rn(ldexpf(src[k], e));
+}
+// HalfRows for rows whose maximum magnitudes (row_max, as FP32 bits) are
+// already known; eight elements per thread.
+__global__ void HalfRowsFromMax(const float* __restrict__ x,
+                                const unsigned* __restrict__ row_max,
+                                HalfActivations out, int K) {
+  const int row = blockIdx.y, k = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+  const int e = RowExponent(__uint_as_float(row_max[row]));
+  if (!blockIdx.x && !threadIdx.x)
+    out.scale[row] = ldexpf(1.0F, -e);
+  if (k >= K)
+    return;
+  const float* src = x + std::size_t(row) * K + k;
+  const float4 a = *reinterpret_cast<const float4*>(src),
+               b = *reinterpret_cast<const float4*>(src + 4);
+  const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+  __half h[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    h[i] = __float2half_rn(ldexpf(v[i], e));
+  uint4 packed;
+  __builtin_memcpy(&packed, h, sizeof(packed));
+  *reinterpret_cast<uint4*>(out.values + std::size_t(row) * K + k) = packed;
 }
 namespace detail {
 using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
@@ -100,8 +121,7 @@ struct SplitK {
 // LDS stages leave one barrier per K block. With kSwiGLU, job 0 is the FFN
 // gate and job 1 its up projection: a block holds BM / 2 rows of each and
 // writes silu(gate) * up to job 0's output.
-template<int BM, int BN, int WM, int WN, bool kSwiGLU = false,
-         bool kRaw = false>
+template<int BM, int BN, int WM, int WN, bool kSwiGLU = false>
 __launch_bounds__(256) __global__
     void TiledQ8Gemm(Projections jobs, HalfActivations x, int tokens, int K,
                      SplitK sk) {
@@ -109,9 +129,8 @@ __launch_bounds__(256) __global__
   using detail::v8f;
   static_assert(WM * WN == 8 && (!kSwiGLU || WM % 2 == 0));
   constexpr int RM = BM / 16 / WM, RN = BN / 16 / WN;
-  // A B unit is one token's FP16 K block, or with kRaw half of its FP32 one.
-  constexpr int kBUnits = kRaw ? 2 * BN : BN;
-  constexpr int kAPer = (BM + 255) / 256, kBPer = (kBUnits + 255) / 256;
+  // A B unit is one token's FP16 K block.
+  constexpr int kAPer = (BM + 255) / 256, kBPer = (BN + 255) / 256;
   constexpr int kTileRows = kSwiGLU ? BM / 2 : BM;
   // One K block of a row or token is four 16-byte chunks; neighbouring rows
   // permute them so fragment reads cover all bank groups.
@@ -150,17 +169,11 @@ __launch_bounds__(256) __global__
     a_ptr[p] = static_cast<const std::uint8_t*>(jobs.job[source].weight) +
                std::size_t(a_live[p] ? r : M - 1) * blocks * 34;
   }
-  const void* b_ptr[kBPer];
-  [[maybe_unused]] int b_exponent[kBPer];
+  const __half* b_ptr[kBPer];
 #pragma unroll
   for (int p = 0; p < kBPer; ++p) {
     const int idx = p * 256 + tid, t = t_block + idx % BN;
-    const bool live = idx < kBUnits && t < tokens;
-    if constexpr (kRaw) {
-      b_ptr[p] = live ? x.raw + std::size_t(t) * K + idx / BN * 16 : nullptr;
-      b_exponent[p] = live ? RowExponent(__uint_as_float(x.row_max[t])) : 0;
-    } else
-      b_ptr[p] = live ? x.values + std::size_t(t) * K : nullptr;
+    b_ptr[p] = idx < BN && t < tokens ? x.values + std::size_t(t) * K : nullptr;
   }
   uint4 a_codes[kAPer][2];
   std::uint16_t a_d[kAPer];
@@ -176,9 +189,8 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int p = 0; p < kBPer; ++p) {
       if (b_ptr[p]) {
-        const auto* src = reinterpret_cast<const uint4*>(
-            static_cast<const std::uint8_t*>(b_ptr[p]) +
-            std::size_t(kb) * 32 * (kRaw ? sizeof(float) : sizeof(__half)));
+        const auto* src =
+            reinterpret_cast<const uint4*>(b_ptr[p] + std::size_t(kb) * 32);
 #pragma unroll
         for (int c = 0; c < 4; ++c)
           b_data[p][c] = src[c];
@@ -213,29 +225,11 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int p = 0; p < kBPer; ++p) {
       const int idx = p * 256 + tid;
-      if (idx >= kBUnits)
+      if (idx >= BN)
         break;
-      const int t = idx % BN;
-      if constexpr (kRaw) {
-        // HalfRows' rounding: scale by the row's power of two, round.
-        float v[16];
-        __builtin_memcpy(v, b_data[p], sizeof(v));
-        __half h[16];
 #pragma unroll
-        for (int e = 0; e < 16; ++e)
-          h[e] = __float2half_rn(ldexpf(v[e], b_exponent[p]));
-        const int k_half = idx / BN;
-#pragma unroll
-        for (int c = 0; c < 2; ++c) {
-          uint4 u;
-          __builtin_memcpy(&u, h + 8 * c, 16);
-          s_b[stage][t][swizzle(t, 2 * k_half + c)] = u;
-        }
-      } else {
-#pragma unroll
-        for (int c = 0; c < 4; ++c)
-          s_b[stage][t][swizzle(t, c)] = b_data[p][c];
-      }
+      for (int c = 0; c < 4; ++c)
+        s_b[stage][idx][swizzle(idx, c)] = b_data[p][c];
     }
   };
   v8f acc[RM][RN] = {};
@@ -340,9 +334,7 @@ __launch_bounds__(256) __global__
         const int local = (wt * RN + j) * 16 + sub, token = t_block + local;
         float scale = 0;
         if (token < tokens)
-          scale = kRaw ? ldexpf(1.0F,
-                                -RowExponent(__uint_as_float(x.row_max[token])))
-                       : x.scale[token];
+          scale = x.scale[token];
         [[maybe_unused]] float token_max = 0;
 #pragma unroll
         for (int i = 0; i < RM; ++i)
@@ -368,9 +360,7 @@ __launch_bounds__(256) __global__
     const int local = (wt * RN + j) * 16 + sub, token = t_block + local;
     float scale = 0;
     if (token < tokens)
-      scale =
-          kRaw ? ldexpf(1.0F, -RowExponent(__uint_as_float(x.row_max[token])))
-               : x.scale[token];
+      scale = x.scale[token];
     [[maybe_unused]] float token_max = 0;
 #pragma unroll
     for (int i = 0; i < RM; ++i) {
@@ -432,7 +422,7 @@ __launch_bounds__(256) __global__
 // those of TiledQ8Gemm, in its order. Block = kWaves waves x RM row tiles of
 // 16 rows, x BN = 16 * RN tokens. With kSwiGLU a wave holds 16 gate rows
 // (tile 0) and the same 16 up rows (tile 1) and applies SwiGLU in registers.
-template<int RN, bool kSwiGLU = false, bool kRaw = false, int kWaves = 8>
+template<int RN, bool kSwiGLU = false, int kWaves = 8>
 __launch_bounds__(kWaves * 32) __global__
     void RegQ8Gemm(Projections jobs, HalfActivations x, int tokens, int K,
                    SplitK sk) {
@@ -440,9 +430,8 @@ __launch_bounds__(kWaves * 32) __global__
   using detail::v8f;
   constexpr int RM = 2, BN = 16 * RN;
   constexpr int T = kWaves * 32;
-  // A B unit is one token's FP16 K block, or with kRaw half of its FP32 one.
-  constexpr int kBUnits = kRaw ? 2 * BN : BN;
-  constexpr int kBPer = (kBUnits + T - 1) / T;
+  // A B unit is one token's FP16 K block.
+  constexpr int kBPer = (BN + T - 1) / T;
   constexpr int kTileRows = kWaves * 16 * (kSwiGLU ? 1 : RM);
   __shared__ __attribute__((aligned(16))) uint4 s_b[2][BN][4];
   const auto swizzle = [](int row, int c) { return c ^ ((row >> 1) & 3); };
@@ -476,17 +465,11 @@ __launch_bounds__(kWaves * 32) __global__
     w_ptr[i] = static_cast<const std::uint8_t*>(jobs.job[source].weight) +
                std::size_t(row[i] < M ? row[i] : M - 1) * blocks * 34;
   }
-  const void* b_ptr[kBPer];
-  [[maybe_unused]] int b_exponent[kBPer];
+  const __half* b_ptr[kBPer];
 #pragma unroll
   for (int p = 0; p < kBPer; ++p) {
     const int idx = p * T + tid, t = t_block + idx % BN;
-    const bool live = idx < kBUnits && t < tokens;
-    if constexpr (kRaw) {
-      b_ptr[p] = live ? x.raw + std::size_t(t) * K + idx / BN * 16 : nullptr;
-      b_exponent[p] = live ? RowExponent(__uint_as_float(x.row_max[t])) : 0;
-    } else
-      b_ptr[p] = live ? x.values + std::size_t(t) * K : nullptr;
+    b_ptr[p] = idx < BN && t < tokens ? x.values + std::size_t(t) * K : nullptr;
   }
   uint4 w_codes[RM][2];
   std::uint16_t w_d[RM];
@@ -504,9 +487,8 @@ __launch_bounds__(kWaves * 32) __global__
 #pragma unroll
     for (int p = 0; p < kBPer; ++p) {
       if (b_ptr[p]) {
-        const auto* src = reinterpret_cast<const uint4*>(
-            static_cast<const std::uint8_t*>(b_ptr[p]) +
-            std::size_t(kb) * 32 * (kRaw ? sizeof(float) : sizeof(__half)));
+        const auto* src =
+            reinterpret_cast<const uint4*>(b_ptr[p] + std::size_t(kb) * 32);
 #pragma unroll
         for (int c = 0; c < 4; ++c)
           b_data[p][c] = src[c];
@@ -521,29 +503,11 @@ __launch_bounds__(kWaves * 32) __global__
 #pragma unroll
     for (int p = 0; p < kBPer; ++p) {
       const int idx = p * T + tid;
-      if (idx >= kBUnits)
+      if (idx >= BN)
         break;
-      const int t = idx % BN;
-      if constexpr (kRaw) {
-        // HalfRows' rounding: scale by the row's power of two, round.
-        float v[16];
-        __builtin_memcpy(v, b_data[p], sizeof(v));
-        __half h[16];
 #pragma unroll
-        for (int e = 0; e < 16; ++e)
-          h[e] = __float2half_rn(ldexpf(v[e], b_exponent[p]));
-        const int k_half = idx / BN;
-#pragma unroll
-        for (int c = 0; c < 2; ++c) {
-          uint4 u;
-          __builtin_memcpy(&u, h + 8 * c, 16);
-          s_b[stage][t][swizzle(t, 2 * k_half + c)] = u;
-        }
-      } else {
-#pragma unroll
-        for (int c = 0; c < 4; ++c)
-          s_b[stage][t][swizzle(t, c)] = b_data[p][c];
-      }
+      for (int c = 0; c < 4; ++c)
+        s_b[stage][idx][swizzle(idx, c)] = b_data[p][c];
     }
   };
   v8f acc[RM][RN] = {};
@@ -650,9 +614,7 @@ __launch_bounds__(kWaves * 32) __global__
       const int token = t_block + j * 16 + 2 * l + half;
       float scale = 0;
       if (token < tokens)
-        scale =
-            kRaw ? ldexpf(1.0F, -RowExponent(__uint_as_float(x.row_max[token])))
-                 : x.scale[token];
+        scale = x.scale[token];
       if constexpr (kSwiGLU) {
         // The separate SwiGLU kernel's formula.
         const float g = acc[0][j][l] * scale, u = acc[1][j][l] * scale;

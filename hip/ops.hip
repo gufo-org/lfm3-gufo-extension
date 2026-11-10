@@ -1971,7 +1971,7 @@ SplitK PlanSplit(int token_blocks, int tiles, int k_blocks, int resident,
   }
   return plan;
 }
-template<bool kSwiGLU = false, bool kRaw = false>
+template<bool kSwiGLU = false>
 void LaunchSplit(std::span<const Output> outputs, HalfActivations split, int n,
                  int K, hipStream_t s, DenseWorkspace workspace = {}) {
   constexpr int BN = 64;
@@ -2000,9 +2000,9 @@ void LaunchSplit(std::span<const Output> outputs, HalfActivations split, int n,
     kernel<<<units, 256, 0, s>>>(jobs, split, n, K, plan);
   };
   if (wide)
-    launch.template operator()<RegQ8Gemm<BN / 16, kSwiGLU, kRaw>>();
+    launch.template operator()<RegQ8Gemm<BN / 16, kSwiGLU>>();
   else
-    launch.template operator()<TiledQ8Gemm<64, BN, 4, 2, kSwiGLU, kRaw>>();
+    launch.template operator()<TiledQ8Gemm<64, BN, 4, 2, kSwiGLU>>();
 }
 }  // namespace
 // One-row Q8_0 projections of one input in a single launch; false when the
@@ -2102,11 +2102,12 @@ void ProjectFfn(const Tensor& gate, const Tensor& up, const Tensor& down,
     split.row_max = workspace.row_max;
     (void)hipMemsetAsync(workspace.row_max, 0, std::size_t(n) * 4, s);
     LaunchSplit<true>(first, split, n, gate.cols, s);
-    HalfActivations raw{};
-    raw.raw = hidden;
-    raw.row_max = workspace.row_max;
+    // The gate/up input is consumed; its workspace holds the down input.
+    const auto half = HalfActivations::In(workspace.quantized, n, down.cols);
+    HalfRowsFromMax<<<dim3((down.cols / 8 + 255) / 256, n), 256, 0, s>>>(
+        hidden, workspace.row_max, half, down.cols);
     const Output second[] = {{&down, out}};
-    LaunchSplit<false, true>(second, raw, n, down.cols, s, workspace);
+    LaunchSplit(second, half, n, down.cols, s, workspace);
     return;
   }
   ProjectSwiGLU(gate, up, x, hidden, up_scratch, n, s, workspace, split_ready);
