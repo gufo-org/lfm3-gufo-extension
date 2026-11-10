@@ -148,11 +148,19 @@ public:
   std::vector<float> Push(std::span<const float> samples, bool finish = false);
 
 private:
-  double ratio_, cutoff_, half_;
+  // Output i sits at input time i * step_ / phases_ (exact).
+  std::uint64_t from_, to_, step_, phases_;
+  double cutoff_, half_;
   bool same_;
+  // Filter taps of each phase k (output at q + k / phases_): from input
+  // q + first_[k], count_[k] of them, weights at k * taps_ when tabulated.
+  std::vector<std::int32_t> first_, count_;
+  std::size_t taps_{};
+  std::vector<double> weights_;
   std::vector<float> history_;  // input from base_
   std::int64_t base_{};
   std::uint64_t received_{}, next_{};
+  double Weight(double d) const;
 };
 }  // namespace gufo::models::lfm3_audio
 #endif

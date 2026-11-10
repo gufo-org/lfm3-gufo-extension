@@ -110,6 +110,23 @@ Qwen3-ASR 1.7B). `gufo speak` writes speech that transcribes back exactly,
 answers a spoken question in speech, and reports a native tool call in text
 mode; `gufo transcribe --live` returns the live transcript.
 
+## Shared prompt passes
+
+November 10, 2026, Q8_0 backbone and BF16 mmproj, release build. A prompt's
+text and audio runs advance in shared passes, so its text rows take the FP16
+prompt activations of the audio rows. `lfm3_asr_probe` compares that with
+the separate passes on 14 clips (16, 24 and 48 kHz, 2.1–28 s): teacher-forced
+over the greedy transcript, every step has the same argmax, KL at most
+1.5e-6 (mean at most 1.1e-7) and log-probabilities within 0.017; the
+generator's tokens equal the probe's. HTTP transcripts of all 14 clips, live
+transcription and voice-chat text are unchanged, greedy TTS is
+byte-identical, the encoder's embeddings are bit-identical, and the ASR,
+realtime (11 cases) and 32K context suites pass.
+
+```sh
+lfm3_asr_probe $M/LFM3-Audio-2B-Q8_0.gguf $M/mmproj-LFM3-Audio-2B-BF16.gguf clips/*.wav
+```
+
 ## Reproduction
 
 ```sh

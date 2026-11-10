@@ -145,6 +145,25 @@ int main(int argc, char** argv) {
     Require(a->Reset(&error), error);
     Require(a->Forward(tokens, repeat, &error), error);
     Require(repeat == batched, "reset did not reproduce exact logits");
+    // Runs share the passes of one Forward, also across the 512-row chunk
+    // boundary and with empty runs between them.
+    {
+      const auto all = std::span<const std::uint32_t>(tokens);
+      const l::Session::Input runs[] = {{all.first(5), {}},
+                                        {},
+                                        {all.subspan(5, 500), {}},
+                                        {all.subspan(505), {}}};
+      Require(a->Reset(&error) && a->ForwardInputs(runs, repeat, &error),
+              error);
+      Require(repeat == batched && a->Position() == tokens.size(),
+              "input runs differ from one forward");
+      const float row[1] = {};
+      const l::Session::Input bad[] = {{all.first(1), row}};
+      Require(!a->ForwardInputs(bad, {}, &error),
+              "run with tokens and rows accepted");
+    }
+    Require(a->Reset(&error), error);
+    Require(a->Forward(tokens, repeat, &error), error);
     const std::uint32_t invalid = m->config().vocab;
     Require(!a->Forward(std::span(&invalid, 1), {}, &error),
             "invalid token accepted");

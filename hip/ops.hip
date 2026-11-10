@@ -1755,13 +1755,23 @@ void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
   if (batch > 8) {
     for (std::size_t offset = 0; offset < batch;) {
       const std::size_t remaining = batch - offset;
+      // A ragged tail of 9-11 rows takes one 12-row pass instead of an
+      // 8-row pass and another over the weights; each row's sums are the
+      // same. These kernels are compute bound (about 0.8 ms per row over
+      // LFM3 1.7B), so wider ragged passes would cost more than they save.
       const std::size_t width =
-          remaining >= 16 ? 16 : (remaining >= 12 ? 12 : 0);
+          remaining >= 16 ? 16 : (remaining >= 9 ? 12 : 0);
+      const bool ragged = remaining < width;
       const float* input = fp32_x + offset * k;
       float* output = y + offset * m;
       if (width == 16) {
         SmallBatchQ8_0ExactFp32VecGEMMKernel<16, 16, 3, true, true>
             <<<(m + 47) / 48, 512, 0, stream>>>(w, input, output, m, k);
+      } else if (width == 12 && ragged) {
+        SmallBatchQ8_0ExactFp32VecGEMMKernel<16, 12, 2, true, true, 32, 1, 12,
+                                             false, true>
+            <<<(m + 31) / 32, 512, 0, stream>>>(w, input, output, m, k,
+                                                remaining);
       } else if (width == 12) {
         SmallBatchQ8_0ExactFp32VecGEMMKernel<16, 12, 2, true, true>
             <<<(m + 31) / 32, 512, 0, stream>>>(w, input, output, m, k);

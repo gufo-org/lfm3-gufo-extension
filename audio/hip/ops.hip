@@ -787,16 +787,48 @@ void SgemmBf16(const float* x, const void* w, const float* bias, float* y,
     // Past the 32 MiB MALL, FP32 activations would be streamed again for
     // every row tile.
     const bool rows_fast = std::size_t(n) * K * sizeof(float) > (32U << 20);
-    const auto grid = [&](int bt) {
-      const unsigned tokens = (n + bt - 1) / bt, rows = M / 128;
+    const auto grid = [&](int bt, int br) {
+      const unsigned tokens = (n + bt - 1) / bt, rows = M / br;
       return rows_fast ? dim3(rows, tokens) : dim3(tokens, rows);
     };
-    if (n > 1024)
-      Split3Gemm<128, 128, 2, 4><<<grid(128), 256, 0, s>>>(
+    if (n > 1024) {
+      Split3Gemm<128, 128, 2, 4><<<grid(128, 128), 256, 0, s>>>(
+          x, weights, bias, y, n, M, K, act, rows_fast);
+      return;
+    }
+    // Each output's sums are the same for every tile shape. Short inputs (a
+    // 10 s clip is 125 tokens) leave 64 x 128 tiles too few to fill the
+    // device, so they take the shape with the fewest waves of resident
+    // blocks (about 56) times the tile's work, whose activation split and
+    // weight staging cost more per product in smaller tiles. Measured on
+    // the encoder's projections, this is within 5% of the best shape.
+    int shape = 0;
+    if (n <= 256) {
+      constexpr int kShapes[][2] = {{64, 128}, {32, 64}, {32, 128}, {64, 64}};
+      double best = 0;
+      for (int i = 0; i < 4; ++i) {
+        const int bt = kShapes[i][0], br = kShapes[i][1];
+        const int blocks = (n + bt - 1) / bt * (M / br);
+        const double cost = double((blocks + 55) / 56) * bt * br *
+                            (1 + 2.0 * (32.0 / bt + 64.0 / br) / 3);
+        if (!i || cost < best) {
+          best = cost;
+          shape = i;
+        }
+      }
+    }
+    if (shape == 1)
+      Split3Gemm<32, 64, 2, 4><<<grid(32, 64), 256, 0, s>>>(
+          x, weights, bias, y, n, M, K, act, rows_fast);
+    else if (shape == 2)
+      Split3Gemm<32, 128, 2, 4><<<grid(32, 128), 256, 0, s>>>(
+          x, weights, bias, y, n, M, K, act, rows_fast);
+    else if (shape == 3)
+      Split3Gemm<64, 64, 4, 2><<<grid(64, 64), 256, 0, s>>>(
           x, weights, bias, y, n, M, K, act, rows_fast);
     else
-      Split3Gemm<64, 128, 2, 4><<<grid(64), 256, 0, s>>>(x, weights, bias, y, n,
-                                                         M, K, act, rows_fast);
+      Split3Gemm<64, 128, 2, 4><<<grid(64, 128), 256, 0, s>>>(
+          x, weights, bias, y, n, M, K, act, rows_fast);
     return;
   }
   SgemmKernel<<<dim3((n + kTile - 1) / kTile, (M + kTile - 1) / kTile), 256, 0,

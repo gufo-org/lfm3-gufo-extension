@@ -229,11 +229,13 @@ struct Session::Impl {
     const auto& c = w.config;
     const auto s = stream.value;
     const auto n = embeddings ? embedding_rows : tokens.size();
-    if (embeddings)
-      Check(hipMemcpyAsync(
-          x.data, embeddings, n * c.hidden * 4,
-          on_device ? hipMemcpyDeviceToDevice : hipMemcpyHostToDevice, s));
-    else {
+    // ForwardInputs gathers its rows into x itself.
+    if (embeddings) {
+      if (embeddings != x.floats())
+        Check(hipMemcpyAsync(
+            x.data, embeddings, n * c.hidden * 4,
+            on_device ? hipMemcpyDeviceToDevice : hipMemcpyHostToDevice, s));
+    } else {
       Check(hipMemcpyAsync(ids.data, tokens.data(), tokens.size_bytes(),
                            hipMemcpyHostToDevice, s));
       gpu::Embed(w.embedding, static_cast<const std::uint32_t*>(ids.data),
@@ -694,6 +696,95 @@ bool Session::ForwardEmbeddings(std::span<const float> rows, bool on_device,
     }
     if (!logits.empty())
       Check(hipMemcpy(logits.data(), impl_->logits.data, logits.size_bytes(),
+                      hipMemcpyDeviceToHost));
+    return true;
+  } catch (const std::exception& e) {
+    if (error)
+      *error = e.what();
+    return false;
+  }
+}
+bool Session::ForwardInputs(std::span<const Input> inputs,
+                            std::span<float> logits, std::string* error) {
+  try {
+    auto& d = *impl_;
+    const auto& w = d.model->impl_->weights;
+    const auto& c = w.config;
+    const std::size_t H = c.hidden;
+    if (c.decision)
+      throw std::invalid_argument("use the decision API for d1 models");
+    if (d.poisoned)
+      throw std::runtime_error(
+          "LFM3 session requires Reset after a device error");
+    std::size_t n = 0;
+    for (const auto& input : inputs) {
+      if (!input.tokens.empty() && !input.rows.empty())
+        throw std::invalid_argument("an LFM3 input run is tokens or rows");
+      if (input.rows.size() % H)
+        throw std::invalid_argument("LFM3 embedding rows must be whole");
+      for (auto t : input.tokens)
+        if (t >= c.vocab)
+          throw std::invalid_argument("LFM3 token out of range");
+      n += input.tokens.size() + input.rows.size() / H;
+    }
+    if (!n || n > d.context - d.position ||
+        (!logits.empty() && logits.size() != c.vocab))
+      throw std::invalid_argument(
+          "invalid LFM3 input/logit count or context exhausted");
+    if (hooks_)
+      hooks_->BeforeWrite(d.position, d.position + std::uint32_t(n));
+    const auto s = d.stream.value;
+    std::vector<std::uint32_t> ids;
+    std::size_t run = 0, at = 0;  // next input row: inputs[run], row at
+    for (std::size_t done = 0; done < n;) {
+      const auto count = std::min(Impl::kChunk, n - done);
+      try {
+        // Token rows are embedded from one upload of their IDs; embedding
+        // rows are copied into place.
+        ids.clear();
+        struct Part {
+          std::size_t row, count, id;
+          const float* rows;
+        };
+        std::vector<Part> parts;
+        for (std::size_t row = 0; row < count;) {
+          const auto& input = inputs[run];
+          const auto size = input.tokens.size() + input.rows.size() / H;
+          const auto take = std::min(size - at, count - row);
+          if (take && input.rows.empty()) {
+            parts.push_back({row, take, ids.size(), nullptr});
+            ids.insert(ids.end(), input.tokens.begin() + std::ptrdiff_t(at),
+                       input.tokens.begin() + std::ptrdiff_t(at + take));
+          } else if (take)
+            parts.push_back({row, take, 0, input.rows.data() + at * H});
+          row += take;
+          at += take;
+          if (at == size) {
+            ++run;
+            at = 0;
+          }
+        }
+        if (!ids.empty())
+          Check(hipMemcpyAsync(d.ids.data, ids.data(), ids.size() * 4,
+                               hipMemcpyHostToDevice, s));
+        for (const auto& part : parts)
+          if (part.rows)
+            Check(hipMemcpyAsync(d.x.floats() + part.row * H, part.rows,
+                                 part.count * H * 4, hipMemcpyHostToDevice, s));
+          else
+            gpu::Embed(w.embedding,
+                       static_cast<const std::uint32_t*>(d.ids.data) + part.id,
+                       d.x.floats() + part.row * H, int(part.count), s);
+        d.Run({}, !logits.empty() && done + count == n, {}, d.x.floats(),
+              count);
+      } catch (...) {
+        d.poisoned = true;
+        throw;
+      }
+      done += count;
+    }
+    if (!logits.empty())
+      Check(hipMemcpy(logits.data(), d.logits.data, logits.size_bytes(),
                       hipMemcpyDeviceToHost));
     return true;
   } catch (const std::exception& e) {

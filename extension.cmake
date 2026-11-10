@@ -296,6 +296,20 @@ gufo_extension_target(
     hip::host
 )
 
+# Transcription latency and the shared prompt pass; needs weights.
+gufo_extension_target(
+  NAME lfm3_asr_probe
+  SOURCES
+    tests/asr_probe.cpp
+  LINK_LIBRARIES
+    gufo_lfm3_audio
+    gufo_lfm3_hip
+    gufo_lfm3
+    gufo_ext_runtime
+    ${_gufo_lfm3_test_libs}
+    hip::host
+)
+
 gufo_extension_target(
   NAME lfm3_audio_batch_bench
   SOURCES
