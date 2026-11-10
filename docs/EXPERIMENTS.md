@@ -280,6 +280,8 @@ phase runs 20 s with its own power average.
 | HIP | decode | 111.8 | 100.4 W | 898 mJ |
 | HRX | prefill | 7,054.4 | 139.5 W | 19.8 mJ |
 | HRX | decode | 95.6 | 96.6 W | 1,011 mJ |
+| HRX, queue pool | prefill | 7,489.8 | 140.5 W | 18.8 mJ |
+| HRX, queue pool | decode | 95.8 | 97.2 W | 1,014 mJ |
 
 `gufo bench` agrees on the speeds: HIP pp2048 9,063-9,196 and tg128
 111.3-112.0, HRX 8,720-8,843 and 96.1-96.2 tok/s. HRX decodes LFM3 about 14%
@@ -290,8 +292,10 @@ The HRX build used here gave every created stream its own hardware queue.
 LFM3 creates about 70 streams, and with that many queues mapped the GPU stays
 100% busy at 2.9 GHz with no work queued: an idle server drew 39-41 W against
 11-12 W on HIP. A pool of at most four queues idles normally (0% busy,
-11-12 W); sixteen spins again. The HRX package is being changed to the pool;
-these HRX rows predate that fix, so re-measure them once it lands.
+11-12 W); sixteen spins again. The two "HRX" rows above used the queue per
+stream; the "HRX, queue pool" rows use the pooled package
+(gufo-org/gufo#1147), with which an idle LFM3 server draws 13 W at 0% busy.
+The pool lifts prefill by 6% and leaves decode unchanged.
 
 ### NPU
 
