@@ -11,9 +11,9 @@
 namespace gufo::models::lfm3::gpu {
 void Embed(const Tensor& weight, const std::uint32_t* tokens, float* out, int n,
            hipStream_t stream);
-// Prompt projections of n rows need SplitActivationBytes(n, K) here.
-// row_max (one word per prompt row) lets the FFN down projection split its
-// input while staging.
+// Prompt projections of n rows need HalfActivationBytes(n, K) here.
+// row_max (one word per prompt row) collects the FFN hidden rows' maxima so
+// they convert to FP16 for the down projection without another reduction.
 // With partial (SplitPartialBytes) and zeroed tickets (kMaxSplitUnits
 // words), projections whose tiles leave the last wave of resident blocks
 // partly idle split those tiles across K.
@@ -30,7 +30,7 @@ struct Output {
   const Tensor* weight;
   float* out;
 };
-// True when these projections of n rows read one split prompt input.
+// True when these projections of n rows read one FP16 prompt input.
 bool SharesSplit(std::span<const Output> outputs, int n,
                  DenseWorkspace workspace);
 // Projects one input through up to four weights with the same column count.
@@ -51,7 +51,7 @@ void ProjectFfn(const Tensor& gate, const Tensor& up, const Tensor& down,
                 bool split_ready = false);
 // x += post_norm(branch) (branch may be null, post_norm may be null), then
 // z = norm(x) unless norm is null. With split, z goes to the workspace as a
-// split prompt input instead. Returns false when the width is unsupported.
+// FP16 prompt input instead. Returns false when the width is unsupported.
 bool ResidualNorm(const float* branch, const Tensor* post_norm, float* x,
                   const Tensor* norm, float* z, int n, int hidden, float eps,
                   bool split, hipStream_t stream, DenseWorkspace workspace);

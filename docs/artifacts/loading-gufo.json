@@ -22,7 +22,7 @@
     "fingerprintId": "a568074ce6fb9029f7abb69112fa248ea6da887b8ad8287029f4126144caff1e",
     "schemaVersion": "1.0.0"
   },
-  "measuredOn": "2026-11-08",
+  "measuredOn": "2026-11-10",
   "mode": "ar",
   "model": {
     "id": "LFM3-1.7B",
@@ -35,8 +35,8 @@
   "referenceName": "llama.cpp",
   "rows": {
     "default": {
-      "command": "gufo serve --port 48945 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
-      "ready_s": 4.42,
+      "command": "gufo serve --port 54767 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
+      "ready_s": 4.102,
       "ready_s_sd": null,
       "samples": 1
     }
@@ -47,7 +47,7 @@
       "gufo",
       "serve",
       "--port",
-      "48945",
+      "54767",
       "--sessions",
       "1",
       "llm",
@@ -66,7 +66,7 @@
   "source": {
     "buildMode": "nix-release",
     "dirty": true,
-    "revision": "12f8d8ab9a944b2df3efe388b44246ec37923c53"
+    "revision": "bd6b0fdd083568d5eb485a2f3ba37a118a0a15c4"
   },
   "table": "loading",
   "target": "gufo"

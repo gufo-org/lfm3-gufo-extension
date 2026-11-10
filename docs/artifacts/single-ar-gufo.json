@@ -22,7 +22,7 @@
     "fingerprintId": "a568074ce6fb9029f7abb69112fa248ea6da887b8ad8287029f4126144caff1e",
     "schemaVersion": "1.0.0"
   },
-  "measuredOn": "2026-11-08",
+  "measuredOn": "2026-11-10",
   "mode": null,
   "model": {
     "id": "LFM3-1.7B",
@@ -35,7 +35,7 @@
   "referenceName": "llama.cpp",
   "rows": {
     "0": {
-      "command": "gufo serve --port 38599 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 42609 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 0,
@@ -46,15 +46,15 @@
           "prompt_n": 2034
         }
       ],
-      "pp": 4714.18,
+      "pp": 8789.59,
       "pp_sd": null,
       "samples": 1,
-      "tg": 101.47,
+      "tg": 109.3,
       "tg_sd": null,
       "workload": "prose"
     },
     "12288": {
-      "command": "gufo serve --port 38599 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 42609 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 12285,
@@ -65,15 +65,15 @@
           "prompt_n": 2054
         }
       ],
-      "pp": 2889.67,
+      "pp": 7165.3,
       "pp_sd": null,
       "samples": 1,
-      "tg": 87.38,
+      "tg": 100.95,
       "tg_sd": null,
       "workload": "prose"
     },
     "131072": {
-      "command": "gufo serve --port 38599 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 42609 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 131290,
@@ -84,15 +84,15 @@
           "prompt_n": 2046
         }
       ],
-      "pp": 657.22,
+      "pp": 3334.6,
       "pp_sd": null,
       "samples": 1,
-      "tg": 38.51,
+      "tg": 60.33,
       "tg_sd": null,
       "workload": "prose"
     },
     "16384": {
-      "command": "gufo serve --port 38599 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 42609 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 16341,
@@ -103,15 +103,15 @@
           "prompt_n": 2050
         }
       ],
-      "pp": 2613.98,
+      "pp": 6995.11,
       "pp_sd": null,
       "samples": 1,
-      "tg": 83.84,
+      "tg": 98.79,
       "tg_sd": null,
       "workload": "prose"
     },
     "32768": {
-      "command": "gufo serve --port 38599 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 42609 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 32774,
@@ -122,34 +122,34 @@
           "prompt_n": 2026
         }
       ],
-      "pp": 1828.69,
+      "pp": 6036.79,
       "pp_sd": null,
       "samples": 1,
-      "tg": 71.93,
+      "tg": 90.42,
       "tg_sd": null,
       "workload": "prose"
     },
     "4096": {
-      "command": "gufo serve --port 38599 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 42609 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 4098,
-          "completion_sha256": "a9d8a1f16b23d19ee887d04e2dbb120705231e68fdb3d1b76478f2c4c00cc379",
+          "completion_sha256": "81de1496d155ebfbaf06594a994dd22db8d4901d3a05b5ef3acb03ff8ad38b3c",
           "draft_n": 0,
           "draft_n_accepted": 0,
           "predicted_n": 128,
           "prompt_n": 2049
         }
       ],
-      "pp": 3914.64,
+      "pp": 8163.31,
       "pp_sd": null,
       "samples": 1,
-      "tg": 95.89,
+      "tg": 106.24,
       "tg_sd": null,
       "workload": "prose"
     },
     "65536": {
-      "command": "gufo serve --port 38599 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 42609 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 65605,
@@ -160,15 +160,15 @@
           "prompt_n": 2054
         }
       ],
-      "pp": 1151.18,
+      "pp": 4651.75,
       "pp_sd": null,
       "samples": 1,
-      "tg": 55.42,
+      "tg": 77.21,
       "tg_sd": null,
       "workload": "prose"
     },
     "8192": {
-      "command": "gufo serve --port 38599 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 42609 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 8191,
@@ -179,10 +179,10 @@
           "prompt_n": 2046
         }
       ],
-      "pp": 3310.11,
+      "pp": 7748.16,
       "pp_sd": null,
       "samples": 1,
-      "tg": 91.46,
+      "tg": 103.66,
       "tg_sd": null,
       "workload": "prose"
     }
@@ -193,7 +193,7 @@
       "gufo",
       "serve",
       "--port",
-      "38599",
+      "42609",
       "--sessions",
       "1",
       "llm",
@@ -212,7 +212,7 @@
   "source": {
     "buildMode": "nix-release",
     "dirty": true,
-    "revision": "12f8d8ab9a944b2df3efe388b44246ec37923c53"
+    "revision": "bd6b0fdd083568d5eb485a2f3ba37a118a0a15c4"
   },
   "table": "single-ar",
   "target": "gufo"

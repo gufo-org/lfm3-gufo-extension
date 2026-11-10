@@ -17,18 +17,18 @@ weight-memory advantage over BF16. Q4/Q5/Q6, multimodal and decision variants
 are not supported by this initial backend.
 
 Weights stay packed on the GPU. Activations, accumulation and convolution
-history remain FP32; attention K/V caches are F16, llama.cpp's default (the
-checkpoint itself is BF16). Q8 prompt projections scale each activation row by a
-power of two and split it into an FP16 high part plus the FP16 rounding of the
-remainder (about 22 significant bits per element), chained into one FP32 F16
-WMMA accumulator per Q8 K32 block. This approximation passes the independent
-projection and model probability gates with lower error than the earlier
-three-digit integer encoding; decode uses the existing Strix Halo quantized
-GEMV kernels. BF16 prefill shares weights across rows using the existing exact
-BF16/FP32 projection kernels. Prompt attention runs on the matrix cores: F16
-K, V and probabilities, Q as an F16 high part plus its F16 remainder, FP32
-scores, softmax and accumulation. Decode attention reads the F16 cache with
-FP32 Q, probabilities and accumulation. Cache-free attention (vision encoders,
+history remain FP32 outside the matrix cores; attention K/V caches are F16,
+llama.cpp's default (the checkpoint itself is BF16). Q8 prompt projections
+scale each activation row by a power of two and round it to FP16 (11
+significant bits per element, far below the Q8_0 weight rounding), with one
+FP32 WMMA accumulator per Q8 K32 block. Against the BF16 reference this
+matches the earlier 22-bit split activations in KL, top-1 and NLL
+([quality](QUALITY.md)). Decode keeps FP32 activations in the Strix Halo
+quantized GEMV kernels. BF16 prefill shares weights across rows using the
+existing exact BF16/FP32 projection kernels. Prompt attention runs on the
+matrix cores: F16 Q, K, V and probabilities, FP32 scores, softmax and
+accumulation. Decode attention reads the F16 cache with FP32 Q, probabilities
+and accumulation. Cache-free attention (vision encoders,
 audio stacks, decision prompts) reads the same F16 K/V rows.
 
 Download from the [official GGUF repository](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/tree/b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf):

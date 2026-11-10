@@ -174,3 +174,40 @@ Pure WMMA reaches about 51 TFLOPS on this device; the split GEMM runs at
 about 37 raw TFLOPS. Ablation: weight loads about 9%, activation loads 5%,
 barrier 3%. Attention is about 60% WMMA time, 10% K/V loads. The remaining
 large levers lower precision (F16-only activations or Q) and need a decision.
+
+## November 10 pass: FP16 prompt activations
+
+Q8_0 `gufo bench` pp2048 / tg128, Gufo `bd6b0fdd`, against extension
+`23efc07`. Quality evidence for the precision change is in QUALITY.md.
+
+| Depth | Before | After |
+| ---: | --- | --- |
+| 0 | 6281 / 110.6 | 9399 / 111.8 |
+| 8K | 5713 / 103.8 | 8392 / 105.1 |
+| 32K | 4428 / 88.9 | 6276 / 90.8 |
+| 128K | 2548 / 60.3 | 3432 / 60.9 |
+
+The HTTP text suites (`all`, provider preset, 32K context) pass and fail the
+same cases as before with the same responses; prefill time per request fell
+by a median of 31% (89 matched requests, none slower) and decode by 1%. The VL
+(19 cases), ASR, d1 packed (26 checks) and d1 parity suites pass; d1 answers
+move by at most 2.5e-4 in probability against the previous build.
+
+| Mechanism | Decision and evidence |
+| --- | --- |
+| Prompt projection activations as one row-scaled FP16 plane instead of the high/remainder pair; two WMMAs per K32 block instead of four | Retained (precision decision). KL against BF16 unchanged (1.252e-3 → 1.255e-3), KL to the previous path 2.4e-6, identical top-1. pp2048 6150 → about 8450. |
+| FFN hidden state converted to FP16 once (row maxima from the SwiGLU epilogue) instead of while staging the down projection | Retained, byte-identical logits: each of the 8 row tiles had re-read and re-converted the FP32 rows. Down projection 750 → 562 µs per layer and chunk; pp2048 about +8%. The FP32 staging route was removed. |
+| Single F16 query in matrix-core prompt attention | Retained (same precision decision). On a 27K-token text, KL against BF16 9.79e-4 → 9.72e-4, KL to the split query 1.5e-6, identical top-1. pp512 at 32K 5888 → 6232. |
+| One decode GEMV row per wave (four for the 7680-column down projection); gate and up rows of a SwiGLU block in separate waves joined through LDS | Retained, byte-identical (each row keeps its reduction order). tg128 109.8 → 111.4. The GEMVs now read at 92–96% of the measured 240.8 GB/s DRAM ceiling. |
+| Barrier-free decode attention: a wave per KV group takes batches of 8 keys, lane L owns dimensions 4L..4L+3 of every head, scores reduce by DPP, waves merge in LDS | Retained: 64-key tiles with six block barriers each reached 87% of the cache layout's read ceiling (about 220 GB/s for 256-byte group slices of 1 KiB rows), now 92%. tg128 at 32K 89.3 → 90.4. Unrolled span merge: 108 → 56 µs per token at 32K. |
+| HIP graph capture of the decode step | Rejected: +0.5%. The about 1.9 µs between dependent kernels is GPU-side, not launch overhead. |
+| 256 / 1024-row prefill chunks | Rejected again: 8430 / 9240 versus 9200 at 512 (1024 within noise, more memory and scheduling latency). |
+| Down projection tiles (16-row token tiles, 4-wave blocks), split-K off | Rejected: 5–25% slower than 32-token, 8-wave tiles with tail split-K. |
+| Wave-tree RowSquares in the residual norm (two barriers instead of twenty) | Rejected: tg unchanged; the single-block norm waits on loads, not barriers. |
+| Dword-aligned weight loads in decode GEMVs; 2–8 waves per block | Rejected: neutral. |
+
+Remaining decode cost is the 1.84 GB weight read per token (7.6 ms at the
+ceiling, 8.9 ms measured) plus 184 launches with GPU-side gaps. Prefill gate/up
+projections run at about 29 effective TFLOPS (54% of the WMMA peak) with one
+FP32 FMA per accumulator and K block for the Q8 scale. The next precision lever
+would fold the Q8 scale into FP16 weights (rounding each q·d to 11 bits).
