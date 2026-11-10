@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <future>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -134,8 +135,10 @@ std::unique_ptr<Model> Model::Load(const std::string& path,
   if (mmproj.empty())
     m.text = lfm3::Model::Load(path, &error);
   else {
+    // The vision tower streams from disk beside the audio backbone.
+    auto vision = std::async(std::launch::async, Vision::Load, mmproj);
     m.audio = lfm3_audio::Model::Load(path, mmproj, &error);
-    m.vision = Vision::Load(mmproj);
+    m.vision = vision.get();
   }
   if (!m.audio && !m.text)
     throw std::runtime_error(error);

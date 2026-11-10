@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <mutex>
 #include <numbers>
 #include <stdexcept>
@@ -13,6 +14,7 @@
 #include <utility>
 
 #include "../hip/ops.hpp"
+#include "../upload.hpp"
 #include "hip/ops.hpp"
 namespace gufo::models::lfm3_audio {
 namespace {
@@ -272,7 +274,7 @@ struct Model::Impl {
   std::unique_ptr<core::GgufReader> reader;
   AudioWeights weights;
   Tokens tokens;
-  std::vector<Buffer> allocations;
+  lfm3::DeviceWeights device;
   Buffer istft_basis;  // [n_fft][n_fft + 2], synthesis window included
   std::vector<float> window;
   // Encoder state, serialized by encoder_mutex.
@@ -360,17 +362,43 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
   try {
     auto m = std::shared_ptr<Model>(new Model);
     auto& impl = *m->impl_;
+    // The projector streams from disk beside the backbone, binding against
+    // the backbone geometry read from its metadata.
+    std::string projector_error;
+    auto projector = std::async(std::launch::async, [&] {
+      auto geometry = core::GgufReader::OpenFile(backbone, &projector_error);
+      const auto config =
+          geometry ? lfm3::Config::FromGguf(*geometry, &projector_error)
+                   : std::nullopt;
+      if (!config)
+        return false;
+      impl.reader = core::GgufReader::OpenFile(mmproj, &projector_error);
+      if (!impl.reader)
+        return false;
+      auto w =
+          AudioWeights::Bind(*impl.reader, config->hidden, &projector_error);
+      if (!w)
+        return false;
+      impl.weights = std::move(*w);
+      impl.weights.Visit([&](Tensor& t) { impl.device.Add(t); });
+      impl.device.Upload(*impl.reader);
+      impl.weights.Visit([&](Tensor& t) { impl.device.Resolve(t); });
+      return true;
+    });
     impl.backbone = lfm3::Model::Load(backbone, error);
-    if (!impl.backbone)
+    if (!impl.backbone) {
+      // Report the backbone failure; the projector only waits.
+      try {
+        (void)projector.get();
+      } catch (const std::exception&) {
+      }
       return nullptr;
-    impl.reader = core::GgufReader::OpenFile(mmproj, error);
-    if (!impl.reader)
+    }
+    if (!projector.get()) {
+      if (error)
+        *error = projector_error;
       return nullptr;
-    auto w =
-        AudioWeights::Bind(*impl.reader, impl.backbone->config().hidden, error);
-    if (!w)
-      return nullptr;
-    impl.weights = std::move(*w);
+    }
     const auto& tok = impl.backbone->tokenizer();
     auto id = [&](std::string_view text) {
       const auto ids = tok.Encode(text, true);
@@ -384,18 +412,6 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
                    id("<|mixed_start|>"), id("<|im_end|>"),
                    id("<|im_start|>"),    id("<|startoftext|>"),
                    id("<|mixed_end|>"),   id("<|endoftext|>")};
-    std::unordered_map<const void*, void*> uploaded;
-    impl.weights.Visit([&](Tensor& t) {
-      if (!t.data)
-        return;
-      if (!uploaded.contains(t.data)) {
-        impl.allocations.emplace_back(t.bytes);
-        auto* p = impl.allocations.back().data;
-        Check(hipMemcpy(p, t.data, t.bytes, hipMemcpyHostToDevice));
-        uploaded[t.data] = p;
-      }
-      t.data = uploaded.at(t.data);
-    });
     // Inverse real FFT with the periodic Hann synthesis window folded in.
     if (impl.weights.n_fft) {
       const int N = int(impl.weights.n_fft), bins = N / 2 + 1;

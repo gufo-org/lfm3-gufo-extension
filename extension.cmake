@@ -36,6 +36,7 @@ gufo_extension_target(
   NAME gufo_lfm3_hip
   SOURCES
     engine.cpp
+    upload.cpp
   LINK_LIBRARIES
     gufo_lfm3
     gufo_ext_runtime

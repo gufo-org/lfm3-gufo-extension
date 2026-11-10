@@ -17,8 +17,12 @@ enum class ContinuationTensor {
 class Model : public std::enable_shared_from_this<Model> {
 public:
   ~Model();
+  static constexpr std::uint32_t kModelContext = ~0U;
+  // A nonzero session_context (kModelContext: the model's own) allocates
+  // the state of the first session of that context while weights load.
   static std::shared_ptr<Model> Load(const std::string& path,
-                                     std::string* error = nullptr);
+                                     std::string* error = nullptr,
+                                     std::uint32_t session_context = 0);
   std::unique_ptr<Session> CreateSession(std::uint32_t context,
                                          std::string* error = nullptr);
   const Config& config() const;
