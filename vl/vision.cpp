@@ -11,6 +11,7 @@
 
 #include "../audio/hip/ops.hpp"
 #include "../hip/ops.hpp"
+#include "../upload.hpp"
 #include "hip/ops.hpp"
 namespace gufo::models::lfm3_vl {
 namespace {
@@ -57,10 +58,22 @@ struct Vision::Impl {
   std::string identity;
   std::once_flag identity_once;
   std::unique_ptr<core::GgufReader> reader;
-  std::vector<Buffer> weights;
+  lfm3::DeviceWeights device;
+  Buffer patch_weights;
   std::vector<Block> blocks;
   Tensor patch, norm, proj_norm, proj_bias, proj1, bias1, proj2, bias2;
-  Tensor Get(const std::string& name, unsigned cols, unsigned rows) {
+  template<class F>
+  void Visit(F f) {
+    for (auto* t :
+         {&norm, &proj_norm, &proj_bias, &proj1, &bias1, &proj2, &bias2})
+      f(*t);
+    for (auto& b : blocks)
+      for (auto* t : {&b.norm, &b.ffn_norm, &b.gate, &b.up, &b.down, &b.conv,
+                      &b.in, &b.out, &b.q, &b.k, &b.v, &b.qn, &b.kn})
+        f(*t);
+  }
+  // Validates a mapped tensor; Load uploads every Get after the last.
+  Tensor Find(const std::string& name, unsigned cols, unsigned rows) const {
     const auto* t = reader->FindTensor(name);
     std::size_t count = 1;
     if (t)
@@ -75,10 +88,12 @@ struct Vision::Impl {
     if (!bytes || bytes != t->size_bytes ||
         (t->type == GgmlType::kQ8_0 && cols % 32))
       throw std::runtime_error("invalid d1 vision tensor bytes: " + name);
-    weights.emplace_back(bytes);
-    Check(
-        hipMemcpy(weights.back().data, t->data, bytes, hipMemcpyHostToDevice));
-    return {weights.back().data, t->type, cols, rows, bytes};
+    return {t->data, t->type, cols, rows, bytes};
+  }
+  Tensor Get(const std::string& name, unsigned cols, unsigned rows) {
+    auto t = Find(name, cols, rows);
+    device.Add(t);
+    return t;
   }
   Tensor Norm(const std::string& name, unsigned cols) {
     auto t = Get(name, cols, 1);
@@ -109,25 +124,18 @@ std::unique_ptr<Vision> Vision::Load(const std::string& path) {
   // Static images repeat their frame twice. Add the two temporal slices of
   // the patchifier in F32, retaining their exact stored F16 values.
   std::vector<float> patch(1024 * 768), row(768), second(768);
-  const auto* p0 = r.FindTensor("v.patch_embd.weight");
-  const auto* p1 = r.FindTensor("v.patch_embd.weight.1");
-  if (!p0 || !p1)
-    throw std::runtime_error("missing temporal patchifier slices");
-  auto p = m.Get("v.patch_embd.weight", 768, 1024);
-  auto pnext = m.Get("v.patch_embd.weight.1", 768, 1024);
-  p.data = p0->data;
-  pnext.data = p1->data;
+  const auto p = m.Find("v.patch_embd.weight", 768, 1024);
+  const auto pnext = m.Find("v.patch_embd.weight.1", 768, 1024);
   for (int i = 0; i < 1024; ++i) {
     lfm3::DecodeRow(p, i, row);
     lfm3::DecodeRow(pnext, i, second);
     for (int j = 0; j < 768; ++j)
       patch[i * 768 + j] = row[j] + second[j];
   }
-  m.weights.emplace_back(patch.size() * 4);
-  Check(hipMemcpy(m.weights.back().data, patch.data(), patch.size() * 4,
+  m.patch_weights = Buffer(patch.size() * 4);
+  Check(hipMemcpy(m.patch_weights.data, patch.data(), patch.size() * 4,
                   hipMemcpyHostToDevice));
-  m.patch = {m.weights.back().data, GgmlType::kF32, 768, 1024,
-             patch.size() * 4};
+  m.patch = {m.patch_weights.data, GgmlType::kF32, 768, 1024, patch.size() * 4};
   m.norm = m.Norm("v.embedding_norm.weight", 1024);
   for (int i = 0; i < 14; ++i) {
     const auto prefix = "v.blk." + std::to_string(i) + ".";
@@ -159,6 +167,8 @@ std::unique_ptr<Vision> Vision::Load(const std::string& path) {
   m.bias1 = m.Norm("mm.0.bias", 4096);
   m.proj2 = m.Get("mm.2.weight", 4096, 2048);
   m.bias2 = m.Norm("mm.2.bias", 2048);
+  m.device.Upload(r);
+  m.Visit([&](Tensor& t) { m.device.Resolve(t); });
   return v;
 }
 std::shared_ptr<Vision> LoadMatchingVision(const std::string& backbone,

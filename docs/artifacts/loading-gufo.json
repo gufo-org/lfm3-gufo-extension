@@ -35,10 +35,10 @@
   "referenceName": "llama.cpp",
   "rows": {
     "default": {
-      "command": "gufo serve --port 54767 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
-      "ready_s": 4.102,
-      "ready_s_sd": null,
-      "samples": 1
+      "command": "gufo serve --port 35337 --sessions 1 llm --model LFM3-1.7B-Q8_0.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
+      "ready_s": 1.018,
+      "ready_s_sd": 0.093,
+      "samples": 3
     }
   },
   "schemaVersion": 1,
@@ -47,7 +47,7 @@
       "gufo",
       "serve",
       "--port",
-      "54767",
+      "35337",
       "--sessions",
       "1",
       "llm",

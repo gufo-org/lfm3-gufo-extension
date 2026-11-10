@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <future>
 #include <gufo/ext/component_cache_resources.hpp>
 #include <gufo/ext/gguf_identity.hpp>
 #include <gufo/ext/host_budget.hpp>
@@ -401,14 +402,21 @@ std::shared_ptr<ext::TextModelRunner> CreateLfm3TextRunner(
       *error = "LFM3 does not support speculative decoding";
     return nullptr;
   }
-  auto model = Model::Load(options.model_path, error);
-  if (!model)
-    return nullptr;
+  // The projector streams from disk beside the backbone.
+  auto loading_vision =
+      std::async(std::launch::async, lfm3_vl::LoadMatchingVision,
+                 options.model_path, options.vision_model_path);
+  auto model = Model::Load(
+      options.model_path, error,
+      options.max_context ? options.max_context : Model::kModelContext);
   std::shared_ptr<lfm3_vl::Vision> vision;
   try {
-    vision = lfm3_vl::LoadMatchingVision(options.model_path,
-                                         options.vision_model_path);
+    vision = loading_vision.get();
+    if (!model)
+      return nullptr;
   } catch (const std::exception& e) {
+    if (!model)
+      return nullptr;
     if (error)
       *error = e.what();
     return nullptr;

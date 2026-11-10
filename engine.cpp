@@ -6,12 +6,14 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <future>
+#include <mutex>
 #include <stdexcept>
-#include <unordered_map>
 #include <utility>
 
 #include "continuation_hooks.hpp"
 #include "hip/ops.hpp"
+#include "upload.hpp"
 namespace gufo::models::lfm3 {
 namespace {
 void Check(hipError_t status) {
@@ -46,6 +48,29 @@ struct Stream {
       (void)hipStreamDestroy(value);
   }
 };
+// Per-layer recurrent state: convolution history or the K/V cache.
+struct State {
+  Buffer conv, k, v;
+  std::uint32_t capacity{};
+};
+std::vector<State> AllocateStates(const Config& c, std::uint32_t ctx) {
+  std::vector<State> states;
+  states.reserve(c.layers.size());
+  for (std::size_t i = 0; i < c.layers.size(); ++i) {
+    State s;
+    if (c.layers[i] == LayerType::kConvolution)
+      s.conv = Buffer(std::size_t(c.hidden) * (c.conv_width - 1) * 4);
+    else {
+      s.capacity = c.layers[i] == LayerType::kSlidingAttention
+                       ? std::min(ctx, c.window)
+                       : ctx;
+      s.k = Buffer(std::size_t(s.capacity) * c.kv_heads[i] * c.head_dim * 2);
+      s.v = Buffer(std::size_t(s.capacity) * c.kv_heads[i] * c.head_dim * 2);
+    }
+    states.push_back(std::move(s));
+  }
+  return states;
+}
 template<class F>
 void Visit(Weights& w, F f) {
   f(w.embedding);
@@ -65,12 +90,26 @@ struct Model::Impl {
   std::unique_ptr<core::GgufReader> reader;
   std::unique_ptr<Tokenizer> tokenizer;
   Weights weights;
-  std::vector<Buffer> allocations;
+  DeviceWeights device;
+  // States allocated during loading for the first session of this context.
+  std::mutex prepared_mutex;
+  std::uint32_t prepared_context{};
+  std::vector<State> prepared;
+  std::vector<State> TakeStates(std::uint32_t ctx) {
+    {
+      std::lock_guard lock(prepared_mutex);
+      if (ctx == prepared_context && !prepared.empty()) {
+        prepared_context = 0;
+        return std::exchange(prepared, {});
+      }
+    }
+    return AllocateStates(weights.config, ctx);
+  }
 };
 Model::Model() : impl_(std::make_unique<Impl>()) {}
 Model::~Model() = default;
-std::shared_ptr<Model> Model::Load(const std::string& path,
-                                   std::string* error) {
+std::shared_ptr<Model> Model::Load(const std::string& path, std::string* error,
+                                   std::uint32_t session_context) {
   try {
     auto m = std::shared_ptr<Model>(new Model);
     m->impl_->reader = core::GgufReader::OpenFile(path, error);
@@ -79,22 +118,28 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
     auto w = Weights::Bind(*m->impl_->reader, error);
     if (!w)
       return nullptr;
+    m->impl_->weights = *w;
+    // Copy packed weights verbatim so quantization and mapped-file lifetime
+    // never depend on a session; tied embeddings share one copy. The
+    // tokenizer parses on this thread meanwhile.
+    auto& device = m->impl_->device;
+    Visit(m->impl_->weights, [&](Tensor& t) { device.Add(t); });
+    auto upload = std::async(std::launch::async,
+                             [&] { device.Upload(*m->impl_->reader); });
     m->impl_->tokenizer = Tokenizer::Load(*m->impl_->reader, error);
+    // The driver maps the first session's caches while the disk is busy.
+    const auto& c = m->impl_->weights.config;
+    if (session_context == kModelContext)
+      session_context = c.context;
+    if (m->impl_->tokenizer && session_context &&
+        session_context <= c.context) {
+      m->impl_->prepared = AllocateStates(c, session_context);
+      m->impl_->prepared_context = session_context;
+    }
+    upload.get();
     if (!m->impl_->tokenizer)
       return nullptr;
-    m->impl_->weights = *w;
-    // Tied embeddings share one allocation. Copy packed weights verbatim so
-    // quantization and mapped-file lifetime never depend on a session.
-    std::unordered_map<const void*, void*> uploaded;
-    Visit(m->impl_->weights, [&](Tensor& t) {
-      if (!uploaded.contains(t.data)) {
-        m->impl_->allocations.emplace_back(t.bytes);
-        auto* p = m->impl_->allocations.back().data;
-        Check(hipMemcpy(p, t.data, t.bytes, hipMemcpyHostToDevice));
-        uploaded[t.data] = p;
-      }
-      t.data = uploaded.at(t.data);
-    });
+    Visit(m->impl_->weights, [&](Tensor& t) { device.Resolve(t); });
     return m;
   } catch (const std::exception& e) {
     if (error)
@@ -116,10 +161,6 @@ struct Session::Impl {
   bool poisoned{}, logits_ready{};
   Buffer ids, x, z, out, p, q, k, v, gate, a, ff_gate, ff_up, logits, frontier,
       inputs, decision_groups;
-  struct State {
-    Buffer conv, k, v;
-    std::uint32_t capacity{};
-  };
   std::vector<State> states;
   Buffer quantized, row_max, split_partial, split_tickets, attention_scratch,
       frequencies, chunk_k, chunk_v;
@@ -167,20 +208,7 @@ struct Session::Impl {
                          c.theta_swa, stream.value);
     Check(hipStreamSynchronize(stream.value));
 
-    states.reserve(c.layers.size());
-    for (std::size_t i = 0; i < c.layers.size(); ++i) {
-      State s;
-      if (c.layers[i] == LayerType::kConvolution)
-        s.conv = Buffer(std::size_t(c.hidden) * (c.conv_width - 1) * 4);
-      else {
-        s.capacity = c.layers[i] == LayerType::kSlidingAttention
-                         ? std::min(ctx, c.window)
-                         : ctx;
-        s.k = Buffer(std::size_t(s.capacity) * c.kv_heads[i] * c.head_dim * 2);
-        s.v = Buffer(std::size_t(s.capacity) * c.kv_heads[i] * c.head_dim * 2);
-      }
-      states.push_back(std::move(s));
-    }
+    states = model->impl_->TakeStates(ctx);
   }
   void EnsureLogits() {
     if (logits_ready)

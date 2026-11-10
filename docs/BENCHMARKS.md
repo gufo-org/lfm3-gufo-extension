@@ -53,7 +53,7 @@ cache and verified non-resident) to HTTP readiness.
 <!-- bench:loading -->
 | LFM3 1.7B Q8_0<br>Target | Gufo ready (s) | llama.cpp ready (s) | Gain |
 | --- | ---: | ---: | ---: |
-| Q8_0 | 4.10 | TODO | TODO |
+| Q8_0 | 1.02 ± 0.09 | TODO | TODO |
 <!-- /bench -->
 
 ![Loading time](artifacts/charts/loading.svg)

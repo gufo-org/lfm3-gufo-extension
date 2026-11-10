@@ -211,3 +211,33 @@ ceiling, 8.9 ms measured) plus 184 launches with GPU-side gaps. Prefill gate/up
 projections run at about 29 effective TFLOPS (54% of the WMMA peak) with one
 FP32 FMA per accumulator and K block for the Q8 scale. The next precision lever
 would fold the Q8 scale into FP16 weights (rounding each q·d to 11 bits).
+
+## November 10 pass: model loading
+
+Cold model files (evicted from the page cache and verified non-resident) to
+HTTP readiness, Gufo `bd6b0fdd`, against extension `033a9e8`; text at 262144
+tokens of context, VL at 16384, d1 at 8192.
+
+| Model | Before (s) | After (s) |
+| --- | ---: | ---: |
+| LFM3 1.7B | 3.73–3.84 | 0.92–1.16 |
+| LFM3-VL 2B | 4.22–4.25 | 0.97 |
+| LFM3-Audio 2B (ASR) | 4.30–4.34 | 0.68 |
+| d1-Omni 2B | 4.45–4.46 | 0.73–0.77 |
+
+Every HTTP response (greedy text and VL logprobs, ASR, d1 probabilities) is
+byte-identical to the previous build: weights are still copied verbatim.
+
+| Mechanism | Decision and evidence |
+| --- | --- |
+| Tensor payloads through Gufo's `hip::WeightUpload` (16 unbuffered readers, pinned staging) instead of `hipMemcpy` from the mapping | Retained. Serial page faults read the file at about 0.6 GB/s; the readers reach 5.3 GB/s against 5.7 GB/s measured for 16 parallel `O_DIRECT` reads of this disk. Resident memory at the session phase falls from 2057 to 305 MiB. |
+| One allocation per 128 MiB of payloads, in file order, instead of one per tensor | Retained: reads start after the first segment; `hipMalloc` maps zeroed pages at about 28 GB/s regardless of threads, so later segments allocate while the disk is busy. |
+| Tokenizer parsing and the first session's K/V caches (3 GiB at 262144 tokens) allocated while the weights stream | Retained: removes 60 ms and 110 ms from the serial path. |
+| Vision and audio projectors loaded beside the backbone | Retained: VL 1.18 → 0.97 s, ASR 0.90 → 0.68 s, d1 0.86 → 0.73 s. |
+
+Remaining text readiness is about 70 ms before the extension is called, about
+110 ms of HIP initialization and staging setup, 350 ms of disk reads at the
+ceiling, and Gufo's 2 GiB RAM-cache reserve, prepared before readiness
+(about 300 ms of page population). With the file already in the page cache,
+loading takes 0.82–0.88 s against 0.80–0.95 s before: unbuffered reads skip
+the cache, as for Gufo's own models.
