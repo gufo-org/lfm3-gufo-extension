@@ -1304,9 +1304,9 @@ __launch_bounds__(256) __global__
   const int h = g * kGroup + wave % kGroup, w0 = q0 + wave / kGroup * 16;
   const int row = w0 + col, stride = kh * D;
   const bool live = row < n;
-  // Q carries the softmax scale in base-2 units before its split.
+  // Q carries the softmax scale in base-2 units before its F16 rounding.
   const float scale = rsqrtf(float(D)) * 1.44269504088896341F;
-  v16h qf[kSteps], ql[kSteps];
+  v16h qf[kSteps];
   {
     const float* qr = q + (std::size_t(live ? row : 0) * heads + h) * D;
 #pragma unroll
@@ -1323,10 +1323,6 @@ __launch_bounds__(256) __global__
         qf[s][c * 4 + 1] = static_cast<_Float16>(f.y);
         qf[s][c * 4 + 2] = static_cast<_Float16>(f.z);
         qf[s][c * 4 + 3] = static_cast<_Float16>(f.w);
-        ql[s][c * 4 + 0] = static_cast<_Float16>(f.x - float(qf[s][c * 4 + 0]));
-        ql[s][c * 4 + 1] = static_cast<_Float16>(f.y - float(qf[s][c * 4 + 1]));
-        ql[s][c * 4 + 2] = static_cast<_Float16>(f.z - float(qf[s][c * 4 + 2]));
-        ql[s][c * 4 + 3] = static_cast<_Float16>(f.w - float(qf[s][c * 4 + 3]));
       }
   }
   const int span_first = split * span, span_last = span_first + span - 1;
@@ -1392,7 +1388,6 @@ __launch_bounds__(256) __global__
 #pragma unroll
       for (int kb = 0; kb < 2; ++kb) {
         const v16h kf = Fragment(&sk[(kb * 16 + col) * kKStride + st * 16]);
-        s[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf, ql[st], s[kb]);
         s[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf, qf[st], s[kb]);
       }
     float tile_max = -INFINITY;
