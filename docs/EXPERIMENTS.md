@@ -324,3 +324,34 @@ free.
 Next: measure the NPU's DRAM-to-tile bandwidth directly, then port one LFM3
 SwiGLU block to the NPU in Loom and measure tokens per joule against the
 GPU's 898 mJ decode figure.
+
+### Why HRX decodes LFM3 14% slower
+
+HRX dispatch profile against a rocprofv3 trace of the same `gufo bench`
+(decode window, the last 40% of dispatches; rocprof adds 2-3% on HIP):
+
+| Kernel family | Calls | HIP median | HRX median | HIP total | HRX total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `Q8_0MultiGEMV` | 2,647 | 144.6 µs | 163.1 µs | 253.6 ms | 325.2 ms |
+| `Q8_0GEMV` | 2,704 | 74.5 µs | 74.9 µs | 217.6 ms | 197.2 ms |
+| `ResidualNormKernel` | 2,703 | 6.7 µs | 8.0 µs | 19.5 ms | 22.2 ms |
+| `DecodeWaves` | 607 | 9.2 µs | 14.2 µs | 6.5 ms | 8.4 ms |
+
+Decode is about 194 kernels per token and 93% GPU-busy on HRX (launch gaps
+median 3.6 µs, 7% of the window), so a decode graph would recover at most
+about 7%. The deficit is `Q8_0MultiGEMV`, 13% slower per call, while the
+single-output GEMV runs at the same speed. Ruled out, each by A/B on
+`gufo bench -p 2048 -n 128 -r 3` or a microbenchmark in
+[`artifacts/hrx/`](artifacts/hrx/):
+
+| Hypothesis | Test | Result |
+| --- | --- | --- |
+| HRX's host-upload cache state (hrx-system#2984) | rewrite every weight segment device-to-device after upload ([`rewrite-weights-probe.diff`](artifacts/hrx/rewrite-weights-probe.diff)) | tg128 95.3-96.0 against 95.8-96.5 without; HIP 111.4-112.0 either way |
+| Small grids placed on fewer compute units | 1-80 long workgroups ([`spread.hip`](artifacts/hrx/spread.hip)) | identical on both runtimes: up to 40 run in parallel on all 10 WGP slots and both shader engines |
+| Per-workgroup reads of the by-value `Projections` argument | by-value against by-pointer job tables ([`kernarg.hip`](artifacts/hrx/kernarg.hip)) | at most 4% apart on HRX, same pattern on HIP |
+| HRX's dispatch registers | `FORCE_SIMD_DIST` (`COMPUTE_RESOURCE_LIMITS` bit 23), `ORDER_MODE` | tg128 95.4-96.1 and 95.9-96.4 against 95.7-96.3 |
+
+Open: the remaining suspect is memory throughput of HRX-launched,
+bandwidth-bound kernels (the largest streaming case of `kernarg.hip` is 6%
+slower on HRX, 133.8 against 126.0 µs). Next: an instruction-level thread
+trace of `Q8_0MultiGEMV` under both runtimes.
