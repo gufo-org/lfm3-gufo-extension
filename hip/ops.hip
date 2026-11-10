@@ -301,72 +301,66 @@ __global__ void FastGEMVBlockKernel(const void* __restrict__ A,
   }
 }
 
-// Two Q8_0 rows dotted with x by one wave; row1_blocks may be null. Every
-// GEMV entry point shares this reduction order.
-__device__ __forceinline__ void Q8_0Dot2(
-    const Q8_0Block* __restrict__ row0_blocks,
-    const Q8_0Block* __restrict__ row1_blocks, const float* __restrict__ x,
-    std::size_t num_blocks, std::size_t lane_id, float& out0, float& out1) {
-  float sum0 = 0.0F;
-  float sum1 = 0.0F;
-
+// R Q8_0 rows dotted with x by one wave; trailing rows may be null. Each
+// row keeps the same reduction order however many rows a wave holds, so
+// every GEMV entry point produces the same sums.
+template<int R>
+__device__ __forceinline__ void Q8_0DotRows(const Q8_0Block* const (&rows)[R],
+                                            const float* __restrict__ x,
+                                            std::size_t num_blocks,
+                                            std::size_t lane_id,
+                                            float (&out)[R]) {
+  float sum[R] = {};
   for (std::size_t b = lane_id; b < num_blocks; b += 32) {
     const float* xb = x + (b * kQ8_0BlockSize);
-    const Q8_0Block& wblk0 = row0_blocks[b];
-    const float d0 = __half2float(wblk0.d);
-    float blk_dot0 = 0.0F;
 #pragma unroll
-    for (int i = 0; i < 32; ++i)
-      blk_dot0 += static_cast<float>(wblk0.qs[i]) * xb[i];
-    sum0 += d0 * blk_dot0;
-
-    if (row1_blocks != nullptr) {
-      const Q8_0Block& wblk1 = row1_blocks[b];
-      const float d1 = __half2float(wblk1.d);
-      float blk_dot1 = 0.0F;
+    for (int r = 0; r < R; ++r) {
+      if (r && !rows[r])
+        break;
+      const Q8_0Block& w = rows[r][b];
+      float dot = 0.0F;
 #pragma unroll
       for (int i = 0; i < 32; ++i)
-        blk_dot1 += static_cast<float>(wblk1.qs[i]) * xb[i];
-      sum1 += d1 * blk_dot1;
+        dot += static_cast<float>(w.qs[i]) * xb[i];
+      sum[r] += __half2float(w.d) * dot;
     }
   }
-
-  for (int off = 16; off > 0; off >>= 1) {
-    sum0 += __shfl_xor(sum0, off);
-    sum1 += __shfl_xor(sum1, off);
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    for (int off = 16; off > 0; off >>= 1)
+      sum[r] += __shfl_xor(sum[r], off);
+    out[r] = sum[r];
   }
-  out0 = sum0;
-  out1 = sum1;
 }
-template<std::uint32_t WavesPerBlock>
+// R consecutive rows per wave: one keeps more waves streaming at K = 2048;
+// longer rows (the FFN down projection) prefer four.
+template<std::uint32_t WavesPerBlock, int R>
 __launch_bounds__(WavesPerBlock * 32, 4) __global__
-    void Q8_0GEMVKernel_2Rows(const void* __restrict__ A,
-                              const float* __restrict__ x,
-                              float* __restrict__ y, std::size_t M,
-                              std::size_t K) {
-  const std::size_t tid = threadIdx.x;
-  const std::size_t lane_id = tid & 31u;
-  const std::size_t warp_id = tid >> 5u;
-  const std::size_t pair_idx = (blockIdx.x * WavesPerBlock) + warp_id;
-  const std::size_t m0 = pair_idx * 2;
-  const std::size_t m1 = m0 + 1;
+    void Q8_0GEMV(const void* __restrict__ A, const float* __restrict__ x,
+                  float* __restrict__ y, std::size_t M, std::size_t K) {
+  const std::size_t lane_id = threadIdx.x & 31u;
+  const std::size_t m0 =
+      ((blockIdx.x * WavesPerBlock) + (threadIdx.x >> 5u)) * R;
   if (m0 >= M)
     return;
   const std::size_t num_blocks = K / kQ8_0BlockSize;
   const auto* blocks = static_cast<const Q8_0Block*>(A);
-  float sum0, sum1;
-  Q8_0Dot2(blocks + m0 * num_blocks,
-           m1 < M ? blocks + m1 * num_blocks : nullptr, x, num_blocks, lane_id,
-           sum0, sum1);
-  if (lane_id == 0) {
-    y[m0] = sum0;
-    if (m1 < M)
-      y[m1] = sum1;
-  }
+  const Q8_0Block* rows[R];
+#pragma unroll
+  for (int r = 0; r < R; ++r)
+    rows[r] = m0 + r < M ? blocks + (m0 + r) * num_blocks : nullptr;
+  float sum[R];
+  Q8_0DotRows(rows, x, num_blocks, lane_id, sum);
+  if (lane_id == 0)
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+      if (m0 + r < M)
+        y[m0 + r] = sum[r];
 }
 // Up to four Q8_0 GEMVs of one input in a single launch, each owning a
-// contiguous range of blocks. With kSwiGLU, a wave dots row m of job 0 (gate)
-// and of job 1 (up) and writes silu(gate) * up to job 0's output.
+// contiguous range of blocks, one row per wave. With kSwiGLU, the first half
+// of a block's waves dot rows of job 0 (gate) and the second half the same
+// rows of job 1 (up); the gate waves write silu(gate) * up to job 0's output.
 template<std::uint32_t WavesPerBlock, bool kSwiGLU>
 __launch_bounds__(WavesPerBlock * 32, 4) __global__
     void Q8_0MultiGEMV(Projections jobs, const float* __restrict__ x,
@@ -375,40 +369,40 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
   for (int j = 1; j < jobs.count; ++j)
     if (int(blockIdx.x) >= jobs.first_block[j])
       job = j;
-  const std::size_t lane_id = threadIdx.x & 31u;
-  const std::size_t unit =
-      (blockIdx.x - jobs.first_block[job]) * WavesPerBlock +
-      (threadIdx.x >> 5u);
+  const std::size_t lane_id = threadIdx.x & 31u, wave = threadIdx.x >> 5u;
   const std::size_t M = jobs.job[job].rows;
   const std::size_t num_blocks = K / kQ8_0BlockSize;
-  const auto* blocks = static_cast<const Q8_0Block*>(jobs.job[job].weight);
-  float sum0, sum1;
+  float sum[1];
   if constexpr (kSwiGLU) {
-    if (unit >= M)
-      return;
-    Q8_0Dot2(
-        blocks + unit * num_blocks,
-        static_cast<const Q8_0Block*>(jobs.job[1].weight) + unit * num_blocks,
-        x, num_blocks, lane_id, sum0, sum1);
-    if (lane_id == 0) {
+    constexpr std::uint32_t kRows = WavesPerBlock / 2;
+    const std::size_t row = blockIdx.x * kRows + wave % kRows;
+    const int source = wave / kRows;
+    __shared__ float up[kRows];
+    if (row < M) {
+      const Q8_0Block* rows[1] = {
+          static_cast<const Q8_0Block*>(jobs.job[source].weight) +
+          row * num_blocks};
+      Q8_0DotRows(rows, x, num_blocks, lane_id, sum);
+      if (source && !lane_id)
+        up[wave % kRows] = sum[0];
+    }
+    __syncthreads();
+    if (!source && row < M && !lane_id) {
       // BatchedSwiGLUActivationKernel's formula.
-      const float sig_g = 1.0F / (1.0F + expf(-sum0));
-      jobs.job[0].out[unit] = (sum0 * sig_g) * sum1;
+      const float sig_g = 1.0F / (1.0F + expf(-sum[0]));
+      jobs.job[0].out[row] = (sum[0] * sig_g) * up[wave];
     }
     return;
   }
-  const std::size_t m0 = unit * 2, m1 = m0 + 1;
-  if (m0 >= M)
+  const std::size_t row =
+      (blockIdx.x - jobs.first_block[job]) * WavesPerBlock + wave;
+  if (row >= M)
     return;
-  Q8_0Dot2(blocks + m0 * num_blocks,
-           m1 < M ? blocks + m1 * num_blocks : nullptr, x, num_blocks, lane_id,
-           sum0, sum1);
-  float* y = jobs.job[job].out;
-  if (lane_id == 0) {
-    y[m0] = sum0;
-    if (m1 < M)
-      y[m1] = sum1;
-  }
+  const Q8_0Block* rows[1] = {
+      static_cast<const Q8_0Block*>(jobs.job[job].weight) + row * num_blocks};
+  Q8_0DotRows(rows, x, num_blocks, lane_id, sum);
+  if (!lane_id)
+    jobs.job[job].out[row] = sum[0];
 }
 
 template<int Offset = 16>
@@ -1744,10 +1738,16 @@ void LaunchGEMV(const void* A, core::GgmlType a_type, const float* x, float* y,
   constexpr std::uint32_t kWavesPerBlock = 4;
   constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
   if (a_type == core::GgmlType::kQ8_0) {
-    const std::size_t num_pairs = (M + 1U) / 2U;
-    const std::size_t grid = (num_pairs + kWavesPerBlock - 1U) / kWavesPerBlock;
-    Q8_0GEMVKernel_2Rows<kWavesPerBlock>
-        <<<grid, kBlockThreads, 0, stream>>>(A, x, y, M, K);
+    const auto launch = [&]<int R>() {
+      const std::size_t waves = (M + R - 1U) / R;
+      Q8_0GEMV<kWavesPerBlock, R>
+          <<<(waves + kWavesPerBlock - 1U) / kWavesPerBlock, kBlockThreads, 0,
+             stream>>>(A, x, y, M, K);
+    };
+    if (K >= 4096)
+      launch.template operator()<4>();
+    else
+      launch.template operator()<1>();
     return;
   }
   if (a_type == core::GgmlType::kBF16 && K % 8 == 0 && K < 8192) {
@@ -2010,7 +2010,7 @@ void LaunchSplit(std::span<const Output> outputs, HalfActivations split, int n,
 template<bool kSwiGLU>
 bool LaunchMultiGEMV(std::span<const Output> outputs, const float* x,
                      hipStream_t s) {
-  constexpr std::uint32_t kWaves = 4;
+  constexpr std::uint32_t kWaves = kSwiGLU ? 8 : 4;
   if (outputs.size() > Projections::kMax)
     return false;
   Projections jobs{};
@@ -2023,9 +2023,10 @@ bool LaunchMultiGEMV(std::span<const Output> outputs, const float* x,
       return false;
     jobs.job[i] = {w.data, outputs[i].out, int(w.rows)};
     jobs.first_block[i] = blocks;
-    const int units = kSwiGLU ? int(w.rows) : (int(w.rows) + 1) / 2;
+    // Waves per row block: a SwiGLU block pairs gate and up waves.
+    const int per = kSwiGLU ? kWaves / 2 : kWaves;
     if (!kSwiGLU || i == 0)
-      blocks += (units + kWaves - 1) / kWaves;
+      blocks += (int(w.rows) + per - 1) / per;
   }
   if (kSwiGLU)
     jobs.count = 1;
