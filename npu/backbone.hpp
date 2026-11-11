@@ -16,10 +16,13 @@
 
 namespace gufo::models::lfm3::npu {
 
-// Recurrent state of one sequence: convolution history and the K/V cache.
+// Recurrent state of one sequence, laid out like the HIP engine's: FP32
+// convolution history [channel][width - 1] and F16 K/V rings
+// [capacity][kv heads][head dim].
 struct State {
   struct Layer {
-    std::vector<float> conv, k, v;
+    std::vector<float> conv;
+    std::vector<_Float16> k, v;
     std::uint32_t capacity{};
   };
   std::vector<Layer> layers;
@@ -48,6 +51,8 @@ class Backbone {
   // each row with Row::logits set, in row order.
   void Forward(std::span<const float> inputs, std::span<const Row> rows,
                std::span<float> hidden, std::span<float> logits);
+  // Vocabulary logits of final-normed hidden rows (n <= kRows).
+  void Head(std::span<const float> hidden, std::uint32_t n, std::span<float> logits);
   const Config& config() const;
 
   static constexpr std::uint32_t kRows = 8;

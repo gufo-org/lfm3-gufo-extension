@@ -27,6 +27,10 @@ public:
                                          std::string* error = nullptr);
   const Config& config() const;
   const Tokenizer& tokenizer() const;
+  // The backbone runs on the XDNA NPU when GUFO_LFM3_DEVICE=npu at load.
+  // NPU sessions keep their state in host memory: DeviceHidden and
+  // ContinuationData return host pointers and DeviceStream is null.
+  bool OnNpu() const;
 
 private:
   Model();
@@ -112,6 +116,8 @@ public:
   void* ContinuationData(ContinuationTensor tensor,
                          std::size_t layer = 0) const;
   std::uint32_t RingCapacity(std::size_t layer) const;
+  // Whether this session's state lives in host memory (NPU backbone).
+  bool HostState() const { return npu_ != nullptr; }
   // False after a device error, until Reset.
   bool IsCoherent() const;
   // Completes the frontier's logits on this session's stream.
@@ -122,6 +128,8 @@ public:
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  struct Npu;
+  std::unique_ptr<Npu> npu_;
   ContinuationHooks* hooks_{};
   Session(std::shared_ptr<Model> model, std::uint32_t context);
   friend class Model;

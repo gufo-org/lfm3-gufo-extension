@@ -59,6 +59,7 @@ gufo_extension_target(
     engine.cpp
     upload.cpp
   LINK_LIBRARIES
+    gufo_lfm3_npu
     gufo_lfm3
     gufo_ext_runtime
     hip::host

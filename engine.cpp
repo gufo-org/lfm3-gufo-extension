@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <mutex>
@@ -13,6 +14,7 @@
 
 #include "continuation_hooks.hpp"
 #include "hip/ops.hpp"
+#include "npu/backbone.hpp"
 #include "upload.hpp"
 namespace gufo::models::lfm3 {
 namespace {
@@ -88,6 +90,7 @@ void Visit(Weights& w, F f) {
 }  // namespace
 struct Model::Impl {
   std::unique_ptr<core::GgufReader> reader;
+  std::unique_ptr<npu::Backbone> npu;
   std::unique_ptr<Tokenizer> tokenizer;
   Weights weights;
   DeviceWeights device;
@@ -119,6 +122,17 @@ std::shared_ptr<Model> Model::Load(const std::string& path, std::string* error,
     if (!w)
       return nullptr;
     m->impl_->weights = *w;
+    if (const char* device = std::getenv("GUFO_LFM3_DEVICE");
+        device && std::string_view(device) == "npu") {
+      // Weights stay in the mapping; the NPU holds encoded projections.
+      m->impl_->tokenizer = Tokenizer::Load(*m->impl_->reader, error);
+      if (!m->impl_->tokenizer)
+        return nullptr;
+      m->impl_->npu = npu::Backbone::Load(m->impl_->weights, error);
+      if (!m->impl_->npu)
+        return nullptr;
+      return m;
+    }
     // Copy packed weights verbatim so quantization and mapped-file lifetime
     // never depend on a session; tied embeddings share one copy. The
     // tokenizer parses on this thread meanwhile.
@@ -152,6 +166,9 @@ const Config& Model::config() const {
 }
 const Tokenizer& Model::tokenizer() const {
   return *impl_->tokenizer;
+}
+bool Model::OnNpu() const {
+  return impl_->npu != nullptr;
 }
 struct Session::Impl {
   static constexpr std::size_t kChunk = Session::kPrefillChunk;
@@ -468,8 +485,117 @@ struct Session::Impl {
       }
   }
 };
-Session::Session(std::shared_ptr<Model> m, std::uint32_t context)
-    : impl_(std::make_unique<Impl>(std::move(m), context)) {}
+
+// NPU sessions: host state advanced by the shared npu::Backbone.
+struct Session::Npu {
+  std::shared_ptr<Model> model;
+  npu::State state;
+  std::uint32_t context;
+  std::vector<float> logits, frontier;
+  bool logits_ready{}, poisoned{};
+
+  Npu(std::shared_ptr<Model> m, std::uint32_t ctx)
+      : model(std::move(m)), context(ctx) {
+    const auto& c = model->config();
+    state = model->impl_->npu->NewState(ctx);
+    logits.assign(c.vocab, 0.0f);
+    frontier.assign(c.hidden, 0.0f);
+  }
+  npu::Backbone& backbone() const { return *model->impl_->npu; }
+  void Require(std::size_t n, std::span<float> out) const {
+    const auto& c = model->config();
+    if (c.decision)
+      throw std::invalid_argument("use the decision API for d1 models");
+    if (poisoned)
+      throw std::runtime_error("LFM3 session requires Reset after a device error");
+    if (!n || n > context - state.position ||
+        (!out.empty() && out.size() != c.vocab))
+      throw std::invalid_argument("invalid LFM3 input/logit count or context exhausted");
+  }
+  // Advances host rows; computes logits of the last row when asked.
+  void Run(std::span<const float> rows, bool want_logits) {
+    const auto H = model->config().hidden;
+    const std::size_t n = rows.size() / H;
+    std::vector<npu::Row> spec(n);
+    for (std::size_t i = 0; i < n; ++i)
+      spec[i] = {&state, state.position + std::uint32_t(i), want_logits && i + 1 == n};
+    std::vector<float> hidden(n * H);
+    try {
+      backbone().Forward(rows, spec, hidden, want_logits ? std::span(logits) : std::span<float>{});
+    } catch (...) {
+      poisoned = true;
+      throw;
+    }
+    std::copy(hidden.end() - H, hidden.end(), frontier.begin());
+    logits_ready = want_logits;
+  }
+  void RunTokens(std::span<const std::uint32_t> tokens, bool want_logits) {
+    const auto H = model->config().hidden;
+    for (std::size_t off = 0; off < tokens.size(); off += Session::kPrefillChunk) {
+      const auto n = std::min(Session::kPrefillChunk, tokens.size() - off);
+      std::vector<float> rows(n * H);
+      for (std::size_t i = 0; i < n; ++i)
+        backbone().Embed(tokens[off + i], std::span(rows).subspan(i * H, H));
+      Run(rows, want_logits && off + n == tokens.size());
+    }
+  }
+  void EnsureLogits() {
+    if (logits_ready || !state.position)
+      return;
+    backbone().Head(frontier, 1, logits);
+    logits_ready = true;
+  }
+  static void Batch(std::span<Session* const> sessions,
+                    std::span<const std::uint32_t> tokens,
+                    std::span<const float* const> inputs, bool want_logits) {
+    if (sessions.empty() || sessions.size() > kMaxBatch || tokens.size() != sessions.size())
+      throw std::invalid_argument("invalid LFM3 decode batch shape");
+    auto& front = *sessions.front()->npu_;
+    const auto& c = front.model->config();
+    const auto H = c.hidden;
+    std::vector<float> rows(sessions.size() * H), hidden(rows.size()),
+        logits(want_logits ? sessions.size() * c.vocab : 0);
+    std::vector<npu::Row> spec(sessions.size());
+    for (std::size_t i = 0; i < sessions.size(); ++i) {
+      auto* session = sessions[i];
+      if (!session || !session->npu_ ||
+          std::find(sessions.begin(), sessions.begin() + i, session) != sessions.begin() + i)
+        throw std::invalid_argument("duplicate, null or non-NPU LFM3 batch session");
+      auto& s = *session->npu_;
+      if (s.poisoned || s.state.position >= s.context || s.model != front.model ||
+          (!(inputs.size() > i && inputs[i]) && tokens[i] >= c.vocab))
+        throw std::invalid_argument("incompatible LFM3 batch session");
+      auto row = std::span(rows).subspan(i * H, H);
+      if (inputs.size() > i && inputs[i])
+        std::copy(inputs[i], inputs[i] + H, row.begin());
+      else
+        front.backbone().Embed(tokens[i], row);
+      spec[i] = {&s.state, s.state.position, want_logits};
+      if (session->hooks_)
+        session->hooks_->BeforeWrite(s.state.position, s.state.position + 1);
+    }
+    try {
+      front.backbone().Forward(rows, spec, hidden, logits);
+    } catch (...) {
+      for (auto* session : sessions)
+        session->npu_->poisoned = true;
+      throw;
+    }
+    for (std::size_t i = 0; i < sessions.size(); ++i) {
+      auto& s = *sessions[i]->npu_;
+      std::copy(hidden.begin() + i * H, hidden.begin() + (i + 1) * H, s.frontier.begin());
+      if (want_logits)
+        std::copy(logits.begin() + i * c.vocab, logits.begin() + (i + 1) * c.vocab, s.logits.begin());
+      s.logits_ready = want_logits;
+    }
+  }
+};
+Session::Session(std::shared_ptr<Model> m, std::uint32_t context) {
+  if (m->OnNpu())
+    npu_ = std::make_unique<Npu>(std::move(m), context);
+  else
+    impl_ = std::make_unique<Impl>(std::move(m), context);
+}
 Session::~Session() {
   if (impl_)
     (void)hipStreamSynchronize(impl_->stream.value);
@@ -493,6 +619,11 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t context,
 bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
                               std::span<const float> embeddings,
                               std::span<float> logits, std::string* error) {
+  if (npu_) {
+    if (error)
+      *error = "d1 decisions are not yet supported on the NPU";
+    return false;
+  }
   // Preserve the original full-vocabulary single-slot path for callers
   // requiring the existing d1 decision probabilities bit for bit.
   try {
@@ -530,6 +661,11 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
                               std::span<const std::uint32_t> positions,
                               std::span<const std::uint32_t> vocabulary,
                               std::span<float> logits, std::string* error) {
+  if (npu_) {
+    if (error)
+      *error = "d1 decisions are not yet supported on the NPU";
+    return false;
+  }
   try {
     const auto& c = impl_->model->config();
     const auto columns = vocabulary.empty() ? c.vocab : vocabulary.size();
@@ -630,6 +766,25 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
 }
 bool Session::Forward(std::span<const std::uint32_t> tokens,
                       std::span<float> logits, std::string* error) {
+  if (npu_) {
+    try {
+      auto& n = *npu_;
+      n.Require(tokens.size(), logits);
+      for (auto t : tokens)
+        if (t >= n.model->config().vocab)
+          throw std::invalid_argument("LFM3 token out of range");
+      if (hooks_)
+        hooks_->BeforeWrite(n.state.position, n.state.position + std::uint32_t(tokens.size()));
+      n.RunTokens(tokens, !logits.empty());
+      if (!logits.empty())
+        std::copy(n.logits.begin(), n.logits.end(), logits.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   try {
     const auto& c = impl_->model->config();
     if (c.decision)
@@ -670,6 +825,29 @@ bool Session::Forward(std::span<const std::uint32_t> tokens,
 }
 bool Session::ForwardEmbeddings(std::span<const float> rows, bool on_device,
                                 std::span<float> logits, std::string* error) {
+  if (npu_) {
+    // NPU sessions take every row from host memory.
+    try {
+      auto& n = *npu_;
+      const auto H = n.model->config().hidden;
+      if (rows.size() % H)
+        throw std::invalid_argument("LFM3 embedding rows must be whole");
+      n.Require(rows.size() / H, logits);
+      if (hooks_)
+        hooks_->BeforeWrite(n.state.position, n.state.position + std::uint32_t(rows.size() / H));
+      for (std::size_t off = 0; off < rows.size(); off += kPrefillChunk * H) {
+        const auto count = std::min(kPrefillChunk * H, rows.size() - off);
+        n.Run(rows.subspan(off, count), !logits.empty() && off + count == rows.size());
+      }
+      if (!logits.empty())
+        std::copy(n.logits.begin(), n.logits.end(), logits.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   try {
     const auto& c = impl_->model->config();
     if (c.decision)
@@ -706,6 +884,41 @@ bool Session::ForwardEmbeddings(std::span<const float> rows, bool on_device,
 }
 bool Session::ForwardInputs(std::span<const Input> inputs,
                             std::span<float> logits, std::string* error) {
+  if (npu_) {
+    try {
+      auto& n = *npu_;
+      const auto& c = n.model->config();
+      const std::size_t H = c.hidden;
+      std::vector<float> rows;
+      for (const auto& input : inputs) {
+        if (!input.tokens.empty() && !input.rows.empty())
+          throw std::invalid_argument("an LFM3 input run is tokens or rows");
+        if (input.rows.size() % H)
+          throw std::invalid_argument("LFM3 embedding rows must be whole");
+        for (auto t : input.tokens) {
+          if (t >= c.vocab)
+            throw std::invalid_argument("LFM3 token out of range");
+          rows.resize(rows.size() + H);
+          n.backbone().Embed(t, std::span(rows).subspan(rows.size() - H, H));
+        }
+        rows.insert(rows.end(), input.rows.begin(), input.rows.end());
+      }
+      n.Require(rows.size() / H, logits);
+      if (hooks_)
+        hooks_->BeforeWrite(n.state.position, n.state.position + std::uint32_t(rows.size() / H));
+      for (std::size_t off = 0; off < rows.size(); off += kPrefillChunk * H) {
+        const auto count = std::min(kPrefillChunk * H, rows.size() - off);
+        n.Run(std::span(rows).subspan(off, count), !logits.empty() && off + count == rows.size());
+      }
+      if (!logits.empty())
+        std::copy(n.logits.begin(), n.logits.end(), logits.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   try {
     auto& d = *impl_;
     const auto& w = d.model->impl_->weights;
@@ -794,6 +1007,15 @@ bool Session::ForwardInputs(std::span<const Input> inputs,
   }
 }
 bool Session::ReadHidden(std::span<float> hidden, std::string* error) const {
+  if (npu_) {
+    if (npu_->poisoned || !npu_->state.position || hidden.size() != npu_->frontier.size()) {
+      if (error)
+        *error = "invalid LFM3 hidden frontier";
+      return false;
+    }
+    std::copy(npu_->frontier.begin(), npu_->frontier.end(), hidden.begin());
+    return true;
+  }
   try {
     if (impl_->poisoned || !impl_->position ||
         hidden.size() != impl_->model->config().hidden)
@@ -808,15 +1030,32 @@ bool Session::ReadHidden(std::span<float> hidden, std::string* error) const {
   }
 }
 const float* Session::DeviceHidden() const {
-  return impl_->frontier.floats();
+  return npu_ ? npu_->frontier.data() : impl_->frontier.floats();
 }
 void* Session::DeviceStream() const {
-  return impl_->stream.value;
+  return npu_ ? nullptr : impl_->stream.value;
 }
 bool Session::ForwardBatch(std::span<Session* const> sessions,
                            std::span<const std::uint32_t> tokens,
                            std::span<std::span<float>> outputs,
                            std::string* error) {
+  if (!sessions.empty() && sessions.front() && sessions.front()->npu_) {
+    try {
+      if (outputs.size() != sessions.size())
+        throw std::invalid_argument("invalid LFM3 decode batch shape");
+      for (std::size_t i = 0; i < outputs.size(); ++i)
+        if (outputs[i].size() != sessions.front()->npu_->model->config().vocab)
+          throw std::invalid_argument("invalid LFM3 batch logits");
+      Npu::Batch(sessions, tokens, {}, true);
+      for (std::size_t i = 0; i < sessions.size(); ++i)
+        std::copy(sessions[i]->npu_->logits.begin(), sessions[i]->npu_->logits.end(), outputs[i].begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   try {
     if (sessions.empty() || sessions.size() > kMaxBatch ||
         tokens.size() != sessions.size() || outputs.size() != sessions.size())
@@ -861,6 +1100,18 @@ bool Session::ForwardBatchInputs(std::span<Session* const> sessions,
                                  std::span<const std::uint32_t> tokens,
                                  std::span<const float* const> rows,
                                  bool logits, std::string* error) {
+  if (!sessions.empty() && sessions.front() && sessions.front()->npu_) {
+    try {
+      if (rows.size() != sessions.size())
+        throw std::invalid_argument("invalid LFM3 decode batch shape");
+      Npu::Batch(sessions, tokens, rows, logits);
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   try {
     if (sessions.empty() || sessions.size() > kMaxBatch ||
         tokens.size() != sessions.size() || rows.size() != sessions.size())
@@ -915,6 +1166,15 @@ bool Session::ForwardBatchInputs(std::span<Session* const> sessions,
   }
 }
 bool Session::Reset(std::string* error) {
+  if (npu_) {
+    if (hooks_)
+      hooks_->BeforeReset();
+    npu_->state.Reset();
+    std::fill(npu_->frontier.begin(), npu_->frontier.end(), 0.0f);
+    npu_->logits_ready = false;
+    npu_->poisoned = false;
+    return true;
+  }
   try {
     if (hooks_)
       hooks_->BeforeReset();
@@ -937,13 +1197,29 @@ bool Session::Reset(std::string* error) {
   }
 }
 std::uint32_t Session::Position() const {
-  return impl_->position;
+  return npu_ ? npu_->state.position : impl_->position;
 }
 void Session::SetContinuationHooks(ContinuationHooks* hooks) {
   hooks_ = hooks;
 }
 void* Session::ContinuationData(ContinuationTensor tensor,
                                 std::size_t layer) const {
+  if (npu_) {
+    auto& n = *npu_;
+    switch (tensor) {
+      case ContinuationTensor::kLogits:
+        return n.logits.data();
+      case ContinuationTensor::kFrontier:
+        return n.frontier.data();
+      case ContinuationTensor::kConvolution:
+        return n.state.layers[layer].conv.data();
+      case ContinuationTensor::kKey:
+        return n.state.layers[layer].k.data();
+      case ContinuationTensor::kValue:
+        return n.state.layers[layer].v.data();
+    }
+    return nullptr;
+  }
   switch (tensor) {
     case ContinuationTensor::kLogits:
       return impl_->logits.data;
@@ -959,19 +1235,31 @@ void* Session::ContinuationData(ContinuationTensor tensor,
   return nullptr;
 }
 std::uint32_t Session::RingCapacity(std::size_t layer) const {
-  return impl_->states[layer].capacity;
+  return npu_ ? npu_->state.layers[layer].capacity : impl_->states[layer].capacity;
 }
 bool Session::IsCoherent() const {
-  return !impl_->poisoned;
+  return npu_ ? !npu_->poisoned : !impl_->poisoned;
 }
 void Session::PrepareLogits() {
+  if (npu_)
+    return npu_->EnsureLogits();
   impl_->EnsureLogits();
 }
 void Session::BeginRestore() {
+  if (npu_) {
+    npu_->poisoned = true;
+    return;
+  }
   Check(hipStreamSynchronize(impl_->stream.value));
   impl_->poisoned = true;
 }
 void Session::FinishRestore(std::uint32_t position) {
+  if (npu_) {
+    npu_->state.position = position;
+    npu_->logits_ready = true;
+    npu_->poisoned = false;
+    return;
+  }
   impl_->position = position;
   impl_->logits_ready = true;
   impl_->poisoned = false;
@@ -1024,9 +1312,24 @@ std::size_t StateBytes(const Config& c, std::uint32_t position) {
 }
 }  // namespace
 std::size_t Session::SnapshotBytes() const {
-  return StateBytes(impl_->model->config(), impl_->position);
+  return npu_ ? StateBytes(npu_->model->config(), npu_->state.position)
+              : StateBytes(impl_->model->config(), impl_->position);
 }
 bool Session::ReadLogits(std::span<float> output, std::string* error) const {
+  if (npu_) {
+    try {
+      auto& n = *npu_;
+      if (n.poisoned || !n.state.position || output.size() != n.logits.size())
+        throw std::invalid_argument("invalid LFM3 logit frontier");
+      n.EnsureLogits();
+      std::copy(n.logits.begin(), n.logits.end(), output.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   try {
     const auto& c = impl_->model->config();
     if (impl_->poisoned || !impl_->position || output.size() != c.vocab)
@@ -1042,6 +1345,42 @@ bool Session::ReadLogits(std::span<float> output, std::string* error) const {
   }
 }
 std::vector<std::uint8_t> Session::SaveSnapshot() const {
+  if (npu_) {
+    auto& n = *npu_;
+    if (n.poisoned)
+      throw std::runtime_error("cannot snapshot a poisoned LFM3 session");
+    const auto& c = n.model->config();
+    std::vector<std::uint8_t> bytes(SnapshotBytes());
+    const std::uint32_t header[]{kSnapshotMagic, kSnapshotVersion, n.context,
+                                 n.state.position, c.hidden, c.vocab,
+                                 std::uint32_t(c.layers.size()), ConfigSignature(c)};
+    for (std::size_t i = 0; i < 8; ++i)
+      WriteWord(bytes, i, header[i]);
+    auto offset = kSnapshotHeaderBytes;
+    auto copy = [&](const void* source, std::size_t size) {
+      if (size)
+        std::memcpy(bytes.data() + offset, source, size);
+      offset += size;
+    };
+    if (n.state.position) {
+      n.EnsureLogits();
+      copy(n.frontier.data(), n.frontier.size() * 4);
+      copy(n.logits.data(), n.logits.size() * 4);
+    } else
+      offset += (std::size_t(c.hidden) + c.vocab) * 4;
+    for (std::size_t i = 0; i < c.layers.size(); ++i) {
+      const auto& layer = n.state.layers[i];
+      if (!layer.conv.empty())
+        copy(layer.conv.data(), layer.conv.size() * 4);
+      else {
+        const auto size = std::size_t(std::min(n.state.position, layer.capacity)) *
+                          c.kv_heads[i] * c.head_dim * 2;
+        copy(layer.k.data(), size);
+        copy(layer.v.data(), size);
+      }
+    }
+    return bytes;
+  }
   if (impl_->poisoned)
     throw std::runtime_error("cannot snapshot a poisoned LFM3 session");
   const auto& c = impl_->model->config();
@@ -1091,6 +1430,41 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> bytes,
   try {
     if (hooks_)
       hooks_->BeforeRestore();
+    if (npu_) {
+      auto& n = *npu_;
+      const auto& c = n.model->config();
+      if (bytes.size() < kSnapshotHeaderBytes || ReadWord(bytes, 0) != kSnapshotMagic ||
+          ReadWord(bytes, 1) != kSnapshotVersion || ReadWord(bytes, 2) != n.context ||
+          ReadWord(bytes, 3) > n.context || ReadWord(bytes, 4) != c.hidden ||
+          ReadWord(bytes, 5) != c.vocab || ReadWord(bytes, 6) != c.layers.size() ||
+          ReadWord(bytes, 7) != ConfigSignature(c) ||
+          bytes.size() != StateBytes(c, ReadWord(bytes, 3)))
+        throw std::invalid_argument("invalid LFM3 snapshot payload");
+      const auto position = ReadWord(bytes, 3);
+      auto offset = kSnapshotHeaderBytes;
+      auto copy = [&](void* destination, std::size_t size) {
+        if (size)
+          std::memcpy(destination, bytes.data() + offset, size);
+        offset += size;
+      };
+      copy(n.frontier.data(), n.frontier.size() * 4);
+      copy(n.logits.data(), n.logits.size() * 4);
+      for (std::size_t i = 0; i < c.layers.size(); ++i) {
+        auto& layer = n.state.layers[i];
+        if (!layer.conv.empty())
+          copy(layer.conv.data(), layer.conv.size() * 4);
+        else {
+          const auto size = std::size_t(std::min(position, layer.capacity)) *
+                            c.kv_heads[i] * c.head_dim * 2;
+          copy(layer.k.data(), size);
+          copy(layer.v.data(), size);
+        }
+      }
+      n.state.position = position;
+      n.logits_ready = position != 0;
+      n.poisoned = false;
+      return true;
+    }
     const auto& c = impl_->model->config();
     // Validate the complete header and size before touching the existing state.
     if (bytes.size() < kSnapshotHeaderBytes ||

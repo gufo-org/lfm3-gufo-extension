@@ -41,8 +41,8 @@ void State::Reset() {
   position = 0;
   for (auto& l : layers) {
     std::fill(l.conv.begin(), l.conv.end(), 0.0f);
-    std::fill(l.k.begin(), l.k.end(), 0.0f);
-    std::fill(l.v.begin(), l.v.end(), 0.0f);
+    std::fill(l.k.begin(), l.k.end(), _Float16(0));
+    std::fill(l.v.begin(), l.v.end(), _Float16(0));
   }
 }
 
@@ -174,16 +174,18 @@ State Backbone::NewState(std::uint32_t context) const {
     if (c.layers[i] == LayerType::kConvolution) {
       l.conv.assign(std::size_t(c.hidden) * (c.conv_width - 1), 0.0f);
     } else {
-      // Sliding layers keep kRows extra slots so rows of one pass never
-      // overwrite keys an earlier row of the pass still attends to.
       l.capacity = c.layers[i] == LayerType::kSlidingAttention
-                       ? std::min(context, c.window + kRows)
+                       ? std::min(context, c.window)
                        : context;
-      l.k.assign(std::size_t(l.capacity) * c.kv_heads[i] * c.head_dim, 0.0f);
-      l.v.assign(l.k.size(), 0.0f);
+      l.k.assign(std::size_t(l.capacity) * c.kv_heads[i] * c.head_dim, _Float16(0));
+      l.v.assign(l.k.size(), _Float16(0));
     }
   }
   return s;
+}
+
+void Backbone::Head(std::span<const float> hidden, std::uint32_t n, std::span<float> logits) {
+  impl_->Run(impl_->head, hidden, n, logits);
 }
 
 void Backbone::Embed(std::uint32_t token, std::span<float> row) const {
@@ -244,36 +246,34 @@ void Backbone::Forward(std::span<const float> inputs, std::span<const Row> rows,
               v[h * D + i + D / 2] = b * std::cos(angle) + a * std::sin(angle);
             }
         };
-        // Normalize, rotate and store every row's K/V first; then attend.
+        // Rows advance in order: each stores its K/V, then attends. A ring
+        // of the window's size then never loses a key a later row needs.
         for (std::uint32_t r = 0; r < n; ++r) {
           float* q = &proj[std::size_t(r) * qkvg];
           float* k = q + H;
           float* v = k + KV;
+          const float* gate = q + H + 2 * KV;
           for (std::uint32_t h = 0; h < c.heads; ++h) Norm(q + h * D, D, Floats(l.q_norm), c.eps);
           for (std::uint32_t h = 0; h < kv; ++h) Norm(k + h * D, D, Floats(l.k_norm), c.eps);
           rope(q, c.heads, chunk[r].position);
           rope(k, kv, chunk[r].position);
           auto& s = chunk[r].state->layers[il];
           const std::size_t slot = chunk[r].position % s.capacity;
-          std::copy(k, k + KV, s.k.begin() + slot * KV);
-          std::copy(v, v + KV, s.v.begin() + slot * KV);
-        }
-        ::lfm3::npu::Parallel(std::size_t(n) * c.heads, [&](std::size_t b0, std::size_t b1) {
-          std::vector<float> scores;
-          for (std::size_t job = b0; job < b1; ++job) {
-            const std::uint32_t r = std::uint32_t(job / c.heads), h = std::uint32_t(job % c.heads);
-            const float* q = &proj[std::size_t(r) * qkvg] + h * D;
-            const float* gate = &proj[std::size_t(r) * qkvg] + H + 2 * KV;
-            const auto& s = chunk[r].state->layers[il];
-            const std::uint32_t pos = chunk[r].position;
-            const std::uint32_t first = swa && pos + 1 > c.window ? pos + 1 - c.window : 0;
+          for (std::uint32_t i = 0; i < KV; ++i) {
+            s.k[slot * KV + i] = static_cast<_Float16>(k[i]);
+            s.v[slot * KV + i] = static_cast<_Float16>(v[i]);
+          }
+          const std::uint32_t pos = chunk[r].position;
+          const std::uint32_t first = swa && pos + 1 > c.window ? pos + 1 - c.window : 0;
+          auto head = [&](std::uint32_t h, std::vector<float>& scores) {
+            const float* qh = q + h * D;
             const std::uint32_t kh = h / (c.heads / kv);
             scores.resize(pos + 1 - first);
             float max = -std::numeric_limits<float>::infinity();
             for (std::uint32_t t = first; t <= pos; ++t) {
-              const float* key = s.k.data() + std::size_t(t % s.capacity) * KV + kh * D;
+              const _Float16* key = s.k.data() + std::size_t(t % s.capacity) * KV + kh * D;
               float score = 0;
-              for (std::uint32_t d = 0; d < D; ++d) score += q[d] * key[d];
+              for (std::uint32_t d = 0; d < D; ++d) score += qh[d] * float(key[d]);
               scores[t - first] = score / std::sqrt(float(D));
               max = std::max(max, scores[t - first]);
             }
@@ -285,14 +285,23 @@ void Backbone::Forward(std::span<const float> inputs, std::span<const Row> rows,
             float* a = &att[std::size_t(r) * H + h * D];
             std::fill(a, a + D, 0.0f);
             for (std::uint32_t t = first; t <= pos; ++t) {
-              const float* value = s.v.data() + std::size_t(t % s.capacity) * KV + kh * D;
+              const _Float16* value = s.v.data() + std::size_t(t % s.capacity) * KV + kh * D;
               const float pr = scores[t - first] / den;
-              for (std::uint32_t d = 0; d < D; ++d) a[d] += pr * value[d];
+              for (std::uint32_t d = 0; d < D; ++d) a[d] += pr * float(value[d]);
             }
             const float g = 1 / (1 + std::exp(-gate[h]));
             for (std::uint32_t d = 0; d < D; ++d) a[d] *= g;
+          };
+          if (pos - first < 512) {
+            std::vector<float> scores;
+            for (std::uint32_t h = 0; h < c.heads; ++h) head(h, scores);
+          } else {
+            ::lfm3::npu::Parallel(c.heads, [&](std::size_t h0, std::size_t h1) {
+              std::vector<float> scores;
+              for (std::size_t h = h0; h < h1; ++h) head(std::uint32_t(h), scores);
+            });
           }
-        });
+        }
         m.Run(p.out, att, n, out);
       }
       for (std::uint32_t r = 0; r < n; ++r) {

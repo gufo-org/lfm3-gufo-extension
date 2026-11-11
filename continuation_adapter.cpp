@@ -301,10 +301,11 @@ ContinuationAdapter::Region ContinuationAdapter::PrivateRegion(
     State& state, const ContinuationComponent& component,
     std::uint32_t position) const {
   Region result;
+  const bool host_state = state.session->HostState();
   const auto add = [&](void* pointer, std::size_t offset, std::size_t bytes,
                        bool host = false) {
     if (bytes)
-      result.pieces.push_back({pointer, offset, bytes, host});
+      result.pieces.push_back({pointer, offset, bytes, host || host_state});
   };
   const auto bytes = component.descriptor.state_bytes;
   auto& session = *state.session;
@@ -487,7 +488,9 @@ cache::Completion ContinuationAdapter::CopyRowsOut(const cache::Slot& slot,
           : static_cast<std::byte*>(RowData(state, component)) + first * row;
   return Transfer(
       state, false, stream, [&](gufo::hip::TransferStream& transfer) {
-        if (!bytes.empty())
+        if (!bytes.empty() && state.session->HostState())
+          std::memcpy(bytes.data(), source, bytes.size());
+        else if (!bytes.empty())
           Check(hip::CopySnapshotToHost(bytes.data(), source, bytes.size(),
                                         transfer.Native()));
       });
@@ -514,7 +517,9 @@ cache::Completion ContinuationAdapter::CopyRowsIn(
     }
     return Transfer(
         state, true, stream, [&](gufo::hip::TransferStream& transfer) {
-          if (!bytes.empty())
+          if (!bytes.empty() && state.session->HostState())
+            std::memcpy(destination, bytes.data(), bytes.size());
+          else if (!bytes.empty())
             Check(hip::CopySnapshotToDevice(destination, bytes.data(),
                                             bytes.size(), transfer.Native()));
         });
