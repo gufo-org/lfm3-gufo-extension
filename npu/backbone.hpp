@@ -27,6 +27,10 @@ struct State {
   };
   std::vector<Layer> layers;
   std::uint32_t position{};
+  // Device-resident forward: the state's slot in the NPU pools, and whether
+  // the host copy above is older than the device's.
+  int slot{-1};
+  bool host_stale{};
   void Reset();
 };
 
@@ -55,6 +59,11 @@ class Backbone {
   void Forward(std::span<const float> inputs, std::span<const Row> rows,
                std::span<float> hidden, std::span<float> logits, bool decision = false,
                std::span<const std::int32_t> groups = {});
+  // Device-resident state: copies the state's NPU slot into its host layers
+  // (when stale), or the host layers into the slot (after a restore), or
+  // clears the slot (after Reset).
+  void SyncToHost(State& state);
+  void SyncToDevice(State& state);
   // Vocabulary logits of final-normed hidden rows (n <= kRows).
   void Head(std::span<const float> hidden, std::uint32_t n, std::span<float> logits);
   const Config& config() const;

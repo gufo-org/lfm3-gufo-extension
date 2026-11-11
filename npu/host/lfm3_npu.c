@@ -33,6 +33,7 @@
 
 typedef struct lfm3_npu_kernel_t {
   loom_run_hal_prepared_candidate_t candidate;
+  iree_hal_executable_function_t function;
   char export_name[256];
   uint32_t workgroup_count[3];
 } lfm3_npu_kernel_t;
@@ -52,6 +53,9 @@ struct lfm3_npu {
   int kernel_count;
   iree_hal_buffer_t* buffers[LFM3_NPU_MAX_BUFFERS];
   int buffer_count;
+  // Dispatches chain on one timeline: each waits for the previous value.
+  iree_hal_semaphore_t* timeline;
+  uint64_t submitted;
   char error[4096];
 };
 
@@ -158,6 +162,10 @@ int lfm3_npu_open(const char* device, lfm3_npu** out) {
     npu->runtime_ready = iree_status_is_ok(status);
   }
   if (iree_status_is_ok(status)) {
+    status = iree_hal_semaphore_create(npu->runtime.device, IREE_HAL_QUEUE_FAMILY_AFFINITY_ANY, 0,
+                                       IREE_HAL_SEMAPHORE_FLAG_DEFAULT, &npu->timeline);
+  }
+  if (iree_status_is_ok(status)) {
     const loomc_iree_hal_target_provider_t* providers[] = {
         loomc_xdna_iree_hal_target_provider(),
     };
@@ -198,6 +206,11 @@ void lfm3_npu_close(lfm3_npu* npu) {
     if (!npu->kernels[i]) continue;
     loom_run_hal_prepared_candidate_deinitialize(&npu->kernels[i]->candidate);
     free(npu->kernels[i]);
+  }
+  if (npu->timeline) {
+    iree_status_ignore(loom_run_hal_semaphore_wait(npu->timeline, npu->submitted, iree_infinite_timeout(),
+                                                   IREE_ASYNC_WAIT_FLAG_NONE));
+    iree_hal_semaphore_release(npu->timeline);
   }
   if (npu->runtime_ready) loom_run_hal_runtime_deinitialize(&npu->runtime);
   loomc_target_profile_release(npu->target_profile);
@@ -353,6 +366,10 @@ int lfm3_npu_compile(lfm3_npu* npu, const char* source, size_t source_length,
     status = loom_run_hal_prepared_candidate_prepare(
         &npu->runtime, &device_artifact, npu->allocator, &kernel->candidate);
   }
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_executable_lookup_function_by_name(
+        kernel->candidate.executable, iree_make_cstring_view(kernel->export_name), &kernel->function);
+  }
   loomc_result_release(result);
   loomc_pass_program_release(pass_program);
   loomc_module_release(module);
@@ -435,8 +452,17 @@ static iree_status_t lfm3_npu_staging(lfm3_npu* npu, uint64_t bytes,
       iree_infinite_timeout(), out);
 }
 
+static iree_status_t lfm3_npu_drain(lfm3_npu* npu) {
+  if (!npu->submitted) return iree_ok_status();
+  return loom_run_hal_semaphore_wait(npu->timeline, npu->submitted, iree_infinite_timeout(),
+                                     IREE_ASYNC_WAIT_FLAG_NONE);
+}
+
+int lfm3_npu_finish(lfm3_npu* npu) { return lfm3_npu_fail(npu, lfm3_npu_drain(npu)); }
+
 int lfm3_npu_write(lfm3_npu* npu, int id, uint64_t offset, const void* data,
                    uint64_t bytes) {
+  if (lfm3_npu_finish(npu)) return 1;
   if (id < 0 || id >= npu->buffer_count || !npu->buffers[id]) return 1;
   iree_hal_buffer_t* staging = NULL;
   iree_status_t status = lfm3_npu_staging(npu, bytes, &staging);
@@ -452,6 +478,7 @@ int lfm3_npu_write(lfm3_npu* npu, int id, uint64_t offset, const void* data,
 
 int lfm3_npu_read(lfm3_npu* npu, int id, uint64_t offset, void* data,
                   uint64_t bytes) {
+  if (lfm3_npu_finish(npu)) return 1;
   if (id < 0 || id >= npu->buffer_count || !npu->buffers[id]) return 1;
   iree_hal_buffer_t* staging = NULL;
   iree_status_t status = lfm3_npu_staging(npu, bytes, &staging);
@@ -465,39 +492,33 @@ int lfm3_npu_read(lfm3_npu* npu, int id, uint64_t offset, void* data,
   return lfm3_npu_fail(npu, status);
 }
 
-int lfm3_npu_dispatch(lfm3_npu* npu, int kernel_id, const int* buffers,
-                      int count) {
-  if (kernel_id < 0 || kernel_id >= npu->kernel_count) return 1;
+int lfm3_npu_enqueue(lfm3_npu* npu, int kernel_id, const int* buffers, int count) {
+  if (kernel_id < 0 || kernel_id >= npu->kernel_count || count > 64) return 1;
   lfm3_npu_kernel_t* kernel = npu->kernels[kernel_id];
-  iree_tooling_buffer_binding_t values[64];
-  if (count > 64) return 1;
+  iree_hal_buffer_ref_t refs[64];
   for (int i = 0; i < count; ++i) {
-    if (buffers[i] < 0 || buffers[i] >= npu->buffer_count ||
-        !npu->buffers[buffers[i]]) {
-      return lfm3_npu_fail(npu, iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                                 "bad buffer %d", buffers[i]));
+    if (buffers[i] < 0 || buffers[i] >= npu->buffer_count || !npu->buffers[buffers[i]]) {
+      return lfm3_npu_fail(npu, iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "bad buffer %d", buffers[i]));
     }
     iree_hal_buffer_t* buffer = npu->buffers[buffers[i]];
-    values[i] = (iree_tooling_buffer_binding_t){
-        .kind = IREE_TOOLING_BUFFER_BINDING_KIND_STORAGE_BUFFER,
-        .buffer = buffer,
-        .byte_offset = 0,
-        .byte_length = iree_hal_buffer_byte_length(buffer),
-    };
+    refs[i] = iree_hal_make_buffer_ref(buffer, 0, iree_hal_buffer_byte_length(buffer));
   }
-  const loom_run_hal_binding_list_t list = {
-      .host_allocator = npu->allocator,
-      .count = (iree_host_size_t)count,
-      .capacity = (iree_host_size_t)count,
-      .values = values,
-  };
-  loom_run_hal_invocation_options_t options;
-  loom_run_hal_invocation_options_initialize(&options);
-  options.function_name = iree_make_cstring_view(kernel->export_name);
-  memcpy(options.workgroup_count, kernel->workgroup_count,
-         sizeof(options.workgroup_count));
-  return lfm3_npu_fail(
-      npu, loom_run_hal_dispatch(npu->runtime.device,
-                                 npu->runtime.dispatch_queue,
-                                 kernel->candidate.executable, &list, &options));
+  const iree_hal_buffer_ref_list_t bindings = {.count = (iree_host_size_t)count, .values = refs};
+  uint64_t wait_value = npu->submitted, signal_value = npu->submitted + 1;
+  const iree_hal_semaphore_list_t waits = {
+      .count = wait_value ? 1 : 0, .semaphores = &npu->timeline, .payload_values = &wait_value};
+  const iree_hal_semaphore_list_t signals = {
+      .count = 1, .semaphores = &npu->timeline, .payload_values = &signal_value};
+  const iree_hal_dispatch_config_t config = iree_hal_make_static_dispatch_config(
+      kernel->workgroup_count[0], kernel->workgroup_count[1], kernel->workgroup_count[2]);
+  iree_status_t status = iree_hal_queue_dispatch(
+      npu->runtime.dispatch_queue, waits, signals, kernel->candidate.executable, kernel->function, config,
+      iree_const_byte_span_empty(), bindings, NULL, IREE_HAL_DISPATCH_FLAG_NONE);
+  if (iree_status_is_ok(status)) npu->submitted = signal_value;
+  return lfm3_npu_fail(npu, status);
+}
+
+int lfm3_npu_dispatch(lfm3_npu* npu, int kernel_id, const int* buffers, int count) {
+  if (lfm3_npu_enqueue(npu, kernel_id, buffers, count)) return 1;
+  return lfm3_npu_finish(npu);
 }

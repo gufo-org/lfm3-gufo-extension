@@ -30,6 +30,7 @@ int main(int argc, char** argv) {
   std::printf("small kernel repeated:   %8.1f us\n", time([&] { npu.Dispatch(a, bind); }, 200));
   std::printf("stream kernel repeated:  %8.1f us\n", time([&] { npu.Dispatch(b, bind); }, 50));
   std::printf("alternating small/stream:%8.1f us per pair\n", time([&] { npu.Dispatch(a, bind); npu.Dispatch(b, bind); }, 50));
+  std::printf("small enqueued x50:       %8.1f us each\n", time([&] { for (int i = 0; i < 50; ++i) npu.Enqueue(a, bind); npu.Finish(); }, 4) / 50);
   std::vector<float> y(256);
   std::printf("read 1 KiB:              %8.1f us\n", time([&] { npu.Read(by, 0, y.data(), 1024); }, 200));
   std::printf("write 4 KiB:             %8.1f us\n", time([&] { npu.Write(bx, 0, x.data(), 4096); }, 200));

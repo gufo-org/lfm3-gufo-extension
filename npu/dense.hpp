@@ -12,6 +12,10 @@
 #include "../weights.hpp"
 #include "program.hpp"
 
+namespace lfm3::npu {
+class Runtime;
+}
+
 namespace gufo::models::lfm3::npu {
 
 class Dense {
@@ -32,6 +36,13 @@ class Dense {
   Matrix Upload(std::span<const Tensor* const> tensors);
   // y[r][m] = W x[r] for `rows` rows of x (k floats each); y is rows x m.
   void Run(const Matrix& w, std::span<const float> x, std::uint32_t rows, std::span<float> y);
+
+  // Device-resident use: the runtime, and y = W x for `blocks` blocks of
+  // eight rows already in the projection layouts (xb blocked BF16, y Yb/Yp).
+  ::lfm3::npu::Runtime& runtime();
+  void Enqueue(const Matrix& w, int xb, int y, std::uint32_t blocks);
+  // Allocates a zeroed device buffer.
+  int Zeros(std::uint64_t bytes);
 
   ~Dense();
 

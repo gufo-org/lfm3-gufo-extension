@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 
@@ -54,7 +55,12 @@ int main(int argc, char** argv) {
       backbone->Embed(tokens[i], std::span(rows).subspan(i * H, H));
       spec[i] = {&state, std::uint32_t(i), i + 1 == tokens.size()};
     }
-    backbone->Forward(rows, spec, {}, logits);
+    std::vector<float> hid(rows.size());
+    backbone->Forward(rows, spec, hid, std::getenv("GUFO_LFM3_NPU_DEBUG_LAYERS") ? std::span<float>{} : std::span(logits));
+    if (std::getenv("GUFO_LFM3_NPU_DEBUG_LAYERS")) {
+      std::ofstream h(std::string(argv[3]) + ".hidden", std::ios::binary);
+      h.write(reinterpret_cast<const char*>(hid.data()), hid.size() * 4);
+    }
   } else {
 #if defined(ENGINE_ENABLE_HIP)
     auto model = Model::Load(argv[1], &error);

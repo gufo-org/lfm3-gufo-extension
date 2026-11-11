@@ -16,7 +16,7 @@ extern "C" {
 
 typedef struct lfm3_npu lfm3_npu;
 
-#define LFM3_NPU_ABI_VERSION 1
+#define LFM3_NPU_ABI_VERSION 2
 
 LFM3_NPU_EXPORT int lfm3_npu_abi_version(void);
 // |device| is an HRX device URI such as "xdna://0?columns=8".
@@ -37,6 +37,11 @@ LFM3_NPU_EXPORT int lfm3_npu_write(lfm3_npu* npu, int buffer, uint64_t offset, c
 LFM3_NPU_EXPORT int lfm3_npu_read(lfm3_npu* npu, int buffer, uint64_t offset, void* data,
                   uint64_t bytes);
 
+// Submits |kernel| with whole-buffer bindings in ordinal order after every
+// earlier submission, without waiting. Reads and writes wait for it.
+LFM3_NPU_EXPORT int lfm3_npu_enqueue(lfm3_npu* npu, int kernel, const int* buffers, int count);
+// Waits for every submitted dispatch.
+LFM3_NPU_EXPORT int lfm3_npu_finish(lfm3_npu* npu);
 // Runs |kernel| with whole-buffer bindings in ordinal order and waits.
 LFM3_NPU_EXPORT int lfm3_npu_dispatch(lfm3_npu* npu, int kernel, const int* buffers, int count);
 

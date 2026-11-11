@@ -17,6 +17,8 @@ struct Runtime::Api {
   int (*write)(lfm3_npu*, int, uint64_t, const void*, uint64_t);
   int (*read)(lfm3_npu*, int, uint64_t, void*, uint64_t);
   int (*dispatch)(lfm3_npu*, int, const int*, int);
+  int (*enqueue)(lfm3_npu*, int, const int*, int);
+  int (*finish)(lfm3_npu*);
 };
 
 namespace {
@@ -45,6 +47,8 @@ Runtime::Runtime(std::string library, std::string device) {
   Bind(handle_, "lfm3_npu_write", api_->write);
   Bind(handle_, "lfm3_npu_read", api_->read);
   Bind(handle_, "lfm3_npu_dispatch", api_->dispatch);
+  Bind(handle_, "lfm3_npu_enqueue", api_->enqueue);
+  Bind(handle_, "lfm3_npu_finish", api_->finish);
   if (api_->abi_version() != LFM3_NPU_ABI_VERSION) {
     throw std::runtime_error("liblfm3_npu: ABI version mismatch");
   }
@@ -90,5 +94,11 @@ void Runtime::Read(int buffer, std::uint64_t offset, void* data, std::uint64_t b
 void Runtime::Dispatch(int kernel, std::span<const int> buffers) {
   Check(api_->dispatch(npu_, kernel, buffers.data(), static_cast<int>(buffers.size())), "dispatch");
 }
+
+void Runtime::Enqueue(int kernel, std::span<const int> buffers) {
+  Check(api_->enqueue(npu_, kernel, buffers.data(), static_cast<int>(buffers.size())), "enqueue");
+}
+
+void Runtime::Finish() { Check(api_->finish(npu_), "finish"); }
 
 }  // namespace lfm3::npu

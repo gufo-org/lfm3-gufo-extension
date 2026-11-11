@@ -28,6 +28,9 @@ class Runtime {
   void Write(int buffer, std::uint64_t offset, const void* data, std::uint64_t bytes);
   void Read(int buffer, std::uint64_t offset, void* data, std::uint64_t bytes);
   void Dispatch(int kernel, std::span<const int> buffers);
+  // Queues behind earlier dispatches; Finish, Read and Write wait.
+  void Enqueue(int kernel, std::span<const int> buffers);
+  void Finish();
 
   template <typename T>
   int Upload(std::span<const T> values) {

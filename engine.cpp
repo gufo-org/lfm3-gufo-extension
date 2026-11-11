@@ -550,6 +550,7 @@ struct Session::Npu {
       if (id >= c.vocab)
         throw std::invalid_argument("d1 token out of range");
     state.Reset();
+    backbone().SyncToDevice(state);
     std::vector<float> rows(tokens.size() * H), hidden(rows.size());
     if (!embeddings.empty())
       std::copy(embeddings.begin(), embeddings.end(), rows.begin());
@@ -1240,6 +1241,7 @@ bool Session::Reset(std::string* error) {
     if (hooks_)
       hooks_->BeforeReset();
     npu_->state.Reset();
+    npu_->backbone().SyncToDevice(npu_->state);
     std::fill(npu_->frontier.begin(), npu_->frontier.end(), 0.0f);
     npu_->logits_ready = false;
     npu_->poisoned = false;
@@ -1276,6 +1278,7 @@ void* Session::ContinuationData(ContinuationTensor tensor,
                                 std::size_t layer) const {
   if (npu_) {
     auto& n = *npu_;
+    n.backbone().SyncToHost(n.state);
     switch (tensor) {
       case ContinuationTensor::kLogits:
         return n.logits.data();
@@ -1326,6 +1329,7 @@ void Session::BeginRestore() {
 void Session::FinishRestore(std::uint32_t position) {
   if (npu_) {
     npu_->state.position = position;
+    npu_->backbone().SyncToDevice(npu_->state);
     npu_->logits_ready = true;
     npu_->poisoned = false;
     return;
@@ -1419,6 +1423,7 @@ std::vector<std::uint8_t> Session::SaveSnapshot() const {
     auto& n = *npu_;
     if (n.poisoned)
       throw std::runtime_error("cannot snapshot a poisoned LFM3 session");
+    n.backbone().SyncToHost(n.state);
     const auto& c = n.model->config();
     std::vector<std::uint8_t> bytes(SnapshotBytes());
     const std::uint32_t header[]{kSnapshotMagic, kSnapshotVersion, n.context,
@@ -1531,6 +1536,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> bytes,
         }
       }
       n.state.position = position;
+      n.backbone().SyncToDevice(n.state);
       n.logits_ready = position != 0;
       n.poisoned = false;
       return true;

@@ -138,4 +138,27 @@ void Dense::Run(const Matrix& w, std::span<const float> x, std::uint32_t rows, s
   }
 }
 
+::lfm3::npu::Runtime& Dense::runtime() { return impl_->npu; }
+
+void Dense::Enqueue(const Matrix& w, int xb, int y, std::uint32_t blocks) {
+  auto& m = *impl_;
+  std::lock_guard lock(m.mutex);
+  for (std::uint32_t b0 = 0; b0 < blocks; b0 += kMaxBlocks)
+    if (blocks > kMaxBlocks) throw std::invalid_argument("too many NPU row blocks");
+  ProjectionShape s = w.shape;
+  s.blocks = blocks;
+  const int bind[] = {xb, w.weights, y};
+  m.npu.Enqueue(m.Kernel(s), bind);
+}
+
+int Dense::Zeros(std::uint64_t bytes) {
+  auto& m = *impl_;
+  std::lock_guard lock(m.mutex);
+  const int id = m.npu.Alloc(bytes);
+  std::vector<std::uint8_t> zero(std::min<std::uint64_t>(bytes, 64u << 20), 0);
+  for (std::uint64_t off = 0; off < bytes; off += zero.size())
+    m.npu.Write(id, off, zero.data(), std::min<std::uint64_t>(zero.size(), bytes - off));
+  return id;
+}
+
 }  // namespace gufo::models::lfm3::npu

@@ -41,6 +41,9 @@ gufo_extension_target(
     npu/dense.cpp
     npu/program.cpp
     npu/stack.cpp
+    npu/rowops.cpp
+    npu/glue.cpp
+    npu/attention.cpp
     npu/host/npu_runtime.cpp
   LINK_LIBRARIES
     gufo_lfm3
