@@ -1,0 +1,184 @@
+// Gated short convolution step on the NPU, one column per 256-channel slice,
+// rows in order. proj: rows of [B | C | x] (3 x 2048 f32), history pool
+// [slot][6][2048] f32 tap-major, weights [7][2048] f32 tap-major, meta: per
+// row the history slot (i32). out: rows of 2048 f32.
+aie2p.target<array> @npu
+
+func.def inline @fmul(%a: vector<16xf32>, %b: vector<16xf32>) -> (vector<16xf32>) {
+  %a1 = vector.fptrunc %a : vector<16xf32> to vector<16xbf16>
+  %a1f = vector.extf %a1 : vector<16xbf16> to vector<16xf32>
+  %ar = vector.subf %a, %a1f : vector<16xf32>
+  %a2 = vector.fptrunc %ar : vector<16xf32> to vector<16xbf16>
+  %a2f = vector.extf %a2 : vector<16xbf16> to vector<16xf32>
+  %ar2 = vector.subf %ar, %a2f : vector<16xf32>
+  %a3 = vector.fptrunc %ar2 : vector<16xf32> to vector<16xbf16>
+  %b1 = vector.fptrunc %b : vector<16xf32> to vector<16xbf16>
+  %b1f = vector.extf %b1 : vector<16xbf16> to vector<16xf32>
+  %br = vector.subf %b, %b1f : vector<16xf32>
+  %b2 = vector.fptrunc %br : vector<16xf32> to vector<16xbf16>
+  %b2f = vector.extf %b2 : vector<16xbf16> to vector<16xf32>
+  %br2 = vector.subf %br, %b2f : vector<16xf32>
+  %b3 = vector.fptrunc %br2 : vector<16xf32> to vector<16xbf16>
+  %zero = vector.splatf 0.0 : vector<16xf32>
+  %l0 = vector.interleave<0> %a1, %a2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %r0 = vector.interleave<0> %b3, %b2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %s0 = vector.dot2f %l0, %r0, %zero : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+  %l1 = vector.interleave<0> %a3, %a1 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %r1 = vector.interleave<0> %b1, %b2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %s1 = vector.dot2f %l1, %r1, %s0 : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+  %l2 = vector.interleave<0> %a2, %a1 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %r2 = vector.interleave<0> %b1, %b1 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %s2 = vector.dot2f %l2, %r2, %s1 : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+  func.return %s2 : vector<16xf32>
+}
+
+pipeline.def<kernel> @conv_col(%column: index) run(%proj_arg: buffer, %hist_arg: buffer, %w_arg: buffer, %meta_arg: buffer, %out_arg: buffer) {
+  %proj, %hist, %wts, %meta, %out = buffer.assume.alignment %proj_arg, %hist_arg, %w_arg, %meta_arg, %out_arg {minimum_alignment = 64} : buffer, buffer, buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c16 = index.constant 16 : index
+  %slice = index.constant 256 : index
+  %hidden = index.constant 2048 : index
+  %rows = index.constant 8 : index
+  %first = index.mul %column, %slice : index
+  %c2 = index.constant 2 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c6x2048 = index.constant 12288 : index
+  %slots = index.constant 4 : index
+  %c3x2048 = index.constant 6144 : index
+  %memory = pipeline.memory<workgroup>[%column, 2] : pool
+  %wsize = index.constant 7168 : offset
+  %w_storage = buffer.alloca<workgroup> pool(%memory) align(64) %wsize : buffer
+  %w_slots = buffer.view %w_storage[%origin] : buffer -> view<1x7x256xf32>
+  %w_ch = channel.bind<fifo> %w_slots, %c1 : view<1x7x256xf32>, index -> channel<tile<7x256xf32>>
+  %hsize = index.constant 6144 : offset
+  %h_storage = buffer.alloca<workgroup> pool(%memory) align(64) %hsize : buffer
+  %h_slots = buffer.view %h_storage[%origin] : buffer -> view<1x6x256xf32>
+  %h_ch = channel.bind<fifo> %h_slots, %c1 : view<1x6x256xf32>, index -> channel<tile<6x256xf32>>
+  %psize = index.constant 3072 : offset
+  %p_storage = buffer.alloca<workgroup> pool(%memory) align(64) %psize : buffer
+  %p_slots = buffer.view %p_storage[%origin] : buffer -> view<1x3x256xf32>
+  %p_ch = channel.bind<fifo> %p_slots, %c1 : view<1x3x256xf32>, index -> channel<tile<3x256xf32>>
+  %osize = index.constant 1024 : offset
+  %o_storage = buffer.alloca<workgroup> pool(%memory) align(64) %osize : buffer
+  %o_slots = buffer.view %o_storage[%origin] : buffer -> view<1x256xf32>
+  %o_ch = channel.bind<fifo> %o_slots, %c1 : view<1x256xf32>, index -> channel<tile<256xf32>>
+  %msize = index.constant 64 : offset
+  %m_storage = buffer.alloca<workgroup> pool(%memory) align(64) %msize : buffer
+  %m_slots = buffer.view %m_storage[%origin] : buffer -> view<1x16xi32>
+  %m_ch = channel.bind<fifo> %m_slots, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+
+  pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {
+    // Scratch: every slot reserved for the whole kernel.
+    %ww, %w = channel.reserve %w_ch : channel<tile<7x256xf32>> -> (write<tile<7x256xf32>>, view<7x256xf32>)
+    %hw, %h = channel.reserve %h_ch : channel<tile<6x256xf32>> -> (write<tile<6x256xf32>>, view<6x256xf32>)
+    %pw, %p = channel.reserve %p_ch : channel<tile<3x256xf32>> -> (write<tile<3x256xf32>>, view<3x256xf32>)
+    %ow, %o = channel.reserve %o_ch : channel<tile<256xf32>> -> (write<tile<256xf32>>, view<256xf32>)
+    %mw, %m = channel.reserve %m_ch : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+    // Weights: 7 taps of this slice (tap stride 2048 floats).
+    %w_at_i = index.mul %first, %c4 : index
+    %w_at = index.cast %w_at_i : index to offset
+    %w_dense = buffer.view %wts[%w_at] : buffer -> view<7x2048xf32>
+    %w_strided = view.refine %w_dense : view<7x2048xf32> -> view<7x2048xf32, #encoding.layout.strided<strides=[2048, 1]>>
+    %w_src = view.subview %w_strided[0, 0] : view<7x2048xf32, #encoding.layout.strided<strides=[2048, 1]>> -> view<7x256xf32, #encoding.layout.strided<strides=[2048, 1]>>
+    %wc = kernel.async.copy %w_src to %w {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<7x256xf32, #encoding.layout.strided<strides=[2048, 1]>> to view<7x256xf32> -> kernel.async.token
+    %wg = kernel.async.group %wc : kernel.async.token -> kernel.async.group
+    kernel.async.wait %wg {newer_groups = 0} : kernel.async.group
+    scf.for %row = [%c0 to %rows step %c1] {
+      // Slot of this row.
+      %m_at_i = index.mul %row, %c4 : index
+      %m_at = index.cast %m_at_i : index to offset
+      %m_src = buffer.view %meta[%m_at] : buffer -> view<16xi32>
+      %mc = kernel.async.copy %m_src to %m {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<16xi32> to view<16xi32> -> kernel.async.token
+      %mg = kernel.async.group %mc : kernel.async.token -> kernel.async.group
+      kernel.async.wait %mg {newer_groups = 0} : kernel.async.group
+      %slot_i32 = view.load %m[%c0] : view<16xi32> -> i32
+      %slot_mask = scalar.constant 3 : i32
+      %slot_bounded = scalar.andi %slot_i32, %slot_mask : i32
+      %slot = index.cast %slot_bounded : i32 to index
+      // History of the slot: 6 taps, tap stride 2048 floats.
+      %h_base0 = index.mul %slot, %c6x2048 : index
+      %h_base = index.add %h_base0, %first : index
+      %h_at_i = index.mul %h_base, %c4 : index
+      %h_at = index.cast %h_at_i : index to offset
+      %h_dense = buffer.view %hist[%h_at] : buffer -> view<6x2048xf32>
+      %h_strided = view.refine %h_dense : view<6x2048xf32> -> view<6x2048xf32, #encoding.layout.strided<strides=[2048, 1]>>
+      %h_global = view.subview %h_strided[0, 0] : view<6x2048xf32, #encoding.layout.strided<strides=[2048, 1]>> -> view<6x256xf32, #encoding.layout.strided<strides=[2048, 1]>>
+      %hc = kernel.async.copy %h_global to %h {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<6x256xf32, #encoding.layout.strided<strides=[2048, 1]>> to view<6x256xf32> -> kernel.async.token
+      %hg = kernel.async.group %hc : kernel.async.token -> kernel.async.group
+      kernel.async.wait %hg {newer_groups = 0} : kernel.async.group
+      // B, C, x of this row's slice.
+      %p_base0 = index.mul %row, %c3x2048 : index
+      %p_base = index.add %p_base0, %first : index
+      %p_at_i = index.mul %p_base, %c4 : index
+      %p_at = index.cast %p_at_i : index to offset
+      %p_dense = buffer.view %proj[%p_at] : buffer -> view<3x2048xf32>
+      %p_strided = view.refine %p_dense : view<3x2048xf32> -> view<3x2048xf32, #encoding.layout.strided<strides=[2048, 1]>>
+      %p_global = view.subview %p_strided[0, 0] : view<3x2048xf32, #encoding.layout.strided<strides=[2048, 1]>> -> view<3x256xf32, #encoding.layout.strided<strides=[2048, 1]>>
+      %pc = kernel.async.copy %p_global to %p {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<3x256xf32, #encoding.layout.strided<strides=[2048, 1]>> to view<3x256xf32> -> kernel.async.token
+      %pg = kernel.async.group %pc : kernel.async.token -> kernel.async.group
+      kernel.async.wait %pg {newer_groups = 0} : kernel.async.group
+      scf.for %i = [%c0 to %slice step %c16] {
+        %bv = vector.load %p[%c0, %i] : view<3x256xf32> -> vector<16xf32>
+        %cv = vector.load %p[%c1, %i] : view<3x256xf32> -> vector<16xf32>
+        %xv = vector.load %p[%c2, %i] : view<3x256xf32> -> vector<16xf32>
+        %bx = func.call @fmul(%bv, %xv) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+        %w6 = vector.load %w[%c6, %i] : view<7x256xf32> -> vector<16xf32>
+        %acc6 = func.call @fmul(%w6, %bx) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+        %acc = scf.for %t = [%c0 to %c6 step %c1](%a = %acc6 : vector<16xf32>) -> (vector<16xf32>) {
+          %hv = vector.load %h[%t, %i] : view<6x256xf32> -> vector<16xf32>
+          %wv = vector.load %w[%t, %i] : view<7x256xf32> -> vector<16xf32>
+          %term = func.call @fmul(%wv, %hv) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+          %next = vector.addf %a, %term : vector<16xf32>
+          scf.yield %next : vector<16xf32>
+        }
+        %y = func.call @fmul(%cv, %acc) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+        vector.store %y, %o[%i] : vector<16xf32>, view<256xf32>
+        scf.for %t = [%c0 to %c5 step %c1] {
+          %t1 = index.add %t, %c1 : index
+          %hn = vector.load %h[%t1, %i] : view<6x256xf32> -> vector<16xf32>
+          vector.store %hn, %h[%t, %i] : vector<16xf32>, view<6x256xf32>
+        }
+        vector.store %bx, %h[%c5, %i] : vector<16xf32>, view<6x256xf32>
+      }
+      %hs = kernel.async.copy %h to %h_global {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<6x256xf32> to view<6x256xf32, #encoding.layout.strided<strides=[2048, 1]>> -> kernel.async.token
+      %hsg = kernel.async.group %hs : kernel.async.token -> kernel.async.group
+      kernel.async.wait %hsg {newer_groups = 0} : kernel.async.group
+      %o_base0 = index.mul %row, %hidden : index
+      %o_base = index.add %o_base0, %first : index
+      %o_at_i = index.mul %o_base, %c4 : index
+      %o_at = index.cast %o_at_i : index to offset
+      %o_global = buffer.view %out[%o_at] : buffer -> view<256xf32>
+      %os = kernel.async.copy %o to %o_global {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<256xf32> to view<256xf32> -> kernel.async.token
+      %osg = kernel.async.group %os : kernel.async.token -> kernel.async.group
+      kernel.async.wait %osg {newer_groups = 0} : kernel.async.group
+    }
+    channel.publish %ww : write<tile<7x256xf32>>
+    channel.publish %hw : write<tile<6x256xf32>>
+    channel.publish %pw : write<tile<3x256xf32>>
+    channel.publish %ow : write<tile<256xf32>>
+    channel.publish %mw : write<tile<16xi32>>
+  }
+}
+
+pipeline.def<kernel> public retain target(@npu) @conv8() run(%proj: buffer, %hist: buffer, %wts: buffer, %meta: buffer, %out: buffer) {
+  %k0 = index.constant 0 : index
+  %k1 = index.constant 1 : index
+  %k2 = index.constant 2 : index
+  %k3 = index.constant 3 : index
+  %k4 = index.constant 4 : index
+  %k5 = index.constant 5 : index
+  %k6 = index.constant 6 : index
+  %k7 = index.constant 7 : index
+  pipeline.compose @conv_col[%k0](%proj, %hist, %wts, %meta, %out) : [index](buffer, buffer, buffer, buffer, buffer)
+  pipeline.compose @conv_col[%k1](%proj, %hist, %wts, %meta, %out) : [index](buffer, buffer, buffer, buffer, buffer)
+  pipeline.compose @conv_col[%k2](%proj, %hist, %wts, %meta, %out) : [index](buffer, buffer, buffer, buffer, buffer)
+  pipeline.compose @conv_col[%k3](%proj, %hist, %wts, %meta, %out) : [index](buffer, buffer, buffer, buffer, buffer)
+  pipeline.compose @conv_col[%k4](%proj, %hist, %wts, %meta, %out) : [index](buffer, buffer, buffer, buffer, buffer)
+  pipeline.compose @conv_col[%k5](%proj, %hist, %wts, %meta, %out) : [index](buffer, buffer, buffer, buffer, buffer)
+  pipeline.compose @conv_col[%k6](%proj, %hist, %wts, %meta, %out) : [index](buffer, buffer, buffer, buffer, buffer)
+  pipeline.compose @conv_col[%k7](%proj, %hist, %wts, %meta, %out) : [index](buffer, buffer, buffer, buffer, buffer)
+}
