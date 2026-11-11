@@ -75,6 +75,7 @@ func.def @tof16(%x: vector<16xf32>) -> (vector<16xf16>) {
   func.return %out : vector<16xf16>
 }
 
+// rsqrt, recip and exp multiply with @fmul2 (about 16 significant bits).
 // 1 / sqrt(x) for x > 0: bit estimate and three Newton steps.
 func.def @rsqrt(%x: vector<16xf32>) -> (vector<16xf32>) {
   %magic = vector.splati 1597463007 : vector<16xi32>
@@ -85,15 +86,15 @@ func.def @rsqrt(%x: vector<16xf32>) -> (vector<16xf32>) {
   %shifted = vector.shrui %bits, %one_i : vector<16xi32>
   %guess = vector.subi %magic, %shifted : vector<16xi32>
   %y0 = vector.bitcast %guess : vector<16xi32> to vector<16xf32>
-  %hx = func.call @fmul(%x, %half) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %a0 = func.call @fmul(%y0, %y0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %b0 = func.call @fmul(%hx, %a0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %hx = func.call @fmul2(%x, %half) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %a0 = func.call @fmul2(%y0, %y0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %b0 = func.call @fmul2(%hx, %a0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
   %c0 = vector.subf %three_halves, %b0 : vector<16xf32>
-  %y1 = func.call @fmul(%y0, %c0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %a1 = func.call @fmul(%y1, %y1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %b1 = func.call @fmul(%hx, %a1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %y1 = func.call @fmul2(%y0, %c0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %a1 = func.call @fmul2(%y1, %y1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %b1 = func.call @fmul2(%hx, %a1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
   %c1 = vector.subf %three_halves, %b1 : vector<16xf32>
-  %y2 = func.call @fmul(%y1, %c1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %y2 = func.call @fmul2(%y1, %c1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
   func.return %y2 : vector<16xf32>
 }
 
@@ -104,62 +105,29 @@ func.def @recip(%x: vector<16xf32>) -> (vector<16xf32>) {
   %bits = vector.bitcast %x : vector<16xf32> to vector<16xi32>
   %guess = vector.subi %magic, %bits : vector<16xi32>
   %y0 = vector.bitcast %guess : vector<16xi32> to vector<16xf32>
-  %a0 = func.call @fmul(%x, %y0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %a0 = func.call @fmul2(%x, %y0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
   %b0 = vector.subf %two, %a0 : vector<16xf32>
-  %y1 = func.call @fmul(%y0, %b0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %a1 = func.call @fmul(%x, %y1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %y1 = func.call @fmul2(%y0, %b0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %a1 = func.call @fmul2(%x, %y1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
   %b1 = vector.subf %two, %a1 : vector<16xf32>
-  %y2 = func.call @fmul(%y1, %b1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %a2 = func.call @fmul(%x, %y2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %y2 = func.call @fmul2(%y1, %b1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %a2 = func.call @fmul2(%x, %y2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
   %b2 = vector.subf %two, %a2 : vector<16xf32>
-  %y3 = func.call @fmul(%y2, %b2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %y3 = func.call @fmul2(%y2, %b2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
   func.return %y3 : vector<16xf32>
 }
 
-// e^x: x log2(e) = n + f with round-to-nearest n, a degree-6 polynomial of
-// 2^f on [-0.5, 0.5] by Horner, then 2^n added to the exponent bits.
-// Inputs below -87 give 0; above 88 saturate.
+// e^x through the native exp2 (approximate-function lowering): inputs
+// below -87 give 0.
 func.def @exp(%x: vector<16xf32>) -> (vector<16xf32>) {
   %low = vector.splatf -87.0 : vector<16xf32>
-  %high = vector.splatf 88.0 : vector<16xf32>
-  %xc0 = vector.maxnumf %x, %low : vector<16xf32>
-  %xc = vector.minnumf %xc0, %high : vector<16xf32>
+  %xc = vector.maxnumf %x, %low : vector<16xf32>
   %log2e = vector.splatf 1.44269504088896341 : vector<16xf32>
   %t = func.call @fmul(%xc, %log2e) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %magic = vector.splatf 12582912.0 : vector<16xf32>
-  %biased = vector.addf %t, %magic : vector<16xf32>
-  %n = vector.subf %biased, %magic : vector<16xf32>
-  %f = vector.subf %t, %n : vector<16xf32>
-  %k6 = vector.splatf 1.5403530393381608e-4 : vector<16xf32>
-  %k5 = vector.splatf 1.3333558146428443e-3 : vector<16xf32>
-  %k4 = vector.splatf 9.6181291076284772e-3 : vector<16xf32>
-  %k3 = vector.splatf 5.5504108664821580e-2 : vector<16xf32>
-  %k2 = vector.splatf 0.24022650695910071 : vector<16xf32>
-  %k1 = vector.splatf 0.69314718055994531 : vector<16xf32>
-  %k0 = vector.splatf 1.0 : vector<16xf32>
-  %p6 = func.call @fmul(%k6, %f) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %q5 = vector.addf %p6, %k5 : vector<16xf32>
-  %p5 = func.call @fmul(%q5, %f) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %q4 = vector.addf %p5, %k4 : vector<16xf32>
-  %p4 = func.call @fmul(%q4, %f) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %q3 = vector.addf %p4, %k3 : vector<16xf32>
-  %p3 = func.call @fmul(%q3, %f) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %q2 = vector.addf %p3, %k2 : vector<16xf32>
-  %p2 = func.call @fmul(%q2, %f) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %q1 = vector.addf %p2, %k1 : vector<16xf32>
-  %p1 = func.call @fmul(%q1, %f) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %poly = vector.addf %p1, %k0 : vector<16xf32>
-  %bias = vector.splati 1262485504 : vector<16xi32>
-  %biased_bits = vector.bitcast %biased : vector<16xf32> to vector<16xi32>
-  %exponent = vector.subi %biased_bits, %bias : vector<16xi32>
-  %shift = vector.splati 23 : vector<16xi32>
-  %scale_bits = vector.shli %exponent, %shift : vector<16xi32>
-  %poly_bits = vector.bitcast %poly : vector<16xf32> to vector<16xi32>
-  %result_bits = vector.addi %poly_bits, %scale_bits : vector<16xi32>
-  %result = vector.bitcast %result_bits : vector<16xi32> to vector<16xf32>
+  %r = vector.exp2f<afn> %t : vector<16xf32>
   %zero = vector.splatf 0.0 : vector<16xf32>
   %under = vector.cmpf olt, %x, %low : vector<16xf32> -> vector<16xi1>
-  %out = vector.select %under, %zero, %result : vector<16xf32>
+  %out = vector.select %under, %zero, %r : vector<16xf32>
   func.return %out : vector<16xf32>
 }
 
