@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "dense.hpp"
+#include "host_ops.hpp"
 #include "host/bfp.hpp"
 
 namespace gufo::models::lfm3::npu {
@@ -114,14 +115,17 @@ void Backbone::Embed(std::uint32_t token, std::span<float> row) const {
 }
 
 void Backbone::Forward(std::span<const float> inputs, std::span<const Row> rows,
-                       std::span<float> hidden, std::span<float> logits) {
+                       std::span<float> hidden, std::span<float> logits, bool decision,
+                       std::span<const std::int32_t> groups) {
   auto& m = *impl_;
   const auto& w = *m.w;
   const auto& c = w.config;
   const std::uint32_t H = c.hidden, D = c.head_dim;
   std::size_t logit_row = 0;
-  for (std::size_t base = 0; base < rows.size(); base += kRows) {
-    const std::uint32_t n = std::uint32_t(std::min<std::size_t>(kRows, rows.size() - base));
+  // A decision prompt is one pass: its full-attention rows see each other.
+  const std::size_t pass = decision ? std::max<std::size_t>(rows.size(), 1) : kRows;
+  for (std::size_t base = 0; base < rows.size(); base += pass) {
+    const std::uint32_t n = std::uint32_t(std::min<std::size_t>(pass, rows.size() - base));
     const auto chunk = rows.subspan(base, n);
     std::vector<float> x(inputs.begin() + base * H, inputs.begin() + (base + n) * H);
     std::vector<float> z(std::size_t(n) * H), out(std::size_t(n) * H);
@@ -169,6 +173,8 @@ void Backbone::Forward(std::span<const float> inputs, std::span<const Row> rows,
         };
         // Rows advance in order: each stores its K/V, then attends. A ring
         // of the window's size then never loses a key a later row needs.
+        // Decision full-attention layers attend once all rows are stored.
+        const bool bidirectional = decision && !swa;
         for (std::uint32_t r = 0; r < n; ++r) {
           float* q = &proj[std::size_t(r) * qkvg];
           float* k = q + H;
@@ -184,6 +190,8 @@ void Backbone::Forward(std::span<const float> inputs, std::span<const Row> rows,
             s.k[slot * KV + i] = static_cast<_Float16>(k[i]);
             s.v[slot * KV + i] = static_cast<_Float16>(v[i]);
           }
+          if (bidirectional)
+            continue;
           const std::uint32_t pos = chunk[r].position;
           const std::uint32_t first = swa && pos + 1 > c.window ? pos + 1 - c.window : 0;
           auto head = [&](std::uint32_t h, std::vector<float>& scores) {
@@ -222,6 +230,23 @@ void Backbone::Forward(std::span<const float> inputs, std::span<const Row> rows,
               for (std::size_t h = h0; h < h1; ++h) head(std::uint32_t(h), scores);
             });
           }
+        }
+        if (bidirectional) {
+          // F16 keys and values as stored, gate per head, group masks.
+          std::vector<float> kf(std::size_t(n) * KV), vf(kf.size());
+          for (std::uint32_t r = 0; r < n; ++r) {
+            const float* k = &proj[std::size_t(r) * qkvg] + H;
+            for (std::uint32_t i = 0; i < KV; ++i) {
+              kf[std::size_t(r) * KV + i] = float(_Float16(k[i]));
+              vf[std::size_t(r) * KV + i] = float(_Float16(k[KV + i]));
+            }
+          }
+          const auto* g = groups.empty() ? nullptr : groups.data() + base;
+          Attention(proj.data(), kf.data(), vf.data(), att.data(), n, c.heads, kv, D,
+                    [&](std::size_t i, std::size_t t) {
+                      return !g || g[i] < 0 || g[t] < 0 || g[i] == g[t];
+                    },
+                    proj.data() + H + 2 * KV, qkvg, qkvg, KV);
         }
         m.Run(p.out, att, n, out);
       }

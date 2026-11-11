@@ -539,6 +539,31 @@ struct Session::Npu {
       Run(rows, want_logits && off + n == tokens.size());
     }
   }
+  // A d1 prompt from empty state in one pass; returns every row's
+  // final-normed hidden state.
+  std::vector<float> Decide(std::span<const std::uint32_t> tokens,
+                            std::span<const float> embeddings,
+                            std::span<const std::int32_t> groups) {
+    const auto& c = model->config();
+    const auto H = c.hidden;
+    for (auto id : tokens)
+      if (id >= c.vocab)
+        throw std::invalid_argument("d1 token out of range");
+    state.Reset();
+    std::vector<float> rows(tokens.size() * H), hidden(rows.size());
+    if (!embeddings.empty())
+      std::copy(embeddings.begin(), embeddings.end(), rows.begin());
+    else
+      for (std::size_t i = 0; i < tokens.size(); ++i)
+        backbone().Embed(tokens[i], std::span(rows).subspan(i * H, H));
+    std::vector<npu::Row> spec(tokens.size());
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+      spec[i] = {&state, std::uint32_t(i), false};
+    backbone().Forward(rows, spec, hidden, {}, true, groups);
+    std::copy(hidden.end() - H, hidden.end(), frontier.begin());
+    logits_ready = false;
+    return hidden;
+  }
   void EnsureLogits() {
     if (logits_ready || !state.position)
       return;
@@ -620,9 +645,21 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
                               std::span<const float> embeddings,
                               std::span<float> logits, std::string* error) {
   if (npu_) {
-    if (error)
-      *error = "d1 decisions are not yet supported on the NPU";
-    return false;
+    try {
+      auto& n = *npu_;
+      const auto& c = n.model->config();
+      if (!c.decision || tokens.empty() || tokens.size() > n.context ||
+          logits.size() != c.vocab ||
+          (!embeddings.empty() && embeddings.size() != tokens.size() * c.hidden))
+        throw std::invalid_argument("invalid d1 prompt, embeddings or logits");
+      const auto hidden = n.Decide(tokens, embeddings, {});
+      n.backbone().Head(std::span(hidden).subspan(hidden.size() - c.hidden), 1, logits);
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
   }
   // Preserve the original full-vocabulary single-slot path for callers
   // requiring the existing d1 decision probabilities bit for bit.
@@ -662,9 +699,42 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
                               std::span<const std::uint32_t> vocabulary,
                               std::span<float> logits, std::string* error) {
   if (npu_) {
-    if (error)
-      *error = "d1 decisions are not yet supported on the NPU";
-    return false;
+    try {
+      auto& n = *npu_;
+      const auto& c = n.model->config();
+      const auto columns = vocabulary.empty() ? c.vocab : vocabulary.size();
+      if (!c.decision || tokens.empty() || tokens.size() > n.context ||
+          positions.empty() || positions.size() > tokens.size() ||
+          logits.size() != positions.size() * columns ||
+          (!groups.empty() && groups.size() != tokens.size()) ||
+          (!embeddings.empty() && embeddings.size() != tokens.size() * c.hidden))
+        throw std::invalid_argument("invalid d1 prompt, groups, slots or readout");
+      for (auto id : vocabulary)
+        if (id >= c.vocab)
+          throw std::invalid_argument("d1 vocabulary ID out of range");
+      for (std::size_t i = 0; i < positions.size(); ++i)
+        if (positions[i] >= tokens.size() || (i && positions[i - 1] >= positions[i]))
+          throw std::invalid_argument("d1 slots must be increasing prompt positions");
+      const bool packed =
+          !groups.empty() && std::any_of(groups.begin(), groups.end(), [&](auto group) {
+            return group > 0 && group != groups.back();
+          });
+      const auto hidden = n.Decide(tokens, embeddings,
+                                   packed ? groups : std::span<const std::int32_t>{});
+      std::vector<float> rows(positions.size() * c.hidden), full(positions.size() * c.vocab);
+      for (std::size_t i = 0; i < positions.size(); ++i)
+        std::copy_n(hidden.begin() + std::size_t(positions[i]) * c.hidden, c.hidden,
+                    rows.begin() + i * c.hidden);
+      n.backbone().Head(rows, std::uint32_t(positions.size()), full);
+      for (std::size_t i = 0; i < positions.size(); ++i)
+        for (std::size_t j = 0; j < columns; ++j)
+          logits[i * columns + j] = full[i * c.vocab + (vocabulary.empty() ? j : vocabulary[j])];
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
   }
   try {
     const auto& c = impl_->model->config();
