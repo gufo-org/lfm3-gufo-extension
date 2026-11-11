@@ -32,6 +32,27 @@ if(TARGET gufo_lfm3)
   endif()
 endif()
 
+# LFM3 backbone on the XDNA NPU through Loom programs. liblfm3_npu.so
+# (npu/host) is loaded at run time, so this target needs no HRX at build time.
+gufo_extension_target(
+  NAME gufo_lfm3_npu
+  SOURCES
+    npu/backbone.cpp
+    npu/host/npu_runtime.cpp
+  LINK_LIBRARIES
+    gufo_lfm3
+    gufo_ext_runtime
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+)
+
+if(TARGET gufo_lfm3_npu)
+  target_compile_options(gufo_lfm3_npu PRIVATE -O3)
+  target_include_directories(gufo_lfm3_npu PUBLIC
+    "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
+  )
+endif()
+
 gufo_extension_target(
   NAME gufo_lfm3_hip
   SOURCES
@@ -237,10 +258,10 @@ gufo_extension_target(
 )
 
 if(ENGINE_ENABLE_HIP)
-  set(_gufo_lfm3_probe_libs gufo_lfm3_hip gufo_lfm3 gufo_ext_runtime
+  set(_gufo_lfm3_probe_libs gufo_lfm3_npu gufo_lfm3_hip gufo_lfm3 gufo_ext_runtime
     ${_gufo_lfm3_test_libs} hip::host)
 else()
-  set(_gufo_lfm3_probe_libs gufo_lfm3 gufo_ext_runtime ${_gufo_lfm3_test_libs})
+  set(_gufo_lfm3_probe_libs gufo_lfm3_npu gufo_lfm3 gufo_ext_runtime ${_gufo_lfm3_test_libs})
 endif()
 
 gufo_extension_target(

@@ -9,6 +9,7 @@
   "registration_target": "gufo_lfm3",
   "targets": {
     "gufo_lfm3": { "requires": [] },
+    "gufo_lfm3_npu": { "requires": [] },
     "gufo_lfm3_hip": { "requires": ["hip"] },
     "gufo_lfm3_audio": { "requires": ["hip"] },
     "gufo_lfm3_vl": { "requires": ["hip"] },

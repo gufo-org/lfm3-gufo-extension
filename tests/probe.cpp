@@ -5,11 +5,12 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include "../engine.hpp"
 #endif
+#include "../npu/backbone.hpp"
 #include "../reference.hpp"
 #include "../tokenizer.hpp"
 int main(int argc, char** argv) {
   if (argc < 4) {
-    std::cerr << "usage: lfm3_probe MODEL cpu|gpu OUTPUT [TOKEN ...]\n";
+    std::cerr << "usage: lfm3_probe MODEL cpu|gpu|npu OUTPUT [TOKEN ...]\n";
     return 2;
   }
   using namespace gufo::models::lfm3;
@@ -39,6 +40,21 @@ int main(int argc, char** argv) {
     for (std::size_t i = 0; i < tokens.size(); ++i)
       reference.Step(tokens[i], i + 1 == tokens.size() ? std::span(logits)
                                                        : std::span<float>{});
+  } else if (std::string_view(argv[2]) == "npu") {
+    auto backbone = npu::Backbone::Load(*w, &error);
+    if (!backbone) {
+      std::cerr << error;
+      return 1;
+    }
+    auto state = backbone->NewState(tokens.size() + 16);
+    const auto H = w->config.hidden;
+    std::vector<float> rows(tokens.size() * H);
+    std::vector<npu::Row> spec(tokens.size());
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      backbone->Embed(tokens[i], std::span(rows).subspan(i * H, H));
+      spec[i] = {&state, std::uint32_t(i), i + 1 == tokens.size()};
+    }
+    backbone->Forward(rows, spec, {}, logits);
   } else {
 #if defined(ENGINE_ENABLE_HIP)
     auto model = Model::Load(argv[1], &error);
