@@ -663,13 +663,13 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
       timed("proj out", [&] { dense->Enqueue(p.out, d.xb2048, d.y_out, blocks); });
       // One decode row: the whole feed-forward block (both norms, gate/up,
       // SwiGLU, down, reduce) as one resident dispatch; the residual stays in x.
-      if (R == 1 && il + 1 < c.layers.size() && d.resident && p.gateup.shape.split == Split::kColumns &&
-          p.down.shape.split == Split::kColumns) {
-        const int k = d.Kernel("ffn_resident", [&] { return ResidentFfnProgram(H, I, c.eps, "ffn_resident"); },
-                               "@ffn_resident");
+      if (R == 1 && d.resident && p.gateup.shape.split == Split::kColumns && p.down.shape.split == Split::kColumns) {
+        const bool last = il + 1 == c.layers.size();
+        const std::string kn = last ? "ffn_resident_last" : "ffn_resident";
+        const int k = d.Kernel(kn, [&] { return ResidentFfnProgram(H, I, c.eps, kn, last); }, "@" + kn);
         const int b[] = {x, d.y_out, d.w_op[il], x2, d.xb2048, p.gateup.weights, d.y_proj, d.xb_ffn,
-                         p.down.weights, d.y_down, d.w_ffn[il]};
-        timed("ffn resident", [&] { npu.Enqueue(k, b); });
+                         p.down.weights, d.y_down, d.w_ffn[il], d.z};
+        timed("ffn resident", [&] { npu.Enqueue(k, std::span<const int>(b, last ? 12 : 11)); });
         continue;
       }
       {

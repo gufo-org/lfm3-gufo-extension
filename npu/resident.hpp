@@ -18,8 +18,10 @@ namespace gufo::models::lfm3::npu {
 //   x = x2 + post_norm(sum d) * w_ffn[0:H];  xb = pack(norm(x) * w_ffn[H:2H])
 // Bindings: x, y_out (Yb), w_op, x2, xb, w_gu, y_gu (Yp), xb_ffn, w_d,
 // y_d (Yp), w_ffn. Layouts as npu/program.hpp; weights packed for the K split.
+// With `last`, the block ends the stack: a twelfth binding z receives the
+// F32 rows norm(x) * w_ffn[H:2H] (no residual or packed output).
 std::string ResidentFfnProgram(std::uint32_t hidden, std::uint32_t intermediate, float eps,
-                               const std::string& name);
+                               const std::string& name, bool last = false);
 
 }  // namespace gufo::models::lfm3::npu
 

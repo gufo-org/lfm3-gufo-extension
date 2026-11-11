@@ -63,7 +63,7 @@ std::string RmsScale(const std::string& v, const std::string& vt, std::uint32_t 
 
 }  // namespace
 
-std::string ResidentFfnProgram(std::uint32_t H, std::uint32_t I, float eps, const std::string& name) {
+std::string ResidentFfnProgram(std::uint32_t H, std::uint32_t I, float eps, const std::string& name, bool last) {
   // Per column c: worker core (c, 2) computes and never touches DRAM; the
   // loader core (c, 3) runs a fixed schedule of every input (weights into a
   // ring, everything else through one 16 KiB record) and the storer core
@@ -165,9 +165,9 @@ std::string ResidentFfnProgram(std::uint32_t H, std::uint32_t I, float eps, cons
   t += ProjectionDot("dot_d", d_tiles, d_tiles);
   std::string top = "\npipeline.def<kernel> public retain target(@npu) @" + name +
                     "() run(%a0: buffer, %a1: buffer, %a2: buffer, %a3: buffer, %a4: buffer, %a5: buffer, %a6: buffer, "
-                    "%a7: buffer, %a8: buffer, %a9: buffer, %a10: buffer) {\n";
+                    "%a7: buffer, %a8: buffer, %a9: buffer, %a10: buffer" + std::string(last ? ", %a11: buffer" : "") + ") {\n";
   top += R"(  %bx, %by, %bwo, %bx2, %bxb, %bwgu, %bygu, %bxf, %bwd, %byd, %bwf = buffer.assume.alignment %a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7, %a8, %a9, %a10 {minimum_alignment = 64} : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer
-  %origin = index.constant 0 : offset
+@ZBIND  %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
@@ -175,6 +175,7 @@ std::string ResidentFfnProgram(std::uint32_t H, std::uint32_t I, float eps, cons
   %c16 = index.constant 16 : index
   %tokb = index.constant 64 : offset
 )";
+  top = Fill(top, {{"@ZBIND", last ? "  %bz = buffer.assume.alignment %a11 {minimum_alignment = 64} : buffer\n" : ""}});
   auto bind = [&](const std::string& n, const std::string& pool, std::uint64_t bytes, std::uint32_t slots,
                   const std::string& rec) {
     return "  %" + n + "_s = buffer.alloca<workgroup> pool(%" + pool + ") align(64) %" + n + "_b : buffer\n" + "  %" + n +
@@ -381,7 +382,13 @@ std::string ResidentFfnProgram(std::uint32_t H, std::uint32_t I, float eps, cons
     if (n5) {
       St += acq("s5x", "outb" + cs, outc, out_t) + flat("s5xd", "bx", 0, 4, out_t) + store("s5x", "s5x", out_t, "s5xd", out_t) +
             rel("s5x", outc);
-      St += store_xb("s5b") + token_post("f5", "fl" + cs);
+      if (last) {  // the normed F32 row instead of the residual and packed row
+        St = St.substr(0, St.rfind("      %s5x_r, %s5x"));
+        St += acq("s5z", "outb" + cs, outc, out_t) + flat("s5zd", "bz", 0, 4, out_t) + store("s5z", "s5z", out_t, "s5zd", out_t) +
+              rel("s5z", outc) + token_post("f5", "fl" + cs);
+      } else {
+        St += store_xb("s5b") + token_post("f5", "fl" + cs);
+      }
     }
     St += "  }\n";
     // ---------------- Worker (c, 2).
@@ -572,7 +579,22 @@ std::string ResidentFfnProgram(std::uint32_t H, std::uint32_t I, float eps, cons
       }
       W += residual("w5r", 0, H);
       // The new residual, then its packed norm.
-      W += emit_x("w5x") + pack("w5p", 0) + flush("5");
+      if (last) {  // outb = norm(sc[0:H]) * w (F32)
+        W += acq("w5z", "inb" + cs, inc, in_t) + RmsScale("sc", sc_t, 0, H, "w5z_s") + rsv("w5zo", "outb" + cs, outc, out_t) +
+             Fill(R"(      %w5z_h = index.constant @H : index
+      scf.for %w5z_i = [%c0 to %w5z_h step %c16] {
+        %w5z_x = vector.load %sc[%w5z_i] : view<6144xf32> -> vector<16xf32>
+        %w5z_w = vector.load %w5z[%w5z_i] : @INT -> vector<16xf32>
+        %w5z_a = func.call @fmul2(%w5z_x, %w5z_s) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+        %w5z_b = func.call @fmul2(%w5z_a, %w5z_w) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+        vector.store %w5z_b, %w5zo[%w5z_i] : vector<16xf32>, @OUTT
+      }
+)",
+                  {{"@H", S(H)}, {"@INT", in_t}, {"@OUTT", out_t}}) +
+             pub("w5zo", outc) + rel("w5z", inc) + flush("5");
+      } else {
+        W += emit_x("w5x") + pack("w5p", 0) + flush("5");
+      }
     }
     W += "    channel.publish %scw : write<tile<6144xf32>>\n  }\n";
     auto cut = [&](std::string text, const std::string& tail) {
