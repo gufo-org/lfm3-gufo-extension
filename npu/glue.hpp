@@ -24,7 +24,8 @@ RowKernel ReducePartialKernel(std::uint32_t m, std::uint32_t rows);
 // Copies blocked rows (ProjectionProgram outputs, one part) to row-major F32.
 RowKernel UnblockKernel(std::uint32_t m, std::uint32_t rows);
 // SwiGLU of a fused gate/up Yb (2 I) into the blocked BF16 input (I).
-RowKernel SwiGluPackKernel(std::uint32_t intermediate, std::uint32_t rows, bool partial = false);
+RowKernel SwiGluPackKernel(std::uint32_t I, std::uint32_t rows, bool partial = false, std::uint32_t out_width = 0,
+                           std::uint32_t in_width = 0);
 // Gated short convolution step for `rows` rows in order: proj Yb (3 H),
 // history pool [slot][width - 1][H] (tap-major), weights [width][H],
 // meta (slot at element 16 r), out blocked BF16 (H).

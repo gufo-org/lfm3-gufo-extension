@@ -17,6 +17,7 @@
 #include "../hip/ops.hpp"
 #include "../npu/dense.hpp"
 #include "../npu/host_ops.hpp"
+#include "../npu/backbone.hpp"
 #include "../npu/stack.hpp"
 #include "../upload.hpp"
 #include "hip/ops.hpp"
@@ -245,6 +246,36 @@ void RunStack(const Stack& st, StackState* state, int n, int window,
   if (state)
     state->position += n;
 }
+// An audio tower as LFM3 backbone weights (no embedding or vocabulary head),
+// so it runs on the NPU device path. Attention keeps `window` keys.
+lfm3::Weights StackWeights(const Stack& st, std::uint32_t window) {
+  lfm3::Weights w;
+  auto& c = w.config;
+  c.hidden = st.hidden;
+  c.intermediate = st.intermediate;
+  c.context = 1u << 16;
+  c.heads = st.heads;
+  c.head_dim = st.head_dim;
+  c.window = window;
+  c.conv_width = st.conv_width;
+  c.eps = st.eps;
+  c.theta = st.theta;
+  c.theta_swa = st.theta;
+  for (const auto& b : st.blocks) {
+    c.layers.push_back(b.attention() ? (window ? lfm3::LayerType::kSlidingAttention : lfm3::LayerType::kFullAttention)
+                                     : lfm3::LayerType::kConvolution);
+    c.kv_heads.push_back(b.attention() ? st.kv_heads : 0);
+    lfm3::LayerWeights l;
+    l.norm = b.norm, l.ffn_norm = b.ffn_norm, l.post_norm = b.post_norm, l.post_ffn_norm = b.post_ffn_norm;
+    l.gate = b.gate, l.up = b.up, l.down = b.down;
+    l.conv = b.conv, l.in_proj = b.in_proj, l.out_proj = b.out_proj;
+    l.q = b.q, l.k = b.k, l.v = b.v, l.q_norm = b.q_norm, l.k_norm = b.k_norm, l.attn_gate = b.attn_gate, l.attn_out = b.attn_out;
+    w.layers.push_back(l);
+  }
+  w.output_norm = st.output_norm;
+  return w;
+}
+
 // Pinned host staging for small per-frame transfers.
 struct Pinned {
   void* data{};
@@ -278,6 +309,9 @@ struct Model::Impl {
   // on the host; tensors keep their mapped host data.
   bool npu{};
   std::unique_ptr<lfm3::npu::Stack> npu_encoder, npu_depth, npu_codec;
+  // The codec stack on the NPU device path (every operation on the NPU).
+  std::unique_ptr<lfm3::Weights> codec_weights;
+  std::unique_ptr<lfm3::npu::Backbone> codec_device;
   lfm3::npu::Dense::Matrix npu_pre_out, npu_proj1, npu_proj2, npu_depth_in,
       npu_codec_in, npu_codec_out;
   std::vector<lfm3::npu::Dense::Matrix> npu_codebooks;  // logits per codebook
@@ -525,6 +559,12 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
       }
       if (!w.codec.blocks.empty()) {
         impl.npu_codec = std::make_unique<lfm3::npu::Stack>(w.codec);
+        if (const char* e = std::getenv("GUFO_LFM3_CODEC_DEVICE"); e && std::string_view(e) != "0") {
+          impl.codec_weights = std::make_unique<lfm3::Weights>(StackWeights(w.codec, w.codec_window));
+          std::string error;
+          impl.codec_device = lfm3::npu::Backbone::Load(*impl.codec_weights, &error);
+          if (!impl.codec_device) throw std::runtime_error("NPU codec: " + error);
+        }
         const Tensor* cin[] = {&w.codec_in};
         const Tensor* cout[] = {&w.codec_out};
         impl.npu_codec_in = dense.Upload(cin);
@@ -1105,6 +1145,7 @@ struct Voice::Npu {
   static constexpr int V = AudioWeights::kCodebookSize;
   std::shared_ptr<Model> model;
   lfm3::npu::Stack::State codec_state;
+  lfm3::npu::State codec_device_state;
   std::array<std::int32_t, K> codes{}, masked{};
   std::vector<std::int32_t> counts, ring;
   int head{}, filled{};
@@ -1114,11 +1155,16 @@ struct Voice::Npu {
   explicit Npu(std::shared_ptr<Model> m) : model(std::move(m)) {
     auto& impl = *model->impl_;
     codec_state = impl.npu_codec->NewState(impl.weights.codec_window);
+    if (impl.codec_device) codec_device_state = impl.codec_device->NewState(1u << 16);
     counts.assign(std::size_t(K) * V, 0);
   }
   Model::Impl& impl() const { return *model->impl_; }
   void Reset() {
     codec_state.Clear();
+    if (impl().codec_device) {
+      codec_device_state.Reset();
+      impl().codec_device->SyncToDevice(codec_device_state);
+    }
     std::fill(counts.begin(), counts.end(), 0);
     head = filled = 0;
     carry_audio.clear();
@@ -1326,7 +1372,23 @@ struct Voice::Npu {
           o[r * Hc + i] += F(w.codec_in_bias)[i];
       for (std::size_t i = 0; i < x.size(); ++i)
         x[i] = o[(i / Hc) / stack * Hc + i % Hc];
-      impl().npu_codec->Run(x, rows, &codec_state, int(w.codec_window), z);
+      if (impl().codec_device) {
+        // Every codec row on the NPU device path; GUFO_LFM3_CODEC_DEVICE=check
+        // also runs the host-glue stack and reports the largest difference.
+        std::vector<lfm3::npu::Row> rws(rows);
+        for (int r = 0; r < rows; ++r) rws[r] = {&codec_device_state, codec_device_state.position + std::uint32_t(r), false};
+        static const bool check = std::string_view(std::getenv("GUFO_LFM3_CODEC_DEVICE")) == "check";
+        impl().codec_device->Forward(x, rws, z, {});
+        if (check) {
+          std::vector<float> zh(z.size());
+          impl().npu_codec->Run(x, rows, &codec_state, int(w.codec_window), zh);
+          double d = 0, m = 0;
+          for (std::size_t i = 0; i < z.size(); ++i) d = std::max(d, double(std::abs(z[i] - zh[i]))), m = std::max(m, double(std::abs(zh[i])));
+          std::fprintf(stderr, "codec device vs host: max diff %.3g of %.3g\n", d, m);
+        }
+      } else {
+        impl().npu_codec->Run(x, rows, &codec_state, int(w.codec_window), z);
+      }
       std::vector<float> spectrum(std::size_t(rows) * w.codec_out.rows);
       dense.Run(impl().npu_codec_out, z, std::uint32_t(rows), spectrum);
       for (int r = 0; r < rows; ++r) {

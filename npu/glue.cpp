@@ -156,19 +156,23 @@ RowKernel ReducePartialKernel(std::uint32_t m, std::uint32_t rows) {
   return k;
 }
 
-RowKernel SwiGluPackKernel(std::uint32_t I, std::uint32_t rows, bool partial) {
+RowKernel SwiGluPackKernel(std::uint32_t I, std::uint32_t rows, bool partial, std::uint32_t out_width, std::uint32_t in_width) {
   RowKernel k;
-  k.name = "swiglu_i" + S(I) + (partial ? "p" : "") + "_r" + S(rows);
+  // in_width: the gate/up projection's padded output width per half;
+  // out_width: the down projection's padded input width (0: I).
+  if (!out_width) out_width = I;
+  if (!in_width) in_width = I;
+  k.name = "swiglu_i" + S(I) + (partial ? "p" : "") + (out_width != I || in_width != I ? "_o" + S(out_width) + "_g" + S(in_width) : "") + "_r" + S(rows);
   k.rows = rows;
   // K-split gate/up projections leave eight partial sums per element.
-  const std::uint32_t piece = partial ? 256 : 512;
-  if (I % piece) throw std::invalid_argument("SwiGLU width must be a multiple of 512");
+  const std::uint32_t piece = partial || I % 512 ? 256 : 512;
+  if (I % piece) throw std::invalid_argument("SwiGLU width must be a multiple of 256");
   k.segments = I / piece;
   k.bindings = 2;
   const auto layout = partial ? Layout::kPartial : Layout::kBlocked;
-  k.inputs.push_back({"g", 0, 0, 0, piece, false, layout, 2 * I / 8});
-  k.inputs.push_back({"u", 0, 0, std::uint64_t(I / 8) * 64, piece, false, layout, 2 * I / 8});
-  k.outputs.push_back({"xb", 1, 0, 0, piece, true, Layout::kBlocked, I / 8});
+  k.inputs.push_back({"g", 0, 0, 0, piece, false, layout, 2 * in_width / 8});
+  k.inputs.push_back({"u", 0, 0, std::uint64_t(in_width / 8) * 64, piece, false, layout, 2 * in_width / 8});
+  k.outputs.push_back({"xb", 1, 0, 0, piece, true, Layout::kBlocked, out_width / 8});
   const std::string load = partial ? R"(        %gv = scf.for %c = [%c0 to %c8p step %c1](%a = %zp : vector<16xf32>) -> (vector<16xf32>) {
           %v = vector.load %g[%c, %i] : view<8x@Pxf32> -> vector<16xf32>
           %s = vector.addf %a, %v : vector<16xf32>

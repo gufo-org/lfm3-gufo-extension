@@ -145,7 +145,20 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       } else {
         const Tensor* qkvg[] = {&l.q, &l.k, &l.v, &l.attn_gate};
         const Tensor* out[] = {&l.attn_out};
-        p.qkvg = m.Make(qkvg, true);
+        if (c.heads < 16) {
+          // QK prep reads 16 gate floats per row: zero rows pad the gates.
+          std::uint32_t rows = 0;
+          for (const auto* t : qkvg) rows += t->rows;
+          p.qkvg = m.dense->Upload(rows + 16 - c.heads, l.q.cols, [&](std::uint32_t r, std::span<float> out) {
+            for (const auto* t : qkvg) {
+              if (r < t->rows) return DecodeRow(*t, r, out);
+              r -= t->rows;
+            }
+            std::fill(out.begin(), out.end(), 0.0f);
+          }, true);
+        } else {
+          p.qkvg = m.Make(qkvg, true);
+        }
         p.out = m.Make(out, true);
       }
       const Tensor* gateup[] = {&l.gate, &l.up};
@@ -155,8 +168,11 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       p.gateup = m.Make(gateup, true);
       p.down = m.Make(down);
     }
-    const Tensor* head[] = {&w.output};
-    m.head = m.Make(head);
+    // Audio towers have no vocabulary head.
+    if (w.output.data) {
+      const Tensor* head[] = {&w.output};
+      m.head = m.Make(head);
+    }
     const char* glue = std::getenv("GUFO_LFM3_NPU_GLUE");
     if (!(glue && std::string_view(glue) == "host")) {
       auto d = std::make_unique<Device>();
@@ -180,7 +196,8 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       }
       {
         const char* r = std::getenv("GUFO_LFM3_NPU_RESIDENT");
-        d->resident = !(r && std::string_view(r) == "0");
+        // The resident FFN program supports H multiple of 1024 and I multiple of 1920.
+        d->resident = !(r && std::string_view(r) == "0") && H % 1024 == 0 && c.intermediate % (8 * 8 * 30) == 0;
       }
       d->w_first = d->Upload(std::vector<float>(Floats(w.layers[0].norm), Floats(w.layers[0].norm) + H));
       for (std::size_t i = 0; i < n; ++i) {
@@ -208,12 +225,16 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       auto& npu = *d->npu;
       d->x = npu.Alloc(R * H * 4), d->x2 = npu.Alloc(R * H * 4), d->o = npu.Alloc(R * H * 4), d->z = npu.Alloc(R * H * 4);
       d->xb2048 = npu.Alloc(B * H * 8 * 2 + pad);
-      d->xb_ffn = npu.Alloc(B * c.intermediate * 8 * 2 + pad);
+      std::uint32_t down_k = 0;
+      for (const auto& p : m.layers) down_k = std::max(down_k, p.down.shape.k);
+      d->xb_ffn = npu.Alloc(B * std::max(c.intermediate, down_k) * 8 * 2 + pad);
       d->y_proj = npu.Alloc(B * 2 * c.intermediate * 8 * 4 * 8 + pad * 4);  // eight partials
       d->y_out = npu.Alloc(B * H * 8 * 4 + pad * 4);
       d->y_down = npu.Alloc(B * 8 * H * 8 * 4 + pad * 4 * 8);
-      d->y_head = npu.Alloc(std::uint64_t(m.head.shape.m) * 64 * 4);
-      d->y_rows = npu.Alloc(std::uint64_t(m.head.shape.m) * 8 * 4);
+      if (w.output.data) {
+        d->y_head = npu.Alloc(std::uint64_t(m.head.shape.m) * 64 * 4);
+        d->y_rows = npu.Alloc(std::uint64_t(m.head.shape.m) * 8 * 4);
+      }
       d->xb_head = npu.Alloc(std::uint64_t(H) * 8 * 2);
       d->q = npu.Alloc(R * c.heads * D * 4), d->gates = npu.Alloc(R * 16 * 4);
       d->count = npu.Alloc(64);
@@ -244,7 +265,7 @@ State Backbone::NewState(std::uint32_t context) const {
       std::vector<float> cg(std::size_t(d->table_rows) * half), sg(cg.size()), cs(cg.size()), ss(cg.size());
       for (std::uint32_t p = 0; p < d->table_rows; ++p)
         for (std::uint32_t i = 0; i < half; ++i) {
-          const float ag = p * std::pow(c.theta, -2.0F * i / D) / Floats(impl_->w->rope_freqs)[i];
+          const float ag = p * std::pow(c.theta, -2.0F * i / D) / (impl_->w->rope_freqs.data ? Floats(impl_->w->rope_freqs)[i] : 1.0F);
           const float as = p * std::pow(c.theta_swa, -2.0F * i / D);
           cg[p * half + i] = std::cos(ag), sg[p * half + i] = std::sin(ag);
           cs[p * half + i] = std::cos(as), ss[p * half + i] = std::sin(as);
@@ -690,7 +711,7 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
       }
       timed("proj gateup", [&] { dense->Enqueue(p.gateup, d.xb2048, d.y_proj, blocks); });
       {
-        const int k = row_kernel(SwiGluPackKernel(I, R8, false));
+        const int k = row_kernel(SwiGluPackKernel(I, R8, false, p.down.shape.k, p.gateup.shape.m / 2));
         const int b[] = {d.y_proj, d.xb_ffn, d.count};
         timed("swiglu", [&] { npu.Enqueue(k, b); });
       }
