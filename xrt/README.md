@@ -210,3 +210,13 @@ once between prefill and decode.
 1x2 8x8 L1 layout. At 1024 × 2048 × 16384 it takes 2.98 ms (23.1 TFLOPS).
 The relative error against the exact Q8_0 weights is 1.1e-2, from the bfp16
 weight encoding.
+
+`iron/prefill/chain.py` chains GEMMs of different K and N in one XRT run on
+the same array configuration (mlir-aie's config1 microkernel, its license
+header kept in `mm_bfp_mixed.cc`). One FFN's projections for 1,024 tokens:
+
+| | Relative error | |
+| --- | ---: | ---: |
+| gate/up, 1024 × 2048 × 16384 | 1.1e-2 | |
+| down, 1024 × 7680 × 2048 | 1.6e-2 | |
+| Both, one run | | 4.25 ms, 23.7 TFLOPS |
