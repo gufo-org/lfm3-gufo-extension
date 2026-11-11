@@ -96,6 +96,24 @@ void Attention(const float* q, const float* k, const float* v, float* out, std::
   });
 }
 
+// y[r][m] = act(sum_k x[r][k] w[m][k] + bias[m]) in FP32 on the host, for
+// small exact matrices (DFT bases, 1x1 convolutions). act: 0 none, 1 SiLU,
+// 2 GELU.
+inline void HostGemm(const float* x, const float* w, const float* bias, float* y, std::size_t rows,
+                     std::size_t m, std::size_t k, int act = 0) {
+  ::lfm3::npu::Parallel(rows, [&](std::size_t r0, std::size_t r1) {
+    for (std::size_t r = r0; r < r1; ++r)
+      for (std::size_t o = 0; o < m; ++o) {
+        float sum = 0;
+        const float* xr = x + r * k;
+        const float* wr = w + o * k;
+        for (std::size_t i = 0; i < k; ++i) sum = std::fma(xr[i], wr[i], sum);
+        if (bias) sum += bias[o];
+        y[r * m + o] = act == 1 ? Silu(sum) : act == 2 ? Gelu(sum) : sum;
+      }
+  });
+}
+
 }  // namespace gufo::models::lfm3::npu
 
 #endif

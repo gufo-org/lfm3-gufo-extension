@@ -40,6 +40,7 @@ gufo_extension_target(
     npu/backbone.cpp
     npu/dense.cpp
     npu/program.cpp
+    npu/stack.cpp
     npu/host/npu_runtime.cpp
   LINK_LIBRARIES
     gufo_lfm3

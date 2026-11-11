@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <mutex>
@@ -14,6 +15,9 @@
 #include <utility>
 
 #include "../hip/ops.hpp"
+#include "../npu/dense.hpp"
+#include "../npu/host_ops.hpp"
+#include "../npu/stack.hpp"
 #include "../upload.hpp"
 #include "hip/ops.hpp"
 namespace gufo::models::lfm3_audio {
@@ -270,6 +274,16 @@ struct GraphExec {
   }
 };
 struct Model::Impl {
+  // NPU mode (GUFO_LFM3_DEVICE=npu): tower projections on the NPU, the rest
+  // on the host; tensors keep their mapped host data.
+  bool npu{};
+  std::unique_ptr<lfm3::npu::Stack> npu_encoder, npu_depth, npu_codec;
+  lfm3::npu::Dense::Matrix npu_pre_out, npu_proj1, npu_proj2;
+  std::vector<float> host_hann, host_dft, host_filters, host_istft;
+  std::vector<float> ComputeMelHost(std::span<const float> pcm);
+  void EncodeTokensNpu(std::span<const float> mel, int mel_first, int frames,
+                       int t0, int t1, lfm3::npu::Stack::State& state,
+                       float* out);
   std::shared_ptr<lfm3::Model> backbone;
   std::unique_ptr<core::GgufReader> reader;
   AudioWeights weights;
@@ -362,6 +376,9 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
   try {
     auto m = std::shared_ptr<Model>(new Model);
     auto& impl = *m->impl_;
+    if (const char* device = std::getenv("GUFO_LFM3_DEVICE");
+        device && std::string_view(device) == "npu")
+      impl.npu = true;
     // The projector streams from disk beside the backbone, binding against
     // the backbone geometry read from its metadata.
     std::string projector_error;
@@ -380,6 +397,8 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
       if (!w)
         return false;
       impl.weights = std::move(*w);
+      if (impl.npu)
+        return true;
       impl.weights.Visit([&](Tensor& t) { impl.device.Add(t); });
       impl.device.Upload(*impl.reader);
       impl.weights.Visit([&](Tensor& t) { impl.device.Resolve(t); });
@@ -431,9 +450,13 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
           basis[std::size_t(n) * 2 * bins + bins + k] =
               float(-scale * std::sin(angle));
         }
+      if (impl.npu) {
+        impl.host_istft = basis;
+      } else {
       impl.istft_basis = Buffer(basis.size() * 4);
       Check(hipMemcpy(impl.istft_basis.data, basis.data(), basis.size() * 4,
                       hipMemcpyHostToDevice));
+      }
     }
     {
       // Analysis tables: periodic Hann, DFT rows [cos | -sin], Slaney mel.
@@ -467,9 +490,31 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
         b = Buffer(v.size() * 4);
         Check(hipMemcpy(b.data, v.data(), v.size() * 4, hipMemcpyHostToDevice));
       };
+      if (impl.npu) {
+        impl.host_hann = hann;
+        impl.host_dft = dft;
+        impl.host_filters = filters;
+      } else {
       upload(impl.stft_window, hann);
       upload(impl.dft_basis, dft);
       upload(impl.mel_filters, filters);
+      }
+    }
+    if (impl.npu) {
+      auto& dense = lfm3::npu::Dense::Shared();
+      const auto& w = impl.weights;
+      impl.npu_encoder = std::make_unique<lfm3::npu::Stack>(w.encoder);
+      const Tensor* pre[] = {&w.pre_out};
+      const Tensor* p1[] = {&w.proj1};
+      const Tensor* p2[] = {&w.proj2};
+      impl.npu_pre_out = dense.Upload(pre);
+      impl.npu_proj1 = dense.Upload(p1);
+      impl.npu_proj2 = dense.Upload(p2);
+      if (!w.depth.blocks.empty())
+        impl.npu_depth = std::make_unique<lfm3::npu::Stack>(w.depth);
+      if (!w.codec.blocks.empty())
+        impl.npu_codec = std::make_unique<lfm3::npu::Stack>(w.codec);
+      return m;
     }
     impl.encoder_stream = std::make_unique<Stream>();
     impl.encoder_scratch = std::make_unique<Scratch>(impl.weights.encoder,
@@ -497,6 +542,11 @@ bool Model::Features(std::span<const float> pcm, std::vector<float>* mel,
   try {
     auto& impl = *impl_;
     const std::lock_guard lock(impl.encoder_mutex);
+    if (impl.npu) {
+      *mel = impl.ComputeMelHost(pcm);
+      *frames = std::uint32_t(mel->size() / AudioWeights::kMelBins);
+      return true;
+    }
     const auto T = impl.ComputeMel(pcm, *impl.encoder_scratch);
     mel->resize(std::size_t(T) * AudioWeights::kMelBins);
     Check(hipMemcpyAsync(mel->data(), impl.mel.data, mel->size() * 4,
@@ -574,6 +624,117 @@ void Model::Impl::EncodeTokens(std::span<const float> mel, int mel_first,
   }
   Check(hipGetLastError());
 }
+std::vector<float> Model::Impl::ComputeMelHost(std::span<const float> pcm) {
+  constexpr int B = AudioWeights::kMelBins;
+  const auto T = MelFrames(pcm.size());
+  const std::size_t padded = std::size_t(T - 1) * kHop + kFft;
+  std::vector<float> samples(padded, 0.0f), frames(std::size_t(T) * kFft),
+      spectrum(std::size_t(T) * 2 * kBins), power(std::size_t(T) * kBins),
+      mel(std::size_t(T) * B);
+  std::copy(pcm.begin(), pcm.end(), samples.begin());
+  for (std::size_t i = 0; i < frames.size(); ++i)
+    frames[i] = samples[(i / kFft) * kHop + i % kFft] * host_hann[i % kFft];
+  lfm3::npu::HostGemm(frames.data(), host_dft.data(), nullptr, spectrum.data(),
+                      T, 2 * kBins, kFft);
+  for (std::size_t i = 0; i < power.size(); ++i) {
+    const float* row = spectrum.data() + (i / kBins) * 2 * kBins;
+    const float re = row[i % kBins], im = row[kBins + i % kBins];
+    power[i] = re * re + im * im;
+  }
+  lfm3::npu::HostGemm(power.data(), host_filters.data(), nullptr, mel.data(),
+                      T, B, kBins);
+  for (auto& v : mel)
+    v = (std::max(std::log10(v), -12.0F) + 4.0F) / 4.0F;
+  return mel;
+}
+void Model::Impl::EncodeTokensNpu(std::span<const float> mel, int mel_first,
+                                  int frames, int t0_all, int t1_all,
+                                  lfm3::npu::Stack::State& state, float* out) {
+  constexpr int B = AudioWeights::kMelBins;
+  const auto& w = weights;
+  const auto& e = w.encoder;
+  auto& dense = lfm3::npu::Dense::Shared();
+  const int C = int(w.downsample_channels);
+  const int hidden = int(backbone->config().hidden);
+  constexpr int kMargin = 16;
+  auto conv = [&](const float* in, int Wi, int Hi, const Tensor& wt,
+                  const Tensor& bias, bool first, std::vector<float>& o) {
+    const int H = (Hi + 1) / 2, W = (Wi + 1) / 2;
+    o.assign(std::size_t(W) * H * C, 0.0f);
+    const float* wv = F(wt);
+    const float* bv = F(bias);
+    ::lfm3::npu::Parallel(std::size_t(W), [&](std::size_t t0, std::size_t t1) {
+      for (std::size_t tt = t0; tt < t1; ++tt)
+        for (int h = 0; h < H; ++h)
+          for (int c = 0; c < C; ++c) {
+            float sum = bv[c];
+            for (int kh = 0; kh < 3; ++kh) {
+              const int ih = 2 * h - 1 + kh;
+              if (ih < 0 || ih >= Hi)
+                continue;
+              for (int kw = 0; kw < 3; ++kw) {
+                const int it = 2 * int(tt) - 1 + kw;
+                if (it >= 0 && it < Wi)
+                  sum = std::fma(wv[c * 9 + kh * 3 + kw],
+                                 first ? in[std::size_t(it) * Hi + ih]
+                                       : in[(std::size_t(it) * Hi + ih) * C + c],
+                                 sum);
+              }
+            }
+            o[(tt * H + h) * C + c] = first ? lfm3::npu::Silu(sum) : sum;
+          }
+    });
+  };
+  for (int t0 = t0_all; t0 < t1_all; t0 += kRows) {
+    const int t1 = std::min(t1_all, t0 + kRows), n = t1 - t0;
+    const int f0 = std::max(0, 8 * t0 - kMargin);
+    const int f1 = std::min(frames, 8 * t1 + kMargin);
+    if (f0 < mel_first || f1 - mel_first > int(mel.size() / B))
+      throw std::logic_error("LFM3-Audio encoder window outside its mel");
+    const int T = f1 - f0;
+    const float* window = mel.data() + std::size_t(f0 - mel_first) * B;
+    const int W1 = (T + 1) / 2, H1 = (B + 1) / 2;
+    const int W2 = (W1 + 1) / 2, H2 = (H1 + 1) / 2;
+    const int W3 = (W2 + 1) / 2, H3 = (H2 + 1) / 2;
+    std::vector<float> c1, c2, c3(std::size_t(W2) * H2 * C), flat;
+    conv(window, T, B, w.conv_weight[0], w.conv_bias[0], true, c1);
+    conv(c1.data(), W1, H1, w.conv_weight[1], w.conv_bias[1], false, c2);
+    lfm3::npu::HostGemm(c2.data(), F(w.conv_weight[2]), F(w.conv_bias[2]),
+                        c3.data(), std::size_t(W2) * H2, C, C, 1);
+    conv(c3.data(), W2, H2, w.conv_weight[3], w.conv_bias[3], false, c2);
+    c3.assign(std::size_t(W3) * H3 * C, 0.0f);
+    lfm3::npu::HostGemm(c2.data(), F(w.conv_weight[4]), F(w.conv_bias[4]),
+                        c3.data(), std::size_t(W3) * H3, C, C, 1);
+    flat.assign(c3.size(), 0.0f);
+    for (std::size_t i = 0; i < c3.size(); ++i) {
+      const int c = int(i % C), h = int((i / C) % H3), tt = int(i / (std::size_t(C) * H3));
+      flat[std::size_t(tt) * C * H3 + std::size_t(c) * H3 + h] = c3[i];
+    }
+    const int skip = t0 - f0 / 8;
+    std::vector<float> x(std::size_t(n) * e.hidden), z(x.size()), o(x.size());
+    dense.Run(npu_pre_out, std::span(flat).subspan(std::size_t(skip) * H3 * C),
+              std::uint32_t(n), x);
+    for (int r = 0; r < n; ++r)
+      for (std::uint32_t i = 0; i < e.hidden; ++i)
+        x[std::size_t(r) * e.hidden + i] += F(w.pre_out_bias)[i];
+    npu_encoder->Run(x, n, &state, int(w.encoder_window), z);
+    lfm3::npu::LayerNormRows(z.data(), n, e.hidden, F(w.proj_norm),
+                             F(w.proj_norm_bias), 1e-5F, o.data());
+    std::vector<float> mid(std::size_t(n) * w.proj1.rows);
+    dense.Run(npu_proj1, o, std::uint32_t(n), mid);
+    for (int r = 0; r < n; ++r)
+      for (std::uint32_t i = 0; i < w.proj1.rows; ++i) {
+        auto& v = mid[std::size_t(r) * w.proj1.rows + i];
+        v = lfm3::npu::Gelu(v + F(w.proj1_bias)[i]);
+      }
+    std::vector<float> emb(std::size_t(n) * hidden);
+    dense.Run(npu_proj2, mid, std::uint32_t(n), emb);
+    for (int r = 0; r < n; ++r)
+      for (int i = 0; i < hidden; ++i)
+        out[std::size_t(t0 - t0_all + r) * hidden + i] =
+            emb[std::size_t(r) * hidden + i] + F(w.proj2_bias)[i];
+  }
+}
 bool Model::Encode(std::span<const float> pcm, std::vector<float>* embeddings,
                    std::string* error) {
   if (pcm.empty()) {
@@ -587,6 +748,7 @@ bool Model::Encode(std::span<const float> pcm, std::vector<float>* embeddings,
 struct AudioInput::Impl {
   std::shared_ptr<Model> model;
   StackState state;
+  lfm3::npu::Stack::State npu_state;
   // Samples from the first frame not yet computed; mel frames from
   // mel_first, which the next tokens' receptive fields still read.
   std::vector<float> pending, mel;
@@ -598,6 +760,10 @@ AudioInput::AudioInput(std::shared_ptr<Model> model)
     : impl_(std::make_unique<Impl>()) {
   impl_->model = std::move(model);
   auto& m = *impl_->model->impl_;
+  if (m.npu) {
+    impl_->npu_state = m.npu_encoder->NewState(m.weights.encoder_window);
+    return;
+  }
   impl_->state = StackState(m.weights.encoder, m.weights.encoder_window);
   impl_->state.Clear(m.weights.encoder, m.encoder_stream->value);
   Check(hipStreamSynchronize(m.encoder_stream->value));
@@ -641,7 +807,19 @@ bool AudioInput::Push(std::span<const float> pcm, bool finish,
     const int tokens = finish ? (st.frames + std::max(count, 0) + 7) / 8
                               : (st.frames + count) / 8;
     const std::lock_guard lock(m.encoder_mutex);
-    if (count > 0) {
+    if (count > 0 && m.npu) {
+      const auto used =
+          finish ? st.pending.size() : std::size_t(count - 1) * kHop + kFft;
+      const auto mel = m.ComputeMelHost({st.pending.data(), used});
+      if (int(mel.size() / B) != count)
+        throw std::logic_error("LFM3-Audio streaming mel frame count");
+      st.mel.insert(st.mel.end(), mel.begin(), mel.end());
+      st.frames += count;
+      st.pending.erase(st.pending.begin(),
+                       st.pending.begin() +
+                           std::ptrdiff_t(std::min(st.pending.size(),
+                                                   std::size_t(count) * kHop)));
+    } else if (count > 0) {
       const auto used =
           finish ? st.pending.size() : std::size_t(count - 1) * kHop + kFft;
       const auto T =
@@ -663,8 +841,12 @@ bool AudioInput::Push(std::span<const float> pcm, bool finish,
     const int hidden = int(m.backbone->config().hidden);
     if (tokens > st.tokens) {
       embeddings->resize(std::size_t(tokens - st.tokens) * hidden);
-      m.EncodeTokens(st.mel, st.mel_first, st.frames, st.tokens, tokens,
-                     st.state, embeddings->data());
+      if (m.npu)
+        m.EncodeTokensNpu(st.mel, st.mel_first, st.frames, st.tokens, tokens,
+                          st.npu_state, embeddings->data());
+      else
+        m.EncodeTokens(st.mel, st.mel_first, st.frames, st.tokens, tokens,
+                       st.state, embeddings->data());
       st.tokens = tokens;
     }
     // Keep the frames the next token's window starts from.
