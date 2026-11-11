@@ -116,6 +116,16 @@ def pack(gguf, ctx=4096):
 
     return lay, S, W, ref, emb, out_norm, rope
 
+def dispatch_args(tok, pos, window=L.WINDOW):
+    """Dispatch-time scalars of one decode token (see lfm3_token.token)."""
+    first = max(0, pos - window + 1)
+    cached_swa = pos - first
+    recs = max(2, -(-pos // 16))     # the global stream is two DMA tasks of at least one record
+    b = max(1, recs - 64)
+    assert recs - b <= 64 and b <= 64, "decode context above 2048 positions needs more stream tasks"
+    return [tok, pos, first, cached_swa, recs, max(1, -(-cached_swa // 16)), recs - b, b]
+
+
 def main():
     xclbin, so, gguf = sys.argv[1:4]
     tokens = [int(x) for x in sys.argv[4:]] or [1, 1785, 3758, 314, 7428, 25, 1003, 2091]
@@ -139,7 +149,7 @@ def main():
     del W
     lib = ctypes.CDLL(so)
     lib.dispatch_generate.restype = ctypes.c_int64
-    lib.dispatch_generate.argtypes = [ctypes.c_int32] * 6 + [ctypes.POINTER(ctypes.POINTER(ctypes.c_uint32))]
+    lib.dispatch_generate.argtypes = [ctypes.c_int32] * 8 + [ctypes.POINTER(ctypes.POINTER(ctypes.c_uint32))]
 
     # float32 model on the same weights.
     deq = lambda cs: (cs[0].astype(np.float32).reshape(cs[0].shape[0], -1, 32) * cs[1][:, :, None]).reshape(cs[0].shape[0], -1)
@@ -202,7 +212,7 @@ def main():
     for p, tok in enumerate(tokens):
         first = max(0, p - L.WINDOW + 1)
         cached_swa = p - first
-        args = [tok, p, first, cached_swa, max(1, -(-p // 16)), max(1, -(-cached_swa // 16))]
+        args = dispatch_args(tok, p)
         n = lib.dispatch_generate(*args, ctypes.byref(ptr))
         ins = np.ctypeslib.as_array(ptr, shape=(n,)).copy()
         bo_i = pyxrt.bo(dev, ins.nbytes, pyxrt.bo.cacheable, kern.group_id(1))

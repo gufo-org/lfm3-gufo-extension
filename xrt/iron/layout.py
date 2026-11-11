@@ -135,8 +135,11 @@ class Layout:
                     heads={s: [("S", self.head_records(q, 2)),
                                ("S", t(self.s_bytes, rope + d["pos"] * 512, [2, 1, REC // 512, 512], [0, 0, 512, 1]))]
                            for s in range(0, 16, 2)},
-                    stream={s: [("S", t(self.s_bytes, kv + (s // 2) * ROWS * self.ctx * 512 + first * 512,
-                                        [recs, 2, REC // 512, 512], [16 * 512, self.ctx * 512, 512, 1]))]
+                    stream={s: ([("S", t(self.s_bytes, kv + (s // 2) * ROWS * self.ctx * 512 + first * 512,
+                                         [recs, 2, REC // 512, 512], [16 * 512, self.ctx * 512, 512, 1]))] if swa else
+                                [("S", t(self.s_bytes, kv + (s // 2) * ROWS * self.ctx * 512 + at * 16 * 512,
+                                         [n, 2, REC // 512, 512], [16 * 512, self.ctx * 512, 512, 1]))
+                                 for at, n in ((0, d["global_a"]), (d["global_a"], d["global_b"]))])
                             for s in range(0, 16, 2)},
                     drains=lambda c, kv=kv: [
                         t(self.s_bytes, self.junk + c * 128, [1, 1, 2, 64], [0, 0, 64, 1]),

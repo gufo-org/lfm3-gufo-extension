@@ -36,7 +36,8 @@ def tap(total, offset, sizes, strides):
 @iron.jit
 def token(S: InOut, W: In, *, tok: DispatchTime[np.int32], pos: DispatchTime[np.int32],
           swa_first: DispatchTime[np.int32], swa_cached: DispatchTime[np.int32],
-          global_recs: DispatchTime[np.int32], swa_recs: DispatchTime[np.int32], ctx: CompileTime[int] = 4096):
+          global_recs: DispatchTime[np.int32], swa_recs: DispatchTime[np.int32],
+          global_a: DispatchTime[np.int32], global_b: DispatchTime[np.int32], ctx: CompileTime[int] = 4096):
     lay = L.Layout(ctx)
     in_ty = np.ndarray[(L.BLOCK,), np.dtype[np.int8]]
     rec_ty = np.ndarray[(REC,), np.dtype[np.int8]]
@@ -124,9 +125,11 @@ def token(S: InOut, W: In, *, tok: DispatchTime[np.int32], pos: DispatchTime[np.
     w_prods = [f.prod() for f in w_fifos]
     y_conses = [f.cons() for f in y_fifos]
 
-    def sequence(S, W, tok, pos, swa_first, swa_cached, global_recs, swa_recs, wh, yh):
+    def sequence(S, W, tok, pos, swa_first, swa_cached, global_recs, swa_recs, global_a, global_b, wh, yh):
+        # A DMA task repeats at most 64 times, so the global KV stream is two tasks of
+        # global_a + global_b = global_recs records (both at least 1).
         d = dict(tok=tok, pos=pos, swa_first=swa_first, swa_cached=swa_cached, global_recs=global_recs,
-                 swa_recs=swa_recs)
+                 swa_recs=swa_recs, global_a=global_a, global_b=global_b)
         for c in range(COLS):
             for j in range(ROWS):
                 for i, l in enumerate(L.ATTN_LAYERS):
@@ -150,7 +153,8 @@ def token(S: InOut, W: In, *, tok: DispatchTime[np.int32], pos: DispatchTime[np.
                     yh[c].drain(S, t, wait=True, group=tg)
             tg.finish()
 
-    rt = Runtime(sequence, [s_ty, w_ty, tok, pos, swa_first, swa_cached, global_recs, swa_recs, w_prods, y_conses])
+    rt = Runtime(sequence, [s_ty, w_ty, tok, pos, swa_first, swa_cached, global_recs, swa_recs, global_a, global_b,
+                            w_prods, y_conses])
     return Program(from_name("npu2", n_cols=None), rt, workers=workers).resolve_program()
 
 
