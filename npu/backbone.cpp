@@ -683,7 +683,7 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
         const std::uint32_t cap = swa ? d.cap_sliding : d.cap_global;
         timed("proj qkvg", [&] { dense->Enqueue(p.qkvg, d.xb2048, d.y_proj, blocks); });
         AttentionShape s{c.heads, c.kv_heads[il], D, p.qkvg.shape.m / 8, true, cap, Device::kSlots, d.table_rows, R,
-                         decision && !swa, d.mma};
+                         decision && !swa && !groups.empty(), d.mma};  // group masks only with groups
         const std::string tag = std::string(swa ? "s" : "g") + std::to_string(c.kv_heads[il]) + (s.groups ? "x" : "");
         AttentionShape s8 = s;
         s8.rows = R8;

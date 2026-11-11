@@ -310,8 +310,9 @@ struct Model::Impl {
   bool npu{};
   std::unique_ptr<lfm3::npu::Stack> npu_encoder, npu_depth, npu_codec;
   // The codec stack on the NPU device path (every operation on the NPU).
-  std::unique_ptr<lfm3::Weights> codec_weights;
-  std::unique_ptr<lfm3::npu::Backbone> codec_device;
+  std::unique_ptr<lfm3::Weights> codec_weights, depth_weights;
+  std::unique_ptr<lfm3::npu::Backbone> codec_device, depth_device;
+  lfm3::npu::State depth_state;
   lfm3::npu::Dense::Matrix npu_pre_out, npu_proj1, npu_proj2, npu_depth_in,
       npu_codec_in, npu_codec_out;
   std::vector<lfm3::npu::Dense::Matrix> npu_codebooks;  // logits per codebook
@@ -548,6 +549,16 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
       impl.npu_proj2 = dense.Upload(p2);
       if (!w.depth.blocks.empty()) {
         impl.npu_depth = std::make_unique<lfm3::npu::Stack>(w.depth);
+        // The depth decoder runs on the NPU device path, bidirectional over
+        // its codebook rows (GUFO_LFM3_DEPTH_DEVICE=0: host-glue stack;
+        // =check: both, with their largest difference).
+        if (const char* e = std::getenv("GUFO_LFM3_DEPTH_DEVICE"); !(e && std::string_view(e) == "0")) {
+          impl.depth_weights = std::make_unique<lfm3::Weights>(StackWeights(w.depth, 0));
+          std::string error;
+          impl.depth_device = lfm3::npu::Backbone::Load(*impl.depth_weights, &error);
+          if (!impl.depth_device) throw std::runtime_error("NPU depth decoder: " + error);
+          impl.depth_state = impl.depth_device->NewState(64);
+        }
         const Tensor* din[] = {&w.depth_in};
         impl.npu_depth_in = dense.Upload(din);
         for (std::uint32_t c = 0; c < AudioWeights::kCodebooks; ++c) {
@@ -1161,6 +1172,22 @@ struct Voice::Npu {
     counts.assign(std::size_t(K) * V, 0);
   }
   Model::Impl& impl() const { return *model->impl_; }
+  // The depth stack over K rows (one bidirectional sequence).
+  void RunDepth(std::span<const float> x, std::span<float> z) const {
+    auto& m = impl();
+    if (!m.depth_device) return m.npu_depth->Run(x, K, nullptr, 0, z);
+    std::vector<lfm3::npu::Row> rws(K);
+    for (int r = 0; r < K; ++r) rws[r] = {&m.depth_state, std::uint32_t(r), false};
+    m.depth_device->Forward(x, rws, z, {}, true);
+    static const bool check = std::getenv("GUFO_LFM3_DEPTH_DEVICE") && std::string_view(std::getenv("GUFO_LFM3_DEPTH_DEVICE")) == "check";
+    if (check) {
+      std::vector<float> zh(z.size());
+      m.npu_depth->Run(x, K, nullptr, 0, zh);
+      double d = 0, mx = 0;
+      for (std::size_t i = 0; i < z.size(); ++i) d = std::max(d, double(std::abs(z[i] - zh[i]))), mx = std::max(mx, double(std::abs(zh[i])));
+      std::fprintf(stderr, "depth device vs host: max diff %.3g of %.3g\n", d, mx);
+    }
+  }
   void Reset() {
     codec_state.Clear();
     if (impl().codec_device) {
@@ -1199,7 +1226,7 @@ struct Voice::Npu {
       for (std::size_t i = 0; i < D; ++i)
         x[c * D + i] = base[c * D + i] + (masked[c] ? F(w.mask_embedding)[i] : row[i]);
     }
-    impl().npu_depth->Run(x, K, nullptr, 0, z);
+    RunDepth(x, z);
     return z;
   }
   // Logits of codebook c from its trunk row.
