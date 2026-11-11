@@ -1,0 +1,282 @@
+aie2p.target<array> @npu
+
+// Cross-column barrier, chain then multicast: column c passes a token to
+// c + 1 through a channel in c + 1's tile; column 7 publishes "done", which a
+// DMA strand multicasts as "go" to every column. Each column counts rounds.
+pipeline.def<kernel> public retain target(@npu) @barrier() run(%out_arg: buffer) {
+  %out_u = buffer.assume.noalias %out_arg : buffer
+  %out = buffer.assume.alignment %out_u {minimum_alignment = 64} : buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %rounds = index.constant @ROUNDS : index
+  %rb = index.constant 64 : offset
+  %m0 = pipeline.memory<workgroup>[0, 2] : pool
+  %gs0 = buffer.alloca<workgroup> pool(%m0) align(64) %rb : buffer
+  %gv0 = buffer.view %gs0[%origin] : buffer -> view<1x16xi32>
+  %go0 = channel.bind<fifo> %gv0, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %os0 = buffer.alloca<workgroup> pool(%m0) align(64) %rb : buffer
+  %ov0 = buffer.view %os0[%origin] : buffer -> view<1x16xi32>
+  %res0 = channel.bind<fifo> %ov0, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %m1 = pipeline.memory<workgroup>[1, 2] : pool
+  %gs1 = buffer.alloca<workgroup> pool(%m1) align(64) %rb : buffer
+  %gv1 = buffer.view %gs1[%origin] : buffer -> view<1x16xi32>
+  %go1 = channel.bind<fifo> %gv1, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %os1 = buffer.alloca<workgroup> pool(%m1) align(64) %rb : buffer
+  %ov1 = buffer.view %os1[%origin] : buffer -> view<1x16xi32>
+  %res1 = channel.bind<fifo> %ov1, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %ts1 = buffer.alloca<workgroup> pool(%m0) align(64) %rb : buffer
+  %tv1 = buffer.view %ts1[%origin] : buffer -> view<1x16xi32>
+  %tok1 = channel.bind<fifo> %tv1, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %m2 = pipeline.memory<workgroup>[2, 2] : pool
+  %gs2 = buffer.alloca<workgroup> pool(%m2) align(64) %rb : buffer
+  %gv2 = buffer.view %gs2[%origin] : buffer -> view<1x16xi32>
+  %go2 = channel.bind<fifo> %gv2, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %os2 = buffer.alloca<workgroup> pool(%m2) align(64) %rb : buffer
+  %ov2 = buffer.view %os2[%origin] : buffer -> view<1x16xi32>
+  %res2 = channel.bind<fifo> %ov2, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %ts2 = buffer.alloca<workgroup> pool(%m1) align(64) %rb : buffer
+  %tv2 = buffer.view %ts2[%origin] : buffer -> view<1x16xi32>
+  %tok2 = channel.bind<fifo> %tv2, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %m3 = pipeline.memory<workgroup>[3, 2] : pool
+  %gs3 = buffer.alloca<workgroup> pool(%m3) align(64) %rb : buffer
+  %gv3 = buffer.view %gs3[%origin] : buffer -> view<1x16xi32>
+  %go3 = channel.bind<fifo> %gv3, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %os3 = buffer.alloca<workgroup> pool(%m3) align(64) %rb : buffer
+  %ov3 = buffer.view %os3[%origin] : buffer -> view<1x16xi32>
+  %res3 = channel.bind<fifo> %ov3, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %ts3 = buffer.alloca<workgroup> pool(%m2) align(64) %rb : buffer
+  %tv3 = buffer.view %ts3[%origin] : buffer -> view<1x16xi32>
+  %tok3 = channel.bind<fifo> %tv3, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %m4 = pipeline.memory<workgroup>[4, 2] : pool
+  %gs4 = buffer.alloca<workgroup> pool(%m4) align(64) %rb : buffer
+  %gv4 = buffer.view %gs4[%origin] : buffer -> view<1x16xi32>
+  %go4 = channel.bind<fifo> %gv4, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %os4 = buffer.alloca<workgroup> pool(%m4) align(64) %rb : buffer
+  %ov4 = buffer.view %os4[%origin] : buffer -> view<1x16xi32>
+  %res4 = channel.bind<fifo> %ov4, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %ts4 = buffer.alloca<workgroup> pool(%m3) align(64) %rb : buffer
+  %tv4 = buffer.view %ts4[%origin] : buffer -> view<1x16xi32>
+  %tok4 = channel.bind<fifo> %tv4, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %m5 = pipeline.memory<workgroup>[5, 2] : pool
+  %gs5 = buffer.alloca<workgroup> pool(%m5) align(64) %rb : buffer
+  %gv5 = buffer.view %gs5[%origin] : buffer -> view<1x16xi32>
+  %go5 = channel.bind<fifo> %gv5, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %os5 = buffer.alloca<workgroup> pool(%m5) align(64) %rb : buffer
+  %ov5 = buffer.view %os5[%origin] : buffer -> view<1x16xi32>
+  %res5 = channel.bind<fifo> %ov5, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %ts5 = buffer.alloca<workgroup> pool(%m4) align(64) %rb : buffer
+  %tv5 = buffer.view %ts5[%origin] : buffer -> view<1x16xi32>
+  %tok5 = channel.bind<fifo> %tv5, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %m6 = pipeline.memory<workgroup>[6, 2] : pool
+  %gs6 = buffer.alloca<workgroup> pool(%m6) align(64) %rb : buffer
+  %gv6 = buffer.view %gs6[%origin] : buffer -> view<1x16xi32>
+  %go6 = channel.bind<fifo> %gv6, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %os6 = buffer.alloca<workgroup> pool(%m6) align(64) %rb : buffer
+  %ov6 = buffer.view %os6[%origin] : buffer -> view<1x16xi32>
+  %res6 = channel.bind<fifo> %ov6, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %ts6 = buffer.alloca<workgroup> pool(%m5) align(64) %rb : buffer
+  %tv6 = buffer.view %ts6[%origin] : buffer -> view<1x16xi32>
+  %tok6 = channel.bind<fifo> %tv6, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %m7 = pipeline.memory<workgroup>[7, 2] : pool
+  %gs7 = buffer.alloca<workgroup> pool(%m7) align(64) %rb : buffer
+  %gv7 = buffer.view %gs7[%origin] : buffer -> view<1x16xi32>
+  %go7 = channel.bind<fifo> %gv7, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %os7 = buffer.alloca<workgroup> pool(%m7) align(64) %rb : buffer
+  %ov7 = buffer.view %os7[%origin] : buffer -> view<1x16xi32>
+  %res7 = channel.bind<fifo> %ov7, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %ts7 = buffer.alloca<workgroup> pool(%m6) align(64) %rb : buffer
+  %tv7 = buffer.view %ts7[%origin] : buffer -> view<1x16xi32>
+  %tok7 = channel.bind<fifo> %tv7, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  %ds = buffer.alloca<workgroup> pool(%m7) align(64) %rb : buffer
+  %dv = buffer.view %ds[%origin] : buffer -> view<1x16xi32>
+  %done = channel.bind<fifo> %dv, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
+  pipeline.strand workers([0, 2], [1, 1], [1, 1]) {
+    %acc = scf.for %r = [%c0 to %rounds step %c1](%a = %c0 : index) -> (index) {
+      %nw, %np = channel.reserve %tok1 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      channel.publish %nw : write<tile<16xi32>>
+      %gr, %gp = channel.acquire %go0 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %gr : read<tile<16xi32>>
+      %an = index.add %a, %c1 : index
+      scf.yield %an : index
+    }
+    %vw, %vp = channel.reserve %res0 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+    %ai = index.cast %acc : index to i32
+    view.store %ai, %vp[%c0] : i32, view<16xi32>
+    %o = index.constant 0 : offset
+    %dst = buffer.view %out[%o] : buffer -> view<16xi32>
+    %cp = kernel.async.copy %vp to %dst {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<16xi32> to view<16xi32> -> kernel.async.token
+    %cg = kernel.async.group %cp : kernel.async.token -> kernel.async.group
+    kernel.async.wait %cg {newer_groups = 0} : kernel.async.group
+    channel.publish %vw : write<tile<16xi32>>
+  }
+  pipeline.strand workers([1, 2], [1, 1], [1, 1]) {
+    %acc = scf.for %r = [%c0 to %rounds step %c1](%a = %c0 : index) -> (index) {
+      %tr, %tp = channel.acquire %tok1 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %tr : read<tile<16xi32>>
+      %nw, %np = channel.reserve %tok2 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      channel.publish %nw : write<tile<16xi32>>
+      %gr, %gp = channel.acquire %go1 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %gr : read<tile<16xi32>>
+      %an = index.add %a, %c1 : index
+      scf.yield %an : index
+    }
+    %vw, %vp = channel.reserve %res1 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+    %ai = index.cast %acc : index to i32
+    view.store %ai, %vp[%c0] : i32, view<16xi32>
+    %o = index.constant 64 : offset
+    %dst = buffer.view %out[%o] : buffer -> view<16xi32>
+    %cp = kernel.async.copy %vp to %dst {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<16xi32> to view<16xi32> -> kernel.async.token
+    %cg = kernel.async.group %cp : kernel.async.token -> kernel.async.group
+    kernel.async.wait %cg {newer_groups = 0} : kernel.async.group
+    channel.publish %vw : write<tile<16xi32>>
+  }
+  pipeline.strand workers([2, 2], [1, 1], [1, 1]) {
+    %acc = scf.for %r = [%c0 to %rounds step %c1](%a = %c0 : index) -> (index) {
+      %tr, %tp = channel.acquire %tok2 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %tr : read<tile<16xi32>>
+      %nw, %np = channel.reserve %tok3 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      channel.publish %nw : write<tile<16xi32>>
+      %gr, %gp = channel.acquire %go2 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %gr : read<tile<16xi32>>
+      %an = index.add %a, %c1 : index
+      scf.yield %an : index
+    }
+    %vw, %vp = channel.reserve %res2 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+    %ai = index.cast %acc : index to i32
+    view.store %ai, %vp[%c0] : i32, view<16xi32>
+    %o = index.constant 128 : offset
+    %dst = buffer.view %out[%o] : buffer -> view<16xi32>
+    %cp = kernel.async.copy %vp to %dst {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<16xi32> to view<16xi32> -> kernel.async.token
+    %cg = kernel.async.group %cp : kernel.async.token -> kernel.async.group
+    kernel.async.wait %cg {newer_groups = 0} : kernel.async.group
+    channel.publish %vw : write<tile<16xi32>>
+  }
+  pipeline.strand workers([3, 2], [1, 1], [1, 1]) {
+    %acc = scf.for %r = [%c0 to %rounds step %c1](%a = %c0 : index) -> (index) {
+      %tr, %tp = channel.acquire %tok3 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %tr : read<tile<16xi32>>
+      %nw, %np = channel.reserve %tok4 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      channel.publish %nw : write<tile<16xi32>>
+      %gr, %gp = channel.acquire %go3 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %gr : read<tile<16xi32>>
+      %an = index.add %a, %c1 : index
+      scf.yield %an : index
+    }
+    %vw, %vp = channel.reserve %res3 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+    %ai = index.cast %acc : index to i32
+    view.store %ai, %vp[%c0] : i32, view<16xi32>
+    %o = index.constant 192 : offset
+    %dst = buffer.view %out[%o] : buffer -> view<16xi32>
+    %cp = kernel.async.copy %vp to %dst {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<16xi32> to view<16xi32> -> kernel.async.token
+    %cg = kernel.async.group %cp : kernel.async.token -> kernel.async.group
+    kernel.async.wait %cg {newer_groups = 0} : kernel.async.group
+    channel.publish %vw : write<tile<16xi32>>
+  }
+  pipeline.strand workers([4, 2], [1, 1], [1, 1]) {
+    %acc = scf.for %r = [%c0 to %rounds step %c1](%a = %c0 : index) -> (index) {
+      %tr, %tp = channel.acquire %tok4 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %tr : read<tile<16xi32>>
+      %nw, %np = channel.reserve %tok5 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      channel.publish %nw : write<tile<16xi32>>
+      %gr, %gp = channel.acquire %go4 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %gr : read<tile<16xi32>>
+      %an = index.add %a, %c1 : index
+      scf.yield %an : index
+    }
+    %vw, %vp = channel.reserve %res4 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+    %ai = index.cast %acc : index to i32
+    view.store %ai, %vp[%c0] : i32, view<16xi32>
+    %o = index.constant 256 : offset
+    %dst = buffer.view %out[%o] : buffer -> view<16xi32>
+    %cp = kernel.async.copy %vp to %dst {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<16xi32> to view<16xi32> -> kernel.async.token
+    %cg = kernel.async.group %cp : kernel.async.token -> kernel.async.group
+    kernel.async.wait %cg {newer_groups = 0} : kernel.async.group
+    channel.publish %vw : write<tile<16xi32>>
+  }
+  pipeline.strand workers([5, 2], [1, 1], [1, 1]) {
+    %acc = scf.for %r = [%c0 to %rounds step %c1](%a = %c0 : index) -> (index) {
+      %tr, %tp = channel.acquire %tok5 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %tr : read<tile<16xi32>>
+      %nw, %np = channel.reserve %tok6 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      channel.publish %nw : write<tile<16xi32>>
+      %gr, %gp = channel.acquire %go5 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %gr : read<tile<16xi32>>
+      %an = index.add %a, %c1 : index
+      scf.yield %an : index
+    }
+    %vw, %vp = channel.reserve %res5 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+    %ai = index.cast %acc : index to i32
+    view.store %ai, %vp[%c0] : i32, view<16xi32>
+    %o = index.constant 320 : offset
+    %dst = buffer.view %out[%o] : buffer -> view<16xi32>
+    %cp = kernel.async.copy %vp to %dst {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<16xi32> to view<16xi32> -> kernel.async.token
+    %cg = kernel.async.group %cp : kernel.async.token -> kernel.async.group
+    kernel.async.wait %cg {newer_groups = 0} : kernel.async.group
+    channel.publish %vw : write<tile<16xi32>>
+  }
+  pipeline.strand workers([6, 2], [1, 1], [1, 1]) {
+    %acc = scf.for %r = [%c0 to %rounds step %c1](%a = %c0 : index) -> (index) {
+      %tr, %tp = channel.acquire %tok6 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %tr : read<tile<16xi32>>
+      %nw, %np = channel.reserve %tok7 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      channel.publish %nw : write<tile<16xi32>>
+      %gr, %gp = channel.acquire %go6 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %gr : read<tile<16xi32>>
+      %an = index.add %a, %c1 : index
+      scf.yield %an : index
+    }
+    %vw, %vp = channel.reserve %res6 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+    %ai = index.cast %acc : index to i32
+    view.store %ai, %vp[%c0] : i32, view<16xi32>
+    %o = index.constant 384 : offset
+    %dst = buffer.view %out[%o] : buffer -> view<16xi32>
+    %cp = kernel.async.copy %vp to %dst {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<16xi32> to view<16xi32> -> kernel.async.token
+    %cg = kernel.async.group %cp : kernel.async.token -> kernel.async.group
+    kernel.async.wait %cg {newer_groups = 0} : kernel.async.group
+    channel.publish %vw : write<tile<16xi32>>
+  }
+  pipeline.strand workers([7, 2], [1, 1], [1, 1]) {
+    %acc = scf.for %r = [%c0 to %rounds step %c1](%a = %c0 : index) -> (index) {
+      %tr, %tp = channel.acquire %tok7 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %tr : read<tile<16xi32>>
+      %nw, %np = channel.reserve %done : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      channel.publish %nw : write<tile<16xi32>>
+      %gr, %gp = channel.acquire %go7 : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      channel.release %gr : read<tile<16xi32>>
+      %an = index.add %a, %c1 : index
+      scf.yield %an : index
+    }
+    %vw, %vp = channel.reserve %res7 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+    %ai = index.cast %acc : index to i32
+    view.store %ai, %vp[%c0] : i32, view<16xi32>
+    %o = index.constant 448 : offset
+    %dst = buffer.view %out[%o] : buffer -> view<16xi32>
+    %cp = kernel.async.copy %vp to %dst {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<16xi32> to view<16xi32> -> kernel.async.token
+    %cg = kernel.async.group %cp : kernel.async.token -> kernel.async.group
+    kernel.async.wait %cg {newer_groups = 0} : kernel.async.group
+    channel.publish %vw : write<tile<16xi32>>
+  }
+  pipeline.strand workers([7, 2], [1, 1], [1, 1]) {
+    scf.for %r = [%c0 to %rounds step %c1] {
+      %dr, %dp = channel.acquire %done : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)
+      %f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7 = channel.fanout %dr : read<tile<16xi32>> -> (read<tile<16xi32>>, read<tile<16xi32>>, read<tile<16xi32>>, read<tile<16xi32>>, read<tile<16xi32>>, read<tile<16xi32>>, read<tile<16xi32>>, read<tile<16xi32>>)
+      %w0, %q0 = channel.reserve %go0 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      %w1, %q1 = channel.reserve %go1 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      %w2, %q2 = channel.reserve %go2 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      %w3, %q3 = channel.reserve %go3 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      %w4, %q4 = channel.reserve %go4 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      %w5, %q5 = channel.reserve %go5 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      %w6, %q6 = channel.reserve %go6 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      %w7, %q7 = channel.reserve %go7 : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
+      channel.copy %f0 -> %w0 : read<tile<16xi32>>, write<tile<16xi32>>
+      channel.copy %f1 -> %w1 : read<tile<16xi32>>, write<tile<16xi32>>
+      channel.copy %f2 -> %w2 : read<tile<16xi32>>, write<tile<16xi32>>
+      channel.copy %f3 -> %w3 : read<tile<16xi32>>, write<tile<16xi32>>
+      channel.copy %f4 -> %w4 : read<tile<16xi32>>, write<tile<16xi32>>
+      channel.copy %f5 -> %w5 : read<tile<16xi32>>, write<tile<16xi32>>
+      channel.copy %f6 -> %w6 : read<tile<16xi32>>, write<tile<16xi32>>
+      channel.copy %f7 -> %w7 : read<tile<16xi32>>, write<tile<16xi32>>
+    }
+  }
+}
