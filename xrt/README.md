@@ -153,3 +153,34 @@ float64 model math on the Q8_0 GGUF:
 | 1 | 7.8e-3 | 4.9e-3 | 1.3e-2 |
 
 A layer takes 1,617 µs per run over 73.5 MB of records (45.5 GB/s).
+
+### Whole decode token
+
+`iron/lfm3_token.py` runs an entire LFM3-1.7B decode token in one XRT run:
+
+- **Phases.** Embedding, 13 convolution layers (4 phases each), 11 attention
+  layers (5 phases each) and the LM head: 109 phases.
+- **Interpreter.** Every core runs a phase interpreter (`decode.cc`,
+  `*_next`). The C++ generates the phase sequence, so the core program stays
+  within its 16 KB.
+- **Roles.** Rows 2–3 also attend (one head each, a two-pass-free online
+  softmax over a bf16 KV cache). Rows 4–5 also convolve (128 channels each).
+  Each role links its own kernel object.
+- **Dispatch-time values.** The token, the position and the attention spans
+  are `DispatchTime` values. The host builds each token's instructions with
+  the design's dispatch library (`dispatch_generate`).
+
+`iron/layout.py` holds the buffer layouts for the design and the host. Both
+buffers stay under 2^31 bytes, because tap offsets are 32-bit. The f32
+embedding table sits in the state buffer.
+
+`iron/token_host.py` packs the Q8_0 GGUF into weight records, runs tokens and
+compares the logits with a float32 model on the same dequantized weights.
+LFM3-1.7B, positions 0–7:
+
+| | |
+| --- | ---: |
+| Time per token | 42.7 ms (23.4 tok/s) |
+| Top-1 agreement | 8 of 8 |
+| Full-vocabulary KL | 9e-3 to 2e-2 (6.7e-2 at position 0) |
+| Logit relative error | 6e-2 to 1e-1 |
