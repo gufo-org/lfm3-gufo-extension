@@ -154,7 +154,8 @@ func.def inline @@NAME(%x: view<@XEBxi8>, %w: view<@WSBxi8>, %wbase: index, %til
 // each weight chunk loads once and feeds every block's accumulator (the
 // chains are independent, so consecutive matrix ops overlap).
 std::string TileLoopBlocks(const std::string& name, std::uint32_t record_tiles, std::uint32_t x_tiles,
-                           std::uint32_t blocks, std::uint32_t resident, bool with_init = false) {
+                           std::uint32_t blocks, std::uint32_t resident, bool with_init = false,
+                           std::uint32_t w_records = 1) {
   std::string body, iters, yields, types, results, args;
   for (std::uint32_t b = 0; b < blocks; ++b) {
     const std::string B = S(b);
@@ -208,7 +209,7 @@ func.def inline @@NAME(%x: view<@XEBxi8>, %w: view<@WSBxi8>, %wbase: index, %xba
   func.return @RESULTS : @TYPES
 }
 )",
-                 {{"@NAME", name}, {"@XEB", S(std::uint64_t(resident) * x_tiles * 72)}, {"@WSB", S(record_tiles * 72)},
+                 {{"@NAME", name}, {"@XEB", S(std::uint64_t(resident) * x_tiles * 72)}, {"@WSB", S(std::uint64_t(w_records) * record_tiles * 72)},
                   {"@PER", S(kPer)}, {"@GB", S(kPer * 72)}, {"@CHUNKS", S(record_tiles / kPer)}, {"@SCHEMA", kSchema},
                   {"@BODY", body}, {"@RESULTS", results}, {"@ITERS", iters}, {"@TYPES", types}, {"@YIELDS", yields},
                   {"@ARGS", with_init ? args : std::string()}});
@@ -715,12 +716,12 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
         t = SuffixNames(t, "_k" + S(c), {"%x_arg", "%w_arg", "%y_arg"});
         flat += Replace(t, {{"#WEST#", "%y_channel_k" + S(c - 1)}});
       }
-      return "aie2p.target<array> @npu\n" + TileLoopBlocks(dot, record_tiles, x_tiles, per_call, bp, true) +
+      return "aie2p.target<array> @npu\n" + TileLoopBlocks(dot, record_tiles, x_tiles, per_call, bp, true, R) +
              "\npipeline.def<kernel> public retain target(@npu) @" + name + "() run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {\n" + flat + "}\n";
     }
   }
   if (!enc && R != 1) throw std::invalid_argument("K-multi without encoded activations needs one record per slot");
-  return "aie2p.target<array> @npu\n" + (enc ? TileLoopBlocks(dot, record_tiles, x_tiles, std::min<std::uint32_t>(bp, 4), bp) : TileLoop(dot, record_tiles, bp * x_tiles)) + body +
+  return "aie2p.target<array> @npu\n" + (enc ? TileLoopBlocks(dot, record_tiles, x_tiles, std::min<std::uint32_t>(bp, 4), bp, false, R) : TileLoop(dot, record_tiles, bp * x_tiles)) + body +
          "\npipeline.def<kernel> public retain target(@npu) @" + name + "() run(%x: buffer, %w: buffer, %y: buffer) {\n" +
          compose + "}\n";
 }
