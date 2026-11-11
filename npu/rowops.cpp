@@ -189,58 +189,6 @@ func.def @exp_fast(%x: vector<16xf32>) -> (vector<16xf32>) {
   func.return %out : vector<16xf32>
 }
 
-// 1 / (1 + e^-x) to about 2e-4 relative (enough before a BF16 result):
-// 2^t by a degree-4 polynomial on the fractional part, two Newton steps for
-// the reciprocal.
-func.def @sigmoid_fast(%x: vector<16xf32>) -> (vector<16xf32>) {
-  %nlog2e = vector.splatf -1.44269504088896341 : vector<16xf32>
-  %t0 = func.call @fmul2(%x, %nlog2e) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %lo = vector.splatf -126.0 : vector<16xf32>
-  %hi = vector.splatf 126.0 : vector<16xf32>
-  %is_lo = vector.cmpf olt, %t0, %lo : vector<16xf32> -> vector<16xi1>
-  %t1 = vector.select %is_lo, %lo, %t0 : vector<16xf32>
-  %is_hi = vector.cmpf ogt, %t1, %hi : vector<16xf32> -> vector<16xi1>
-  %t = vector.select %is_hi, %hi, %t1 : vector<16xf32>
-  %magic = vector.splatf 12582912.0 : vector<16xf32>
-  %biased = vector.addf %t, %magic : vector<16xf32>
-  %n = vector.subf %biased, %magic : vector<16xf32>
-  %f = vector.subf %t, %n : vector<16xf32>
-  %k4 = vector.splatf 9.6181291076284772e-3 : vector<16xf32>
-  %k3 = vector.splatf 5.5504108664821580e-2 : vector<16xf32>
-  %k2 = vector.splatf 0.24022650695910071 : vector<16xf32>
-  %k1 = vector.splatf 0.69314718055994531 : vector<16xf32>
-  %one = vector.splatf 1.0 : vector<16xf32>
-  %p4 = func.call @fmul2(%k4, %f) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %q3 = vector.addf %p4, %k3 : vector<16xf32>
-  %p3 = func.call @fmul2(%q3, %f) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %q2 = vector.addf %p3, %k2 : vector<16xf32>
-  %p2 = func.call @fmul2(%q2, %f) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %q1 = vector.addf %p2, %k1 : vector<16xf32>
-  %p1 = func.call @fmul2(%q1, %f) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %poly = vector.addf %p1, %one : vector<16xf32>
-  %bias = vector.splati 1262485504 : vector<16xi32>
-  %biased_bits = vector.bitcast %biased : vector<16xf32> to vector<16xi32>
-  %exponent = vector.subi %biased_bits, %bias : vector<16xi32>
-  %shift = vector.splati 23 : vector<16xi32>
-  %scale_bits = vector.shli %exponent, %shift : vector<16xi32>
-  %poly_bits = vector.bitcast %poly : vector<16xf32> to vector<16xi32>
-  %e_bits = vector.addi %poly_bits, %scale_bits : vector<16xi32>
-  %e = vector.bitcast %e_bits : vector<16xi32> to vector<16xf32>
-  %d = vector.addf %one, %e : vector<16xf32>
-  %rmagic = vector.splati 2129859559 : vector<16xi32>
-  %two = vector.splatf 2.0 : vector<16xf32>
-  %dbits = vector.bitcast %d : vector<16xf32> to vector<16xi32>
-  %g0 = vector.subi %rmagic, %dbits : vector<16xi32>
-  %y0 = vector.bitcast %g0 : vector<16xi32> to vector<16xf32>
-  %a0 = func.call @fmul2(%d, %y0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %b0 = vector.subf %two, %a0 : vector<16xf32>
-  %y1 = func.call @fmul2(%y0, %b0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %a1 = func.call @fmul2(%d, %y1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %b1 = vector.subf %two, %a1 : vector<16xf32>
-  %y2 = func.call @fmul2(%y1, %b1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  func.return %y2 : vector<16xf32>
-}
-
 // 1 / (1 + e^-x).
 func.def @sigmoid(%x: vector<16xf32>) -> (vector<16xf32>) {
   %zero = vector.splatf 0.0 : vector<16xf32>

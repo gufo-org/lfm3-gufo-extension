@@ -1,8 +1,12 @@
 #include "glue.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -24,6 +28,78 @@ std::string F(double v) {
   return b;
 }
 using Layout = RowOperand::Layout;
+
+// The logistic function as 512 linear pieces centred on k / 16 for x in
+// [-16, 16): a BF16-exact slope (one dot2f against x's two BF16 parts) and an
+// F32 intercept fitted over the piece. Outside the range the end pieces
+// extrapolate towards 0 and 1. Interpolation error stays below 3e-5 absolute.
+std::string SiluTables() {
+  auto silu = [](double x) { return 1.0 / (1.0 + std::exp(-x)); };
+  auto bf16 = [](float v) {
+    std::uint32_t b;
+    std::memcpy(&b, &v, 4);
+    b = (b + 0x7fffu + ((b >> 16) & 1u)) & 0xffff0000u;
+    float r;
+    std::memcpy(&r, &b, 4);
+    return r;
+  };
+  std::vector<float> a(512), b(512);
+  for (int i = 0; i < 512; ++i) {
+    const double c = (i - 256) / 16.0, h = 1.0 / 16.0;
+    a[i] = bf16(float((silu(c + h / 2) - silu(c - h / 2)) / h));
+    double lo = 1e30, hi = -1e30;
+    for (int j = 0; j <= 64; ++j) {
+      const double x = c - h / 2 + h * j / 64.0, r = silu(x) - double(a[i]) * x;
+      lo = std::min(lo, r);
+      hi = std::max(hi, r);
+    }
+    b[i] = float((lo + hi) / 2);
+  }
+  auto hex = [](const std::vector<float>& v) {
+    std::string out;
+    char t[3];
+    for (float f : v) {
+      unsigned char q[4];
+      std::memcpy(q, &f, 4);
+      for (unsigned char c : q) {
+        std::snprintf(t, sizeof t, "%02x", c);
+        out += t;
+      }
+    }
+    return out;
+  };
+  return "      %silu_ta_buf = buffer.constant align(64) bytes(\"" + hex(a) + "\") : buffer\n"
+         "      %silu_tb_buf = buffer.constant align(64) bytes(\"" + hex(b) + "\") : buffer\n"
+         "      %silu_ta = buffer.view %silu_ta_buf[%origin] : buffer -> view<512xf32>\n"
+         "      %silu_tb = buffer.view %silu_tb_buf[%origin] : buffer -> view<512xf32>\n"
+         "      %silu_lo = vector.splatf -16.0 : vector<16xf32>\n"
+         "      %silu_hi = vector.splatf 15.9375 : vector<16xf32>\n"
+         "      %silu_m = vector.splatf 786432.0 : vector<16xf32>\n"
+         "      %silu_mi = vector.splati 1228931072 : vector<16xi32>\n"
+         "      %silu_off = vector.splati 256 : vector<16xi32>\n"
+         "      %silu_mask = vector.splati 511 : vector<16xi32>\n";
+}
+
+// %silu = SiLU(%gv): x times the tabulated logistic function.
+const char* kSiluLookup = R"(        %sl_l = vector.cmpf olt, %gv, %silu_lo : vector<16xf32> -> vector<16xi1>
+        %sl_x0 = vector.select %sl_l, %silu_lo, %gv : vector<16xf32>
+        %sl_h = vector.cmpf ogt, %sl_x0, %silu_hi : vector<16xf32> -> vector<16xi1>
+        %sl_x = vector.select %sl_h, %silu_hi, %sl_x0 : vector<16xf32>
+        %sl_t = vector.addf %sl_x, %silu_m : vector<16xf32>
+        %sl_ti = vector.bitcast %sl_t : vector<16xf32> to vector<16xi32>
+        %sl_k = vector.subi %sl_ti, %silu_mi : vector<16xi32>
+        %sl_k1 = vector.addi %sl_k, %silu_off : vector<16xi32>
+        %sl_i = vector.andi %sl_k1, %silu_mask : vector<16xi32>
+        %sl_a = vector.gather %silu_ta[0][%sl_i] : view<512xf32>, vector<16xi32> -> vector<16xf32>
+        %sl_b = vector.gather %silu_tb[0][%sl_i] : view<512xf32>, vector<16xi32> -> vector<16xf32>
+        %sl_x1, %sl_xr = func.call @split(%gv) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
+        %sl_x2, %sl_xr2 = func.call @split(%sl_xr) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
+        %sl_a1, %sl_ar = func.call @split(%sl_a) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
+        %sl_lv = vector.interleave<0> %sl_x1, %sl_x2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+        %sl_rv = vector.interleave<0> %sl_a1, %sl_a1 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+        %sl_s = vector.dot2f %sl_lv, %sl_rv, %sl_b : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+        %silu = func.call @fmul2(%gv, %sl_s) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+)";
 
 // %scale_<tag>: rsqrt(mean(v^2) + eps) over view %<view> of n floats.
 std::string Scale(const std::string& view, const std::string& tag) {
@@ -190,16 +266,14 @@ RowKernel SwiGluPackKernel(std::uint32_t I, std::uint32_t rows, bool partial, st
   k.body = Fill(std::string(partial ? "      %zp = vector.splatf 0.0 : vector<16xf32>\n      %c8p = index.constant 8 : index\n" : "") +
                     R"(      %n = index.constant @P : index
       scf.for %i = [%c0 to %n step %c16] {
-@LOAD@SIG
-        %silu = func.call @fmul2(%gv, %sg) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-        %o = func.call @fmul2(%silu, %uv) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+@LOAD@SILU        %o = func.call @fmul2(%silu, %uv) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         %ob = vector.fptrunc %o : vector<16xf32> to vector<16xbf16>
         vector.store %ob, %xb[%i] : vector<16xbf16>, view<@Pxbf16>
       }
 )",
                 {{"@LOAD", load}, {"@P", S(piece)},
-                 {"@SIG", std::getenv("GUFO_LFM3_NPU_EXP_NOSIG") ? "        %sg = vector.addf %gv, %gv : vector<16xf32>\n"  // experiment only
-                                                                 : "        %sg = func.call @sigmoid_fast(%gv) : (vector<16xf32>) -> (vector<16xf32>)\n"}});
+                 {"@SILU", kSiluLookup}});
+  k.body = SiluTables() + k.body;
   return k;
 }
 
