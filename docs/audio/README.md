@@ -4,7 +4,7 @@ Native speech recognition, speech synthesis and voice chat for LiquidAI
 LFM3-Audio-2B on Linux x86-64 / Strix Halo `gfx1151`. Implementation:
 [audio/](../../audio), on top of the [LFM3 backbone](../../README.md). The
 extension's `lfm3-audio-asr` and `lfm3-audio-tts` providers serve it through
-Gufo's speech commands; it needs a Gufo with extension API 0.2.20 or newer
+Gufo's speech commands; it needs a Gufo with extension API 0.3.0 or newer
 (shared WAV decoding; realtime, `speak` and `--mmproj` contracts).
 
 The checkpoint pairs the LFM3 1.7B backbone with three audio towers stored in

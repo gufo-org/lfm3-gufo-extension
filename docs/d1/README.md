@@ -8,7 +8,7 @@ spoken instructions. Questions are packed in sets of 16 by default. This
 extension's `d1` decision provider serves it ([d1/](../../d1), on the
 [LFM3 backbone](../../README.md), the [LFM3-VL](../vl/README.md) vision tower
 and the [LFM3-Audio](../audio/README.md) encoder); it needs a Gufo with
-extension API 0.2.20 or newer (the `decision` capability and shared WAV
+extension API 0.3.0 or newer (the `decision` capability and shared WAV
 decoding).
 
 Download the backbone and projector from
