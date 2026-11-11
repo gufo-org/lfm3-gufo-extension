@@ -94,14 +94,20 @@ int main(int argc, char** argv) {
   std::vector<int> ids;
   for (const auto& s : stages) ids.push_back(npu.Compile(s.program, s.root.substr(1) + ".loom", s.root));
   std::vector<FuseStage> fs;
-  for (const auto& s : stages) fs.push_back({s.program, s.root, s.args});
+  const std::size_t fuse_n = std::getenv("FUSE_N") ? std::size_t(std::atoi(std::getenv("FUSE_N"))) : stages.size();
+  for (std::size_t i = 0; i < std::min(fuse_n, stages.size()); ++i) fs.push_back({stages[i].program, stages[i].root, stages[i].args});
   auto t0 = now();
   const std::string fused_text = FuseProgram(fs, kN, "ffn_fused");
+  if (const char* dump = std::getenv("FUSE_DUMP")) {
+    FILE* f = std::fopen(dump, "w");
+    std::fputs(fused_text.c_str(), f);
+    std::fclose(f);
+  }
   int fused = -1;
   try {
     fused = npu.Compile(fused_text, "ffn_fused.loom", "@ffn_fused");
   } catch (const std::exception& e) {
-    std::printf("fused compile failed (timing stages only)\n");
+    std::printf("fused compile failed (timing stages only): %.4000s\n", e.what());
   }
   std::printf("fused compile %.1f s\n", ms(t0, now()) / 1000);
 
