@@ -791,7 +791,14 @@ void SgemmBf16(const float* x, const void* w, const float* bias, float* y,
       const unsigned tokens = (n + bt - 1) / bt, rows = M / br;
       return rows_fast ? dim3(rows, tokens) : dim3(tokens, rows);
     };
-    if (n > 1024) {
+    // Long inputs take 128 x 128 tiles unless 64 x 128 ones cost less in
+    // waves of resident blocks (about 56) times a block's work, which the
+    // model below puts at 1.8 times as much for the large tile. A
+    // 1,200-patch picture's 1,024-row projections fill only 80 large blocks.
+    const auto waves = [&](int bt, int br) {
+      return ((n + bt - 1) / bt * (M / br) + 55) / 56;
+    };
+    if (n > 1024 && waves(128, 128) * 9 < waves(64, 128) * 5) {
       Split3Gemm<128, 128, 2, 4><<<grid(128, 128), 256, 0, s>>>(
           x, weights, bias, y, n, M, K, act, rows_fast);
       return;

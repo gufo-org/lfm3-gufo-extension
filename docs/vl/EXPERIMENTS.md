@@ -37,3 +37,16 @@ Matched end to end (fastest of three, base `810892b` → this pass):
 185226 → 15073 ms (one request each). Greedy answers are unchanged. The
 remaining attention time is VALU-bound (693 instructions for 48 WMMAs per
 tile) with waves locked by two barriers per tile.
+
+## November 11 pass: shared tower overheads
+
+From the d1 decision work ([d1 decisions](../d1/EXPERIMENTS.md)); every change
+keeps embeddings byte-identical (LFM3-VL greedy replies on a synthetic PNG and
+the COCO two-cat photograph are unchanged).
+
+| Mechanism | Decision and evidence |
+| --- | --- |
+| Reuse encode activations and stream across pictures up to 4096 patches | Retained: a 640×480 picture allocated about 80 MB per encode (about 3 ms with the free). Larger pictures still allocate their own. |
+| 64 × 128 tiles for inputs over 1024 patches when they need fewer waves than 128 × 128 | Retained, same sums: 1200 patches 50.7 → 45 ms of GEMM; 1024×1024 and larger pictures keep 128 × 128. |
+| Threaded separable resize, patch normalization by table | Retained, identical pixels: 12-megapixel input 764 → 700 ms end to end (d1). |
+

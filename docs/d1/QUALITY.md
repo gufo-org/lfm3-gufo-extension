@@ -41,12 +41,17 @@ qualification. [Compact evidence](artifacts/packed-qualification.json), with
 full prompts, embeddings, logits and responses retained locally under
 `artifacts/d1/packed/`.
 
-Matched `set_size=1` controls against commit `431efcc7` retain exact text,
-image, audio and long-prompt responses. An initial compact single-slot path
-changed probabilities by at most `1.3e-7`; it was rejected for this compatibility
-route. The original full-vocabulary single-slot path is retained, while packed
-and box slots project only the vocabulary entries they read. Both attempts
-remain in local raw benchmark reports. Current timings are in
+Matched `set_size=1` controls against commit `431efcc7` retained exact text,
+image, audio and long-prompt responses until November 11, 2026. Since then
+decision passes do not split projections along K, so that a request's packs
+can share one pass and still answer exactly as they would alone. Against the
+previous build, all 15 latency fixtures and the eight `d1.py` histories keep
+every discrete answer and token count; probabilities move at most `6.3e-4`,
+as much as reordering that build's own split sums moved them, well inside the
+`0.02` API gate. `d1_packed.py` passes all 26 checks, including the
+partial-tail independence check. Packed, box and single-slot readouts project
+only the vocabulary entries they read; the single-slot GEMV gives the same
+values as the full-vocabulary head. Current timings are in
 [BENCHMARKS.md](BENCHMARKS.md).
 
 Reproduce the numerical teacher with [the reference tool](../../tests/d1_reference/README.md).

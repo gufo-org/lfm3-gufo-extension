@@ -219,16 +219,29 @@ struct Session::Impl {
     Check(hipStreamSynchronize(stream.value));
     logits_ready = true;
   }
+  // An independent d1 prompt of a decision pass: rows from begin, with its
+  // own empty state and positions from zero. Masked prompts read their
+  // groups (packed sets); the others are one bidirectional prompt.
+  struct Segment {
+    std::size_t begin, rows;
+    bool masked;
+  };
   // Rows of embeddings replace the token lookup when embeddings is set; it
   // holds n * hidden floats on the host, or on the device when on_device.
+  // Decision passes list their prompts in segments (none: a single prompt,
+  // masked by groups when given); they never update recurrent state.
   void Run(std::span<const std::uint32_t> tokens, bool output_logits,
            std::span<Impl* const> batch = {}, const float* embeddings = nullptr,
            std::size_t embedding_rows = 0, bool on_device = false,
-           std::span<const std::int32_t> groups = {}) {
+           std::span<const std::int32_t> groups = {},
+           std::span<const Segment> segments = {}) {
     const auto& w = model->impl_->weights;
     const auto& c = w.config;
     const auto s = stream.value;
     const auto n = embeddings ? embedding_rows : tokens.size();
+    const Segment whole{0, n, !groups.empty()};
+    if (segments.empty())
+      segments = {&whole, 1};
     // ForwardInputs gathers its rows into x itself.
     if (embeddings) {
       if (embeddings != x.floats())
@@ -249,9 +262,12 @@ struct Session::Impl {
       Check(hipMemcpyAsync(decision_groups.data, groups.data(),
                            groups.size_bytes(), hipMemcpyHostToDevice, s));
     }
+    // A decision prompt's arithmetic must not depend on the prompts sharing
+    // its pass, so its projections never split K by the pass's tile count.
     const gpu::DenseWorkspace workspace{
         quantized.data, static_cast<unsigned*>(row_max.data),
-        split_partial.floats(), static_cast<unsigned*>(split_tickets.data)};
+        c.decision ? nullptr : split_partial.floats(),
+        static_cast<unsigned*>(split_tickets.data)};
     auto dense = [&](const Tensor& weight, const float* input, float* output,
                      int count, hipStream_t stream) {
       gpu::Dense(weight, input, output, count, stream, workspace);
@@ -335,7 +351,15 @@ struct Session::Impl {
       if (c.layers[i] == LayerType::kConvolution) {
         gpu::Project(inputs, z.floats() + o_in * c.hidden, rows_in, s,
                      workspace, split);
-        if (batch.empty()) {
+        if (c.decision)
+          // Every prompt starts from the zeroed history, left unchanged.
+          for (const auto& seg : segments)
+            gpu::ShortConv(p.floats() + seg.begin * 3 * c.hidden,
+                           static_cast<const float*>(l.conv.data),
+                           states[i].conv.floats(),
+                           a.floats() + seg.begin * c.hidden, seg.rows,
+                           c.hidden, c.conv_width, s, false);
+        else if (batch.empty()) {
           // Rows before the first live one are not read: outputs that
           // would need them are not live either.
           gpu::ShortConv(p.floats() + o_in * 3 * c.hidden,
@@ -360,8 +384,8 @@ struct Session::Impl {
         const bool swa = c.layers[i] == LayerType::kSlidingAttention;
         const auto* factors =
             swa ? nullptr : static_cast<const float*>(w.rope_freqs.data);
-        const auto attend = [&](Impl& owner, std::size_t row,
-                                std::size_t count) {
+        const auto attend = [&](Impl& owner, std::size_t row, std::size_t count,
+                                bool masked = false) {
           auto& state = owner.states[i];
           const auto stride = std::size_t(c.kv_heads[i]) * c.head_dim;
           auto* qr = q.floats() + row * c.heads * c.head_dim;
@@ -388,16 +412,23 @@ struct Session::Impl {
           }
           // Full-attention rows never wrap, so the chunk is packed in place.
           // A sliding ring is written only after attention read its history.
-          gpu::Half* kc = swa ? chunk_k.halves() : ck + owner.position * stride;
-          gpu::Half* vc = swa ? chunk_v.halves() : cv + owner.position * stride;
+          // Decision prompts start at position 0, after earlier prompts' rows.
+          const auto base = c.decision ? 0 : owner.position;
+          gpu::Half* kc = swa ? chunk_k.halves() + row * stride
+                              : ck + (owner.position + row) * stride;
+          gpu::Half* vc = swa ? chunk_v.halves() + row * stride
+                              : cv + (owner.position + row) * stride;
           gpu::PromptHeads(qr, kr, vr, static_cast<const float*>(l.q_norm.data),
                            static_cast<const float*>(l.k_norm.data), table,
                            factors, kc, vc, count, c.heads, c.kv_heads[i],
-                           c.head_dim, owner.position, c.eps, s);
+                           c.head_dim, base, c.eps, s);
           if (c.decision && !swa)
             gpu::BidirectionalAttention(
                 qr, kc, vc, gr, ar, count, c.heads, c.kv_heads[i], s,
-                static_cast<const std::int32_t*>(decision_groups.data));
+                masked
+                    ? static_cast<const std::int32_t*>(decision_groups.data) +
+                          row
+                    : nullptr);
           else {
             // Only the last rows_out queries are live; the earlier chunk rows
             // are already in the (full-attention) cache.
@@ -405,16 +436,19 @@ struct Session::Impl {
             gpu::Attention(qr + skip * c.heads * c.head_dim, kc + skip * stride,
                            vc + skip * stride, gr + skip * c.heads, ck, cv,
                            ar + skip * c.heads * c.head_dim, count - skip,
-                           c.heads, c.kv_heads[i], c.head_dim,
-                           owner.position + skip, state.capacity,
-                           swa ? c.window : 0, s,
+                           c.heads, c.kv_heads[i], c.head_dim, base + skip,
+                           state.capacity, swa ? c.window : 0, s,
                            owner.attention_scratch.floats());
           }
-          if (swa)
+          // A decision pass has no later rows to read the ring.
+          if (swa && !c.decision)
             gpu::StoreKV(kc, vc, ck, cv, count, stride, owner.position,
                          state.capacity, s);
         };
-        if (batch.empty())
+        if (c.decision)
+          for (const auto& seg : segments)
+            attend(*this, seg.begin, seg.rows, seg.masked);
+        else if (batch.empty())
           attend(*this, 0, n);
         else
           for (std::size_t row = 0; row < batch.size(); ++row)
@@ -493,36 +527,15 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t context,
 bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
                               std::span<const float> embeddings,
                               std::span<float> logits, std::string* error) {
-  // Preserve the original full-vocabulary single-slot path for callers
-  // requiring the existing d1 decision probabilities bit for bit.
-  try {
-    const auto& c = impl_->model->config();
-    if (!c.decision || tokens.empty() || tokens.size() > impl_->context ||
-        logits.size() != c.vocab ||
-        (!embeddings.empty() && embeddings.size() != tokens.size() * c.hidden))
-      throw std::invalid_argument("invalid d1 prompt, embeddings or logits");
-    for (auto id : tokens)
-      if (id >= c.vocab)
-        throw std::invalid_argument("d1 token out of range");
-    // A decision prompt runs in one pass: grow the rows only when needed.
-    if (impl_->rows < tokens.size() || impl_->poisoned) {
-      auto state = std::make_unique<Impl>(
-          impl_->model, impl_->context, std::max(kPrefillChunk, tokens.size()));
-      impl_.swap(state);
-    }
-    if (!Reset(error))
-      return false;
-    impl_->Run(tokens, true, {},
-               embeddings.empty() ? nullptr : embeddings.data(),
-               embeddings.empty() ? 0 : tokens.size());
-    Check(hipMemcpy(logits.data(), impl_->logits.data, logits.size_bytes(),
-                    hipMemcpyDeviceToHost));
-    return true;
-  } catch (const std::exception& e) {
+  // The final row over the whole vocabulary.
+  if (tokens.empty()) {
     if (error)
-      *error = e.what();
+      *error = "invalid d1 prompt, embeddings or logits";
     return false;
   }
+  const std::uint32_t last = tokens.size() - 1;
+  const DecisionPrompt prompt{tokens.size(), {}, {&last, 1}};
+  return ForwardDecisions(tokens, embeddings, {&prompt, 1}, {}, logits, error);
 }
 bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
                               std::span<const float> embeddings,
@@ -530,13 +543,26 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
                               std::span<const std::uint32_t> positions,
                               std::span<const std::uint32_t> vocabulary,
                               std::span<float> logits, std::string* error) {
+  const DecisionPrompt prompt{tokens.size(), groups, positions};
+  return ForwardDecisions(tokens, embeddings, {&prompt, 1}, vocabulary, logits,
+                          error);
+}
+bool Session::ForwardDecisions(std::span<const std::uint32_t> tokens,
+                               std::span<const float> embeddings,
+                               std::span<const DecisionPrompt> prompts,
+                               std::span<const std::uint32_t> vocabulary,
+                               std::span<float> logits, std::string* error) {
   try {
     const auto& c = impl_->model->config();
     const auto columns = vocabulary.empty() ? c.vocab : vocabulary.size();
-    if (!c.decision || tokens.empty() || tokens.size() > impl_->context ||
-        positions.empty() || positions.size() > tokens.size() ||
-        logits.size() != positions.size() * columns ||
-        (!groups.empty() && groups.size() != tokens.size()) ||
+    std::size_t rows = 0, slots = 0;
+    for (const auto& prompt : prompts) {
+      rows += prompt.rows;
+      slots += prompt.positions.size();
+    }
+    if (!c.decision || tokens.empty() || prompts.empty() ||
+        rows != tokens.size() || tokens.size() > impl_->context ||
+        logits.size() != slots * columns ||
         (!embeddings.empty() && embeddings.size() != tokens.size() * c.hidden))
       throw std::invalid_argument(
           "invalid d1 prompt, groups, slots or readout");
@@ -546,18 +572,47 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
     for (auto id : vocabulary)
       if (id >= c.vocab)
         throw std::invalid_argument("d1 vocabulary ID out of range");
-    for (std::size_t i = 0; i < positions.size(); ++i)
-      if (positions[i] >= tokens.size() ||
-          (i && positions[i - 1] >= positions[i]))
+    // Prompts lie side by side; their groups and answer rows are joined.
+    std::vector<Impl::Segment> segments;
+    std::vector<std::int32_t> groups;
+    std::vector<std::uint32_t> positions;
+    bool masked = false;
+    for (const auto& prompt : prompts) {
+      const auto begin =
+          segments.empty() ? 0 : segments.back().begin + segments.back().rows;
+      const auto& g = prompt.groups;
+      const auto& p = prompt.positions;
+      if (!prompt.rows || p.empty() || p.size() > prompt.rows ||
+          (!g.empty() && g.size() != prompt.rows))
         throw std::invalid_argument(
-            "d1 slots must be increasing prompt positions");
-    for (std::size_t i = 0; i < groups.size(); ++i)
-      if (groups[i] == 0 || groups[i] < -1 || groups[i] > 128 ||
-          (i && groups[i] < groups[i - 1]))
-        throw std::invalid_argument(
-            "d1 groups must be a state prefix and ordered positive question "
-            "IDs");
-    // A decision prompt runs in one pass: grow the rows only when needed.
+            "invalid d1 prompt, groups, slots or readout");
+      for (std::size_t i = 0; i < p.size(); ++i)
+        if (p[i] >= prompt.rows || (i && p[i - 1] >= p[i]))
+          throw std::invalid_argument(
+              "d1 slots must be increasing prompt positions");
+      for (std::size_t i = 0; i < g.size(); ++i)
+        if (g[i] == 0 || g[i] < -1 || g[i] > 128 || (i && g[i] < g[i - 1]))
+          throw std::invalid_argument(
+              "d1 groups must be a state prefix and ordered positive question "
+              "IDs");
+      // A lone question sees the entire prompt. Keep its original unmasked
+      // specialization, including its FP32 arithmetic and scheduling.
+      const bool packed = std::any_of(g.begin(), g.end(), [&](auto group) {
+        return group > 0 && group != g.back();
+      });
+      segments.push_back({begin, prompt.rows, packed});
+      masked = masked || packed;
+      for (auto at : p)
+        positions.push_back(std::uint32_t(begin + at));
+    }
+    if (masked) {
+      groups.assign(tokens.size(), -1);
+      for (std::size_t i = 0; i < prompts.size(); ++i)
+        if (segments[i].masked)
+          std::copy(prompts[i].groups.begin(), prompts[i].groups.end(),
+                    groups.begin() + segments[i].begin);
+    }
+    // A decision pass runs every row at once: grow the rows only when needed.
     if (impl_->rows < tokens.size() || impl_->poisoned) {
       auto state = std::make_unique<Impl>(
           impl_->model, impl_->context, std::max(kPrefillChunk, tokens.size()));
@@ -565,17 +620,9 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
     }
     if (!Reset(error))
       return false;
-    // A lone question sees the entire prompt. Keep its original unmasked
-    // specialization, including its FP32 arithmetic and scheduling.
-    const bool packed =
-        !groups.empty() &&
-        std::any_of(groups.begin(), groups.end(), [&](auto group) {
-          return group > 0 && group != groups.back();
-        });
     impl_->Run(tokens, false, {},
                embeddings.empty() ? nullptr : embeddings.data(),
-               embeddings.empty() ? 0 : tokens.size(), false,
-               packed ? groups : std::span<const std::int32_t>{});
+               embeddings.empty() ? 0 : tokens.size(), false, groups, segments);
     const auto stream = impl_->stream.value;
     const auto& w = impl_->model->impl_->weights;
     const auto grow = [](Buffer& buffer, std::size_t& capacity,
@@ -594,7 +641,8 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
                         positions.size() * c.hidden * 4);
     auto& projected =
         grow(d.decision_projected, d.decision_capacity[2], logits.size_bytes());
-    Check(hipMemcpyAsync(indices.data, positions.data(), positions.size_bytes(),
+    Check(hipMemcpyAsync(indices.data, positions.data(),
+                         positions.size() * sizeof(std::uint32_t),
                          hipMemcpyHostToDevice, stream));
     Tensor states{impl_->x.data, core::GgmlType::kF32, c.hidden,
                   std::uint32_t(tokens.size()), tokens.size() * c.hidden * 4};
@@ -616,8 +664,16 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
               std::uint32_t(vocabulary.size()),
               vocabulary.size() * (head.bytes / head.rows)};
     }
-    gpu::Dense(head, hidden.floats(), projected.floats(), positions.size(),
-               stream, {impl_->quantized.data});
+    // Each prompt projects its own slots, as in a pass of its own: the
+    // arithmetic of the head depends on the number of rows.
+    std::size_t slot = 0;
+    for (const auto& prompt : prompts) {
+      const auto count = prompt.positions.size();
+      gpu::Dense(head, hidden.floats() + slot * c.hidden,
+                 projected.floats() + slot * columns, int(count), stream,
+                 {impl_->quantized.data});
+      slot += count;
+    }
     Check(hipMemcpyAsync(logits.data(), projected.data, logits.size_bytes(),
                          hipMemcpyDeviceToHost, stream));
     Check(hipStreamSynchronize(stream));
