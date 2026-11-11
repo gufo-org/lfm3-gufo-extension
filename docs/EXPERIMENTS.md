@@ -536,8 +536,18 @@ still run on the host in FP32.
 | LFM3-VL-2B | vision tower + backbone | same answer as the GPU on a test image |
 | LFM3-Audio-2B | ASR encoder | same transcript as the GPU |
 | LFM3-Audio-2B | depth decoder, codec (TTS) | NPU speech transcribed correctly on the GPU; 4 s of audio in 7.9 s |
-| d1-Omni-2B | decision API | not yet: `ForwardDecision` returns an error on the NPU |
+| d1-Omni-2B | decision API (text, image, audio) | same answers as the GPU; probabilities within 0.008 |
 
-Open: d1 decision attention masks; moving attention, norms and convolutions
-onto the NPU; asynchronous dispatch (about 150 µs per synchronous dispatch);
-speed of TTS and prefill.
+d1 prompts run as one pass: full-attention layers are bidirectional with the
+group mask of the HIP kernel (a key is visible when either row is state or both
+share a question), convolution and sliding attention stay causal.
+
+All rows above were re-run with `liblfm3_npu.so` built against Gufo's HRX fork
+pin (`gufo-org/hrx-system` `gufo-staging` `d8345774e3`, gufo-org/gufo#1156):
+every projection shape passes, text KL 0.0015 with identical top-5, VL, ASR,
+TTS and d1 outputs unchanged, decode 12.2 tok/s. That Loom includes the
+AIE2P spill-stack commit (`a62c887489`); the projection kernels still fit
+their tiles.
+
+Open: moving attention, norms and convolutions onto the NPU; asynchronous
+dispatch (about 150 µs per synchronous dispatch); speed of TTS and prefill.

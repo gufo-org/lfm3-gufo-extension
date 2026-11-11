@@ -6,7 +6,8 @@ loads it at run time ([`npu_runtime.hpp`](npu_runtime.hpp)), so its build does
 not depend on HRX.
 
 Build against a configured and built hrx-system tree that contains
-`loom-test` (the library links the same objects):
+`loom-test` (the library links the same objects); qualified with Gufo's fork
+pin `gufo-org/hrx-system` `d8345774e3`:
 
 ```sh
 npu/host/build.sh <hrx-system> <hrx-build> <output-dir>
