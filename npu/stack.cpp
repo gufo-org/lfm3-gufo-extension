@@ -1,6 +1,9 @@
 #include "stack.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -63,6 +66,20 @@ Stack::State Stack::NewState(std::uint32_t window) const {
 
 void Stack::Run(std::span<const float> input, int n, State* state, int window, std::span<float> z_out,
                 int segment) const {
+  // GUFO_LFM3_NPU_TIMING: one line per call (layers, hidden, rows, ms).
+  static const bool timing = std::getenv("GUFO_LFM3_NPU_TIMING") != nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
+  struct Report {
+    bool on;
+    std::chrono::steady_clock::time_point t0;
+    std::size_t layers, hidden;
+    int rows;
+    ~Report() {
+      if (on)
+        std::fprintf(stderr, "npu stack: layers %zu hidden %zu rows %d %.3f ms\n", layers, hidden, rows,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+  } report{timing, t0, w_->blocks.size(), std::size_t(w_->hidden), n};
   const auto& s = *w_;
   const std::size_t H = s.hidden, D = s.head_dim, Q = std::size_t(s.heads) * D,
                     KV = std::size_t(s.kv_heads) * D;
