@@ -53,6 +53,13 @@ def gemm_weight(md, what):
             Bm[:, 128 * j:128 * j + 64] = W[64 * j:64 * j + 64].T
             Bm[:, 128 * j + 64:128 * j + 128] = W[2 * H + 64 * j:2 * H + 64 * j + 64].T
         return Bm
+    if name == "qkv":
+        W = np.concatenate([md.deq(p + f"attn_{n}.weight") for n in ("q", "k", "v", "gate")]) * md.f(p + "attn_norm.weight")
+        Bm = np.zeros((H, 4096), np.float32)
+        Bm[:, :W.shape[0]] = W.T
+        return Bm
+    if name == "attn_out":
+        return md.deq(p + "attn_output.weight").T
     if name == "conv_out":
         return md.deq(p + "shortconv.out_proj.weight").T
     if name == "gate_up":
@@ -77,6 +84,9 @@ def ablock(md, what):
         return P.ablock_put(bf16(md.f(p + "post_attention_norm.weight")))
     if name == "ffn_post":
         return P.ablock_put(bf16(md.f(p + "post_ffw_norm.weight")))
+    if name == "qkn":
+        qn = md.f(p + "attn_q_norm.weight") * (np.log2(np.e) / np.sqrt(128))
+        return P.ablock_put(bf16(np.concatenate([qn, md.f(p + "attn_k_norm.weight")])))
     if name == "taps":
         q = what[2]
         taps = md.f(p + "shortconv.conv.weight").reshape(H, 7)[512 * q:512 * q + 512]
@@ -95,7 +105,20 @@ def pack(plan, md):
     Cs = np.zeros(plan.c_size, np.uint16)
     for off, what in plan.ablocks:
         Cs[off:off + P.ABLOCK] = ablock(md, what)
+    # RoPE tables after each qkv row: [cos 64 | sin 64] for the global then the sliding-window kind
+    rope = rope_tables(md, plan.M)
+    tails = Cs[plan.qs:plan.qs + plan.M * P.QKV_ROW].reshape(plan.M, P.QKV_ROW)
+    tails[:, 4096:4352] = bf16(np.concatenate([rope["attn"], rope["swa"]], 1))
     return np.concatenate(E), Cs
+
+
+def rope_tables(md, n, start=0):
+    i = np.arange(64)
+    out = {}
+    for kind, theta, f in (("attn", 1e6, md.f("rope_freqs.weight")), ("swa", 1e4, np.ones(64))):
+        ang = np.arange(start, start + n)[:, None] * (theta ** (-2.0 * i / 128) / f)[None, :]
+        out[kind] = np.concatenate([np.cos(ang), np.sin(ang)], 1).astype(np.float32)
+    return out
 
 
 def rms(v, w=None):
@@ -109,13 +132,15 @@ def reference(md, kinds, x):
     for l, kind in enumerate(kinds):
         p = f"blk.{l}."
         z = rms(x, md.f(p + "attn_norm.weight"))
-        assert kind == "conv"
-        pr = z @ md.deq(p + "shortconv.in_proj.weight").T
-        bx = pr[:, :H] * pr[:, 2 * H:]
-        taps = md.f(p + "shortconv.conv.weight").reshape(H, 7)
-        pad = np.concatenate([np.zeros((6, H), np.float32), bx])
-        conv = sum(taps[:, k] * pad[k:k + len(x)] for k in range(7))
-        out = (conv * pr[:, H:2 * H]) @ md.deq(p + "shortconv.out_proj.weight").T
+        if kind == "conv":
+            pr = z @ md.deq(p + "shortconv.in_proj.weight").T
+            bx = pr[:, :H] * pr[:, 2 * H:]
+            taps = md.f(p + "shortconv.conv.weight").reshape(H, 7)
+            pad = np.concatenate([np.zeros((6, H), np.float32), bx])
+            conv = sum(taps[:, k] * pad[k:k + len(x)] for k in range(7))
+            out = (conv * pr[:, H:2 * H]) @ md.deq(p + "shortconv.out_proj.weight").T
+        else:
+            out = attention(md, l, kind, z) @ md.deq(p + "attn_output.weight").T
         x = x + rms(out, md.f(p + "post_attention_norm.weight"))
         z = rms(x, md.f(p + "ffn_norm.weight"))
         g, u = z @ md.deq(p + "ffn_gate.weight").T, z @ md.deq(p + "ffn_up.weight").T
@@ -123,6 +148,31 @@ def reference(md, kinds, x):
         xs.append(x)
         md.drop()
     return xs
+
+
+def attention(md, l, kind, z):
+    p = f"blk.{l}."
+    n = len(z)
+    q = (z @ md.deq(p + "attn_q.weight").T).reshape(n, 16, 128)
+    k = (z @ md.deq(p + "attn_k.weight").T).reshape(n, 4, 128)
+    v = (z @ md.deq(p + "attn_v.weight").T).reshape(n, 4, 128)
+    gate = z @ md.deq(p + "attn_gate.weight").T
+    cs = rope_tables(md, n)[kind]
+    c, s = cs[:, None, :64], cs[:, None, 64:]
+    rope = lambda x: np.concatenate([x[..., :64] * c - x[..., 64:] * s, x[..., 64:] * c + x[..., :64] * s], -1)
+    q = rope(rms(q, md.f(p + "attn_q_norm.weight")))
+    k = rope(rms(k, md.f(p + "attn_k_norm.weight")))
+    t = np.arange(n)
+    allowed = t[None, :] <= t[:, None]
+    if kind == "swa":
+        allowed &= t[None, :] > t[:, None] - P.WINDOW
+    a = np.zeros((n, 16, 128), np.float32)
+    for h in range(16):
+        sc = q[:, h] @ k[:, h // 4].T / np.sqrt(128)
+        sc = np.where(allowed, sc, -np.inf)
+        e = np.exp(sc - sc.max(1, keepdims=True))
+        a[:, h] = (e / e.sum(1, keepdims=True)) @ v[:, h // 4]
+    return (a / (1 + np.exp(-gate[:, :, None]))).reshape(n, H)
 
 
 class Runner:
@@ -168,7 +218,7 @@ class Runner:
 
 def main():
     xclbin, insts, gguf, kinds = sys.argv[1:5]
-    kinds = kinds.split(",")
+    kinds = P.lfm3_kinds(int(kinds)) if kinds.isdigit() else kinds.split(",")
     md = Model(gguf)
     plan = P.Plan(kinds)
     t0 = time.perf_counter()
@@ -186,7 +236,7 @@ def main():
     xs = reference(md, kinds, from_bf16(bf16(x0)).reshape(x0.shape))
     rel = lambda p, q: np.linalg.norm(p - q) / np.linalg.norm(q)
     print(f"  x rel err {rel(G[:, H:2 * H], xs[-1]):.3e}, xn rel err {rel(G[:, :H], rms(xs[-1])):.3e}")
-    if len(sys.argv) > 5 and sys.argv[5] == "debug":
+    if len(sys.argv) > 5 and sys.argv[5] == "debug" and kinds[-1] == "conv":
         S = from_bf16(run.scratch())
         l = len(kinds) - 1
         cs = plan.cs[l] + P.STATE * P.CONV_ROW
@@ -204,5 +254,36 @@ def main():
         print(f"  y rel err {rel(Y, y):.3e}")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and sys.argv[1] != "debug-attn":
     main()
+
+
+def debug_attn(argv):
+    """host.py debug-attn <xclbin> <insts> <gguf> <n layers>: last layer must be attention."""
+    xclbin, insts, gguf, n = argv
+    kinds = P.lfm3_kinds(int(n))
+    md = Model(gguf)
+    plan = P.Plan(kinds)
+    E, Cs = pack(plan, md)
+    emb = md.deq("token_embd.weight")
+    x0 = emb[np.random.default_rng(2).integers(0, emb.shape[0], plan.M)]
+    md.drop()
+    run = Runner(xclbin, insts, plan, E, Cs)
+    G, _ = run.run(x0)
+    S = from_bf16(run.scratch())
+    xs = reference(md, kinds[:-1], from_bf16(bf16(x0)).reshape(x0.shape))
+    l = len(kinds) - 1
+    z = rms(xs[-1] if xs else from_bf16(bf16(x0)).reshape(x0.shape), md.f(f"blk.{l}.attn_norm.weight"))
+    a = attention(md, l, kinds[-1], z).reshape(plan.M, 16, 128)
+    O = S[plan.ao:plan.ao + plan.oh].reshape(16, plan.M, 128).transpose(1, 0, 2)
+    rel = lambda p, q: np.linalg.norm(p - q) / np.linalg.norm(q)
+    print(f"attention out rel err {rel(O, a):.3e}")
+    for h in (0, 5, 15):
+        print(f"  head {h}: {rel(O[:, h], a[:, h]):.3e}; tokens 0..31 {rel(O[:32, h], a[:32, h]):.3e}, 992.. {rel(O[992:, h], a[992:, h]):.3e}")
+    per_tok = np.linalg.norm(O - a, axis=(1, 2)) / np.linalg.norm(a, axis=(1, 2))
+    print("  worst tokens", np.argsort(per_tok)[-8:], per_tok[np.argsort(per_tok)[-8:]].round(3))
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "debug-attn":
+    debug_attn(sys.argv[2:])
+    sys.exit(0)

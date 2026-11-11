@@ -6,11 +6,12 @@ Buffers (bf16 elements unless noted):
   c: scratch: SwiGLU output, per-conv-layer [bx | C] rows (6 state rows first),
      conv output rows, and A blocks (128 x 512) of small per-phase constants
 
-Every phase is a dict with "kind" in gemm, norm, conv. GEMM phases carry an A
-source and a C destination:
+Every phase is a dict with "kind" in gemm, norm, conv, qkr, attn. GEMM phases
+carry an A source and a C destination:
   A ("rec",)                 xn of the records
   A ("half", off, stride)    columns 0..63 of every 128 of a scratch matrix
   A ("plain", off, stride)   a scratch matrix
+  A ("heads", off)           attention output, head-major [16][M][128]
   C ("o",)                   the records' o slot
   C ("plain", off, stride)   a scratch matrix
   C ("halves", off, stride)  columns 64..127 of every 128, two blocks per tile
@@ -18,7 +19,16 @@ source and a C destination:
 
 H, I, REC = 2048, 7680, 8192
 M_TILE, N_TILE, K_TILE, MTK = 128, 128, 64, 512
-CONV_ROW, Y_ROW = 4096, 2560
+CONV_ROW, Y_ROW, QKV_ROW = 4096, 2560, 4608
+PIECE = 16384                      # one core's C object
+LAYERS = 24
+ATTN_LAYERS = [l for l in range(LAYERS) if l >= 2 and l % 2 == 0]
+SWA_LAYERS = {4, 8, 12, 16, 20}
+WINDOW = 256
+
+
+def lfm3_kinds(n=LAYERS):
+    return ["swa" if l in SWA_LAYERS else "attn" if l in ATTN_LAYERS else "conv" for l in range(n)]
 STATE = 6
 ABLOCK = M_TILE * MTK
 
@@ -30,10 +40,23 @@ class Plan:
         self.b_off = 0
         self.sw = self._c(M * 15360)
         self.ys = self._c(M * Y_ROW + 4096)
-        self.cs = {}
+        self.cs, self.pieces = {}, {}
+        self.qs = self._c(M * QKV_ROW + 512)
+        self.oh = 16 * M * 128               # head-major attention output
+        self.ao = self._c(4 * self.oh) + 3 * self.oh  # three junk copies first
         self.ablocks = []          # (c offset, what) for the host to fill
         self.phases = [self._norm(("embed",))]
         for l, kind in enumerate(self.kinds):
+            if kind in ("attn", "swa"):
+                piece = self.pieces[l] = self._c(M // 16 * 4 * PIECE)
+                swa = int(kind == "swa")
+                self.phases += [
+                    self._gemm(H, 4096, "plain", ("rec",), ("plain", self.qs, QKV_ROW), (l, "qkv")),
+                    dict(kind="qkr", w=self._ablock((l, "qkn")), qs=self.qs, piece=piece, mode=swa),
+                    dict(kind="attn", piece=piece, ao=self.ao, mode=swa),
+                    self._gemm(H, H, "plain", ("heads", self.ao), ("o",), (l, "attn_out")),
+                ] + self._ffn(l)
+                continue
             assert kind == "conv", kind
             cs = self.cs[l] = self._c((STATE + M) * CONV_ROW + 512)
             rows = cs + STATE * CONV_ROW
@@ -42,13 +65,17 @@ class Plan:
                 self._gemm(H, H, "plain", ("rec",), ("halves", rows, CONV_ROW), (l, "conv_c")),
                 dict(kind="conv", cs=cs, ys=self.ys, taps=[self._ablock((l, "taps", q)) for q in range(4)]),
                 self._gemm(H, H, "plain", ("plain", self.ys, Y_ROW), ("o",), (l, "conv_out")),
-                self._norm((l, "post")),
-                self._gemm(H, 2 * I, "swiglu", ("rec",), ("plain", self.sw, 2 * I), (l, "gate_up")),
-                self._gemm(I, H, "plain", ("half", self.sw, 2 * I), ("o",), (l, "down")),
-                self._norm((l, "ffn_post")),
-            ]
+            ] + self._ffn(l)
         self.b_size = self.b_off
         self.c_size = self.c_off
+
+    def _ffn(self, l):
+        return [
+            self._norm((l, "post")),
+            self._gemm(H, 2 * I, "swiglu", ("rec",), ("plain", self.sw, 2 * I), (l, "gate_up")),
+            self._gemm(I, H, "plain", ("half", self.sw, 2 * I), ("o",), (l, "down")),
+            self._norm((l, "ffn_post")),
+        ]
 
     def codes(self):
         """One code per phase for the core interpreter (see prefill_next)."""
@@ -57,9 +84,9 @@ class Plan:
             if ph["kind"] == "gemm":
                 tiles = (self.M // M_TILE) * (ph["N"] // N_TILE) // 32
                 mode = {"plain": 0, "swiglu": 1, "bx": 2}[ph["mode"]]
-                out.append(0 | mode << 2 | tiles << 4 | (ph["K"] // K_TILE) << 11)
+                out.append(0 | mode << 3 | tiles << 5 | (ph["K"] // K_TILE) << 12)
             else:
-                out.append({"norm": 1, "conv": 2}[ph["kind"]])
+                out.append({"norm": 1, "conv": 2, "qkr": 3, "attn": 4}[ph["kind"]] | ph.get("mode", 0) << 3)
         return out
 
     def _c(self, n):

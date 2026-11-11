@@ -162,6 +162,19 @@ void matmul_vectorized_different_datatypes(bfloat16 *__restrict pA_in,
 
 // ---- LFM3 prefill epilogues (Gufo).
 
+namespace {
+// sigmoid(x) = (1 + tanh(x / 2)) / 2, with bf16 multiplies (native) only.
+inline aie::vector<bfloat16, 16> Sigmoid(aie::vector<bfloat16, 16> x) {
+  const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
+  aie::accum<accfloat, 16> h = aie::mul(x, half);
+  aie::accum<accfloat, 16> s;
+  s.from_vector(aie::broadcast<float, 16>(0.5f));
+  return aie::mac(s, aie::tanh<bfloat16>(h.to_vector<float>()), half).to_vector<bfloat16>();
+}
+}  // namespace
+// Program memory is 16 KB per core: everything below the matmul is optimized for size.
+#pragma clang attribute push(__attribute__((minsize)), apply_to = function)
+
 extern "C" {
 
 // In place on an m x n = 128 x 128 C tile held as 8x8 row-major blocks,
@@ -169,21 +182,13 @@ extern "C" {
 // of the same 64 channels. Writes SiLU(gate) * up into the gate blocks:
 // g * u * (1 + tanh(g / 2)) / 2.
 void prefill_swiglu(bfloat16 *__restrict c) {
-  const aie::vector<float, 16> half = aie::broadcast<float, 16>(0.5f);
-  const aie::vector<float, 16> one = aie::broadcast<float, 16>(1.0f);
+  const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
   for (int bi = 0; bi < 16; ++bi)
     for (int bj = 0; bj < 8; ++bj)
       for (int e = 0; e < 64; e += 16) {
         bfloat16 *g = c + (bi * 16 + bj) * 64 + e;
-        const bfloat16 *u = c + (bi * 16 + bj + 8) * 64 + e;
-        aie::accum<accfloat, 16> ga, ua, th;
-        ga.from_vector(aie::load_v<16>(g));
-        ua.from_vector(aie::load_v<16>(u));
-        const aie::vector<float, 16> gf = ga.to_vector<float>();
-        th.from_vector(aie::tanh<bfloat16>(aie::mul(gf, half).to_vector<float>()));
-        const aie::vector<float, 16> sig = aie::mul(aie::add(th.to_vector<float>(), one), half).to_vector<float>();
-        aie::accum<accfloat, 16> a = aie::mul(aie::mul(gf, ua.to_vector<float>()).to_vector<float>(), sig);
-        aie::store_v(g, a.to_vector<bfloat16>());
+        const aie::vector<bfloat16, 16> gv = aie::load_v<16>(g), uv = aie::load_v<16>(c + (bi * 16 + bj + 8) * 64 + e);
+        aie::store_v(g, aie::mul(aie::mul(gv, uv).to_vector<bfloat16>(), Sigmoid(gv)).to_vector<bfloat16>());
       }
 }
 
@@ -203,12 +208,28 @@ inline aie::vector<float, 16> Wide(const bfloat16 *p) {
   a.from_vector(aie::load_v<16>(p));
   return a.to_vector<float>();
 }
-inline aie::vector<float, 16> Rsqrt(aie::vector<float, 16> sum) {
-  return aie::invsqrt(aie::add(aie::mul(sum, aie::broadcast<float, 16>(1.0f / 2048.0f)).to_vector<float>(),
-                               aie::broadcast<float, 16>(1e-5f)));
+// 1 / sqrt(sum / 2^log2n + 1e-5); the division is an exact exponent shift (sum > 0
+// and normal, or 0).
+__attribute__((noinline)) aie::vector<float, 16> RsqrtMean(aie::vector<float, 16> sum, int log2n) {
+  const aie::vector<int32_t, 16> bits = sum.cast_to<int32_t>();
+  const aie::vector<int32_t, 16> shifted = aie::sub(bits, aie::broadcast<int32_t, 16>(log2n << 23));
+  const aie::vector<float, 16> mean = aie::select(shifted.cast_to<float>(), aie::zeros<float, 16>(),
+                                                  aie::lt(bits, aie::broadcast<int32_t, 16>((log2n + 1) << 23)));
+  return aie::invsqrt(aie::add(mean, aie::broadcast<float, 16>(1e-5f)));
 }
+inline aie::vector<float, 16> Rsqrt(aie::vector<float, 16> sum) { return RsqrtMean(sum, 11); }
 inline aie::vector<float, 16> Total(aie::accum<accfloat, 16> a) {
   return aie::broadcast<float, 16>(aie::reduce_add(a.to_vector<float>()));
+}
+inline aie::vector<bfloat16, 16> Bf(aie::vector<float, 16> v) {
+  aie::accum<accfloat, 16> a;
+  a.from_vector(v);
+  return a.to_vector<bfloat16>();
+}
+inline aie::vector<float, 16> Wide16(aie::vector<bfloat16, 16> v) {
+  aie::accum<accfloat, 16> a;
+  a.from_vector(v);
+  return a.to_vector<float>();
 }
 // Tile rows of the C object in the matmul layout [m/r][n/t][r][t] with r = t = 8:
 // element (R, c) sits at ((R >> 3) * 16 + (c >> 3)) * 64 + (R & 7) * 8 + (c & 7).
@@ -247,23 +268,29 @@ void prefill_norm_row(const bfloat16 *__restrict wp, const bfloat16 *__restrict 
     ww = aie::mac(ww, wo, wo);
   }
   const aie::vector<float, 16> so = Rsqrt(Total(oo));
-  const aie::vector<float, 16> s2 = aie::mul(so, so).to_vector<float>();
-  const aie::vector<float, 16> sum1 =
-      aie::add(aie::add(Total(xx), aie::mul(aie::mul(so, Total(xw)).to_vector<float>(), aie::broadcast<float, 16>(2.0f)).to_vector<float>()),
-               aie::mul(s2, Total(ww)).to_vector<float>());
-  const aie::vector<float, 16> sh = Rsqrt(sum1);
+  // bf16 products into an f32 accumulator: the cross terms keep bf16 precision
+  const aie::vector<bfloat16, 16> so_b = Bf(so);
+  const aie::vector<bfloat16, 16> two_so = aie::mul(so_b, aie::broadcast<bfloat16, 16>(2.0f)).to_vector<bfloat16>();
+  const aie::vector<bfloat16, 16> s2 = aie::mul(so_b, so_b).to_vector<bfloat16>();
+  aie::accum<accfloat, 16> sum1;
+  sum1.from_vector(Total(xx));
+  sum1 = aie::mac(sum1, Bf(Total(xw)), two_so);
+  sum1 = aie::mac(sum1, Bf(Total(ww)), s2);
+  const aie::vector<float, 16> sh = Rsqrt(sum1.to_vector<float>());
   const int at = (part & 1) * 1024;   // element offset within xn or x1
   const bool norm = part < 2;
+  // bf16 multipliers are native; the per-row scales round to bf16.
+  const aie::vector<bfloat16, 16> sob = Bf(so), shb = Bf(sh);
   for (int j = 0; j < 8; ++j) {
     bfloat16 *d = TileRow(tile, slot * 8 + j);
     for (int c = 0; c < 128; c += 16) {
       const int i = at + j * 128 + c;
-      aie::vector<float, 16> t = aie::mul(aie::mul(aie::load_v<16>(o + i), aie::load_v<16>(wp + i)).to_vector<float>(), so).to_vector<float>();
-      aie::vector<float, 16> x1 = aie::add(Wide(x + i), t);
-      if (norm) x1 = aie::mul(x1, sh).to_vector<float>();
-      aie::accum<accfloat, 16> r;
-      r.from_vector(x1);
-      Store16(d, c >> 3, r.to_vector<bfloat16>());
+      aie::accum<accfloat, 16> acc;
+      acc.from_vector(aie::load_v<16>(x + i));
+      acc = aie::mac(acc, aie::mul(aie::load_v<16>(wp + i), sob).to_vector<bfloat16>(), aie::load_v<16>(o + i));
+      aie::vector<bfloat16, 16> x1 = acc.to_vector<bfloat16>();
+      if (norm) x1 = aie::mul(x1, shb).to_vector<bfloat16>();
+      Store16(d, c >> 3, x1);
     }
   }
 }
@@ -299,8 +326,12 @@ int conv_ring;
 extern "C" {
 
 // Copies taps [which * 2048, which * 2048 + 2048) (only 1536 for which = 1)
-// from an A object into the tile and restarts the history ring.
-void prefill_conv_taps(const bfloat16 *__restrict a, bfloat16 *__restrict tile, int32_t which) {
+// from an A object into the tile and restarts the history ring; which
+// alternates 0, 1 per call.
+int taps_which;
+void prefill_conv_taps(const bfloat16 *__restrict a, bfloat16 *__restrict tile) {
+  const int which = taps_which;
+  taps_which ^= 1;
   conv_ring = 0;
   const int n = which ? 1536 : 2048;
   for (int i = 0; i < n; i += 16) aie::store_v(Spare(tile, which * 2048 + i), aie::load_v<16>(a + i));
@@ -311,6 +342,9 @@ void prefill_conv_row(const bfloat16 *__restrict row, bfloat16 *__restrict tile,
   const int ring = conv_ring;
   const int slot = row_slot;
   if (out) row_slot = (slot + 1) & 15;
+#ifdef CONV_STUB
+  return;
+#endif
   for (int jb = 0; jb < 8; ++jb) {
     const bfloat16 *bx = row + (part * 8 + jb) * 128;
     for (int e = 0; e < 64; e += 16) {
@@ -335,27 +369,281 @@ void prefill_conv_row(const bfloat16 *__restrict row, bfloat16 *__restrict tile,
   conv_ring = ring == 5 ? 0 : ring + 1;
 }
 
+}  // extern "C"
+
+// ---- Prefill attention. Shared helpers for the qkr and attention phases.
+
+#include "common/exp2_bf16.h"
+
+namespace {
+// Raw tile position of linear element p (p % 8 == 0) under the C drain's 8x8 untiling.
+inline int RawPos(int p) {
+  const int R = p >> 7, c = p & 127;
+  return ((R >> 3) << 10) + ((c >> 3) << 6) + ((R & 7) << 3);
+}
+inline void Put16Linear(bfloat16 *tile, int p, aie::vector<bfloat16, 16> v) {
+  aie::store_v(tile + RawPos(p), v.extract<8>(0));
+  aie::store_v(tile + RawPos(p + 8), v.extract<8>(1));
+}
+inline aie::vector<float, 16> Rsqrt128(aie::vector<float, 16> sum) { return RsqrtMean(sum, 7); }
+inline aie::vector<float, 16> SumSq128(const bfloat16 *v) {
+  aie::accum<accfloat, 16> acc = aie::zeros<accfloat, 16>();
+  for (int i = 0; i < 128; i += 16) {
+    const aie::vector<bfloat16, 16> x = aie::load_v<16>(v + i);
+    acc = aie::mac(acc, x, x);
+  }
+  return Total(acc);
+}
+
+// The qkr piece of core q for 16 tokens, as linear tile positions:
+//   head hl (0..3): [Q 16 tokens x 128 | gates 16 tokens x 16 heads] at hl * 2304
+//   K at 9216, V at 11264: [kb8 2][dblk 16][8 keys][8 dims]
+constexpr int kQPiece = 2304, kK = 9216, kV = 11264;
+
+// RMS-normalizes one 128-wide head with weight w and applies RoPE (rotate-half)
+// with cos / sin (64 each); out gets 128 bf16.
+__attribute__((noinline)) void NormRope(const bfloat16 *x, const bfloat16 *w, const bfloat16 *cs, bfloat16 *out) {
+  const aie::vector<bfloat16, 16> inv = Bf(Rsqrt128(SumSq128(x)));
+  for (int d = 0; d < 64; d += 16) {
+    const aie::vector<bfloat16, 16> a = aie::mul(aie::mul(aie::load_v<16>(x + d), inv).to_vector<bfloat16>(), aie::load_v<16>(w + d)).to_vector<bfloat16>();
+    const aie::vector<bfloat16, 16> b =
+        aie::mul(aie::mul(aie::load_v<16>(x + 64 + d), inv).to_vector<bfloat16>(), aie::load_v<16>(w + 64 + d)).to_vector<bfloat16>();
+    const aie::vector<bfloat16, 16> c = aie::load_v<16>(cs + d), s = aie::load_v<16>(cs + 64 + d);
+    aie::store_v(out + d, aie::msc(aie::mul(a, c), b, s).to_vector<bfloat16>());
+    aie::store_v(out + 64 + d, aie::mac(aie::mul(b, c), a, s).to_vector<bfloat16>());
+  }
+}
+alignas(64) bfloat16 head_buf[128];
+inline int KvPos(int base, int slot, int d) { return base + (((slot >> 3) * 16 + (d >> 3)) << 6) + ((slot & 7) << 3); }
+
+int rope_kind, attn_swa, attn_round, attn_b, attn_kb, attn_k0, attn_head;
+}  // namespace
+
+extern "C" {
+
+// w: [q-norm weight (pre-scaled by log2(e) / sqrt(128)) | k-norm weight] (one A object).
+// row: [q 2048 | k 512 | v 512 | gate 16 | ...] with RoPE tables at 4096: per kind [cos 64 | sin 64].
+void prefill_qkr_row(const bfloat16 *__restrict w, const bfloat16 *__restrict row, bfloat16 *__restrict tile,
+                     int32_t part) {
+  const int slot = row_slot;
+  row_slot = (slot + 1) & 15;
+  const bfloat16 *cs = row + 4096 + rope_kind * 128;
+  // sigmoid(gate), applied to the attention output later
+  const aie::vector<bfloat16, 16> gates = Sigmoid(aie::load_v<16>(row + 3072));
+  // hl 0..3: q heads 4 part + hl; hl 4: k head part; hl 5: v head part (copied)
+  for (int hl = 0; hl < 6; ++hl) {
+    const bfloat16 *src = hl < 4 ? row + (part * 4 + hl) * 128 : row + 2048 + (hl - 4) * 512 + part * 128;
+    if (hl < 5) NormRope(src, hl < 4 ? w : w + 128, cs, head_buf);
+    const bfloat16 *h = hl < 5 ? head_buf : src;
+    for (int d = 0; d < 128; d += 8) {
+      const int p = hl < 4 ? hl * kQPiece + slot * 128 + d : KvPos(hl == 4 ? kK : kV, slot, d);
+      aie::store_v(tile + RawPos(p), aie::load_v<8>(h + d));
+    }
+    if (hl < 4) Put16Linear(tile, hl * kQPiece + 2048 + slot * 16, gates);
+  }
+}
+
+}  // extern "C"
+
+// ---- Flash attention. Column c serves KV group g = c % 4 and query blocks
+// b = 2 r + c / 4 (32 queries each) in rounds r; core q is head 4 g + q. A round
+// gets the four Q objects of the group (core q copies its own) and then the KV
+// objects of 16 keys each: K at 0, V at 2048, both [kb8 2][dblk 16][8 keys][8 dims].
+// Per-row state is kept in 8 x 8 broadcast form (lane row * 8 + j = value of row).
+// Tile (bf16 units): Y f32 [g 4][dblk 16][8][8] at 0, Q bf16 [g][dblk][8][8] at
+// 8192, P bf16 [g][kb8][8][8] at 12288, l f32 [g][64] at 13312, m bf16 [g][64] at
+// 13824, gate bf16 [32] at 14080. O blocks, written last, take raw 12288..16384
+// (linear 12288..: 32 tokens x 128) in the layout of Y.
+
+namespace {
+constexpr int kQ = 8192, kP = 12288, kL = 13312, kM = 13824, kG = 14080, kO = 12288;
+using Mm = aie::mmul<8, 8, 8, bfloat16, bfloat16, accauto>;
+
+inline float *F32(bfloat16 *p) { return reinterpret_cast<float *>(p); }
+struct LaneDiff {
+  alignas(64) int32_t v[64];
+  constexpr LaneDiff() : v() {
+    for (int l = 0; l < 64; ++l) v[l] = (l & 7) - (l >> 3);
+  }
+};
+alignas(64) constexpr LaneDiff kLaneDiffT{};
+struct Eye {  // bf16 bit patterns: no static constructors on the core
+  alignas(64) uint16_t v[64];
+  constexpr Eye() : v() {
+    for (int l = 0; l < 64; ++l) v[l] = (l & 7) == (l >> 3) ? 0x3F80 : 0;
+  }
+};
+alignas(64) constexpr Eye kEyeT{};
+const bfloat16 *const kEye = reinterpret_cast<const bfloat16 *>(kEyeT.v);
+const int32_t *const kLaneDiff = kLaneDiffT.v;
+inline aie::vector<float, 64> Wide64(aie::vector<bfloat16, 64> v) {
+  aie::accum<accfloat, 64> a;
+  a.from_vector(v);
+  return a.to_vector<float>();
+}
+inline aie::vector<bfloat16, 64> Narrow64(aie::vector<float, 64> v) {
+  aie::accum<accfloat, 64> a;
+  a.from_vector(v);
+  return a.to_vector<bfloat16>();
+}
+// 8 values per row as 16 lanes [k * 8 + row] (k = 0, 1) -> broadcast form.
+inline aie::vector<bfloat16, 64> Bcast16(aie::vector<bfloat16, 16> v) {
+  return aie::transpose(aie::concat(aie::concat(v, v), aie::concat(v, v)), 8, 8);
+}
+inline aie::vector<bfloat16, 64> RowMax(aie::vector<bfloat16, 64> v) {
+  const aie::vector<bfloat16, 64> t = aie::transpose(v, 8, 8);  // [j * 8 + row]
+  const aie::vector<bfloat16, 32> a = aie::max(t.extract<32>(0), t.extract<32>(1));
+  const aie::vector<bfloat16, 16> b = aie::max(a.extract<16>(0), a.extract<16>(1));
+  return Bcast16(aie::max(b, aie::concat(b.extract<8>(1), b.extract<8>(0))));
+}
+}  // namespace
+
+extern "C" {
+
+// cnt[6] = KV objects of this round; resets the running state.
+void prefill_attn_round(int32_t *__restrict cnt, bfloat16 *__restrict tile, int32_t part, int32_t col) {
+  const int b = 2 * attn_round + (col >> 2);
+  attn_round = attn_round == 15 ? 0 : attn_round + 1;
+  int k0 = 0;
+  if (attn_swa) {
+    k0 = (32 * b - 255) >> 4;
+    if (k0 < 0) k0 = 0;
+  }
+  cnt[6] = 2 * b + 2 - k0;
+  attn_b = b;
+  attn_k0 = k0;
+  attn_kb = 2 * b;  // the diagonal blocks come first, then k0 .. 2 b - 1
+  attn_head = 4 * (col & 3) + part;
+  float *y = F32(tile);
+  for (int i = 0; i < 4096; i += 16) aie::store_v(y + i, aie::zeros<float, 16>());
+  for (int i = 0; i < 256; i += 16) aie::store_v(F32(tile + kL) + i, aie::zeros<float, 16>());
+}
+
+// Q object `which` (0..3 per round, counted here) of the round: [Q 16 x 128 | gates 16 x 16] twice; core `part` keeps object part.
+int attn_which;
+void prefill_attn_q(const bfloat16 *__restrict obj, bfloat16 *__restrict tile, int32_t part) {
+  const int which = attn_which;
+  attn_which = (which + 1) & 3;
+  if (which != part) return;
+  for (int i = 0; i < 32; ++i) {
+    const bfloat16 *src = obj + (i >> 4) * 2304 + (i & 15) * 128;
+    for (int dblk = 0; dblk < 16; ++dblk)
+      aie::store_v(tile + kQ + (((i >> 3) * 16 + dblk) << 6) + ((i & 7) << 3), aie::load_v<8>(src + dblk * 8));
+    tile[kG + i] = obj[(i >> 4) * 2304 + 2048 + (i & 15) * 16 + attn_head];
+  }
+}
+
+void prefill_attn_kv(const bfloat16 *__restrict kv, bfloat16 *__restrict tile) {
+  const bfloat16 *K = kv, *V = kv + 2048;
+  const bfloat16 *Q = tile + kQ;
+  // S = Q K^T: [g][kb8] 8 x 8 blocks, one K transpose reused by the four row groups.
+  Mm s[4][2];
+  for (int kb8 = 0; kb8 < 2; ++kb8) {
+    for (int g = 0; g < 4; ++g) s[g][kb8] = Mm(aie::zeros<accfloat, 64>());
+    for (int dblk = 0; dblk < 16; ++dblk) {
+      const aie::vector<bfloat16, 64> kt = aie::transpose(aie::load_v<64>(K + ((kb8 * 16 + dblk) << 6)), 8, 8);
+      for (int g = 0; g < 4; ++g) s[g][kb8].mac(aie::load_v<64>(Q + ((g * 16 + dblk) << 6)), kt);
+    }
+  }
+  const int key0 = attn_kb * 16, q0 = attn_b * 32;
+  const bool mask = key0 + 15 > q0 || (attn_swa && key0 < q0 + 31 - 255);
+  // No running-max rescale: the round's first block (keys 32 b .. 32 b + 15) has a
+  // visible key in every row, and its row maxima stay the offset for the round.
+  // Later scores above it only make P exceed 1, far inside bf16 / f32 range.
+  const bool first = attn_kb == 2 * attn_b;
+  const aie::vector<bfloat16, 64> ones = aie::broadcast<bfloat16, 64>(1.0f);
+  float *y = F32(tile);
+  for (int g = 0; g < 4; ++g) {
+    aie::vector<float, 64> sv[2];
+    for (int kb8 = 0; kb8 < 2; ++kb8) {
+      sv[kb8] = s[g][kb8].to_vector<float>();
+      if (mask) {
+        // key - query = base + (lane & 7) - (lane >> 3)
+        const aie::vector<int32_t, 64> diff =
+            aie::add(aie::load_v<64>(kLaneDiff), aie::broadcast<int32_t, 64>(key0 - q0 + 8 * (kb8 - g)));
+        aie::mask<64> drop = aie::gt(diff, aie::zeros<int32_t, 64>());
+        if (attn_swa) drop = drop | aie::lt(diff, aie::broadcast<int32_t, 64>(-255));
+        sv[kb8] = aie::select(sv[kb8], aie::broadcast<float, 64>(-3e38f), drop);
+      }
+    }
+    bfloat16 *m = tile + kM + g * 64;
+    if (first) aie::store_v(m, RowMax(Narrow64(aie::max(sv[0], sv[1]))));
+    const aie::vector<float, 64> mf = Wide64(aie::load_v<64>(m));
+    for (int kb8 = 0; kb8 < 2; ++kb8) aie::store_v(tile + kP + (kb8 << 6), exp2_bf16(aie::sub(sv[kb8], mf)));
+    const aie::vector<bfloat16, 64> p0 = aie::load_v<64>(tile + kP), p1 = aie::load_v<64>(tile + kP + 64);
+    float *lsum = F32(tile + kL) + g * 64;
+    Mm rs(aie::load_v<64>(lsum));
+    rs.mac(p0, ones);
+    rs.mac(p1, ones);
+    aie::store_v(lsum, rs.to_vector<float>());
+    for (int dblk = 0; dblk < 16; ++dblk) {
+      float *yb = y + ((g * 16 + dblk) << 6);
+      Mm acc(aie::load_v<64>(yb));
+      acc.mac(p0, aie::load_v<64>(V + (dblk << 6)));
+      acc.mac(p1, aie::load_v<64>(V + ((16 + dblk) << 6)));
+      aie::store_v(yb, acc.to_vector<float>());
+    }
+  }
+  attn_kb = attn_kb == 2 * attn_b + 1 ? attn_k0 : attn_kb + 1;
+}
+
+// O = Y / l * sigmoid(gate) (qkr stored the sigmoid), as 8 x 8 blocks at raw 12288 + g * 1024 + dblk * 64.
+void prefill_attn_out(bfloat16 *__restrict tile) {
+  bfloat16 *f = tile + kP;  // P is dead; f[g] = diag(sigmoid(gate) / l) as an 8 x 8 bf16 block
+  for (int g = 0; g < 4; ++g) {
+    const aie::vector<bfloat16, 8> g8 = aie::load_v<8>(tile + kG + g * 8);
+    const aie::vector<bfloat16, 64> gb = Bcast16(aie::concat(g8, g8));
+    for (int i = 0; i < 64; i += 16) {
+      const aie::vector<bfloat16, 16> il = Bf(aie::inv(aie::load_v<16>(F32(tile + kL) + g * 64 + i)));
+      const aie::vector<bfloat16, 16> fv = aie::mul(gb.extract<16>(i >> 4), il).to_vector<bfloat16>();
+      aie::store_v(f + g * 64 + i, aie::mul(fv, aie::load_v<16>(kEye + i)).to_vector<bfloat16>());
+    }
+  }
+  const float *y = F32(tile);
+  for (int g = 3; g >= 0; --g) {  // O[0] overwrites f
+    const aie::vector<bfloat16, 64> d = aie::load_v<64>(f + g * 64);
+    for (int dblk = 0; dblk < 16; ++dblk) {
+      Mm o;
+      o.mul(d, Narrow64(aie::load_v<64>(y + ((g * 16 + dblk) << 6))));
+      aie::store_v(tile + kO + g * 1024 + (dblk << 6), o.to_vector<bfloat16>());
+    }
+  }
+}
+
 // ---- Phase interpreter. PREFILL_PLAN lists one code per phase:
-// kind | mode << 2 | tiles << 4 | ksteps << 11 (kind 0 GEMM, 1 norm, 2 conv;
-// mode 0 plain, 1 SwiGLU, 2 bx).
+// kind | mode << 3 | tiles << 5 | ksteps << 12 (kind 0 GEMM, 1 norm, 2 conv,
+// 3 qkr, 4 attention; GEMM mode 0 plain, 1 SwiGLU, 2 bx; qkr mode the RoPE
+// kind; attention mode 1 for sliding-window).
 #ifndef PREFILL_PLAN
 #define PREFILL_PLAN 0
 #endif
 namespace {
 const int32_t kPlan[] = {PREFILL_PLAN};
-int phase_at, epilogue_mode;
+int phase_at, epilogue_mode, row_qkr;
 }  // namespace
 
-// cnt: [GEMM tiles, k steps, norm, conv]
+// cnt: [GEMM tiles, k steps, norm, conv, qkr, attention, round KV objects]
 void prefill_next(int32_t *__restrict cnt) {
   const int32_t code = kPlan[phase_at];
   phase_at = phase_at + 1 == int(sizeof(kPlan) / sizeof(kPlan[0])) ? 0 : phase_at + 1;  // the core reruns per dispatch
-  const int kind = code & 3;
-  epilogue_mode = (code >> 2) & 3;
-  cnt[0] = kind == 0 ? (code >> 4) & 127 : 0;
-  cnt[1] = code >> 11;
-  cnt[2] = kind == 1;
+  const int kind = code & 7;
+  const int mode = (code >> 3) & 3;
+  epilogue_mode = mode;
+  cnt[0] = kind == 0 ? (code >> 5) & 127 : 0;
+  cnt[1] = code >> 12;
+  cnt[2] = kind == 1 || kind == 3;  // row phases: norm or qkr
   cnt[3] = kind == 2;
+  cnt[4] = 0;
+  row_qkr = kind == 3;
+  cnt[5] = kind == 4;
+  rope_kind = mode;
+  attn_swa = mode;
+  attn_round = 0;
+}
+
+void prefill_row(const bfloat16 *__restrict w, const bfloat16 *__restrict row, bfloat16 *__restrict tile, int32_t part) {
+  if (row_qkr) prefill_qkr_row(w, row, tile, part);
+  else prefill_norm_row(w, row, tile, part);
 }
 
 void prefill_epilogue(bfloat16 *__restrict c) {
@@ -364,3 +652,5 @@ void prefill_epilogue(bfloat16 *__restrict c) {
 }
 
 }  // extern "C"
+
+#pragma clang attribute pop

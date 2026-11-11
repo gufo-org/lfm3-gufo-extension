@@ -35,7 +35,7 @@ _AIE_KERNELS_INC = Path("/home/anvil/npu-work/mlir-aie-src/aie_kernels")
 COLS, ROWS = 8, 4
 
 
-@iron.jit(aiecc_flags=["--dynamic-objFifos"])
+@iron.jit(aiecc_flags=["--dynamic-objFifos"] + os.environ.get("PREFILL_AIECC", "").split())
 def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: CompileTime[int] = 1024):
     plan = P.Plan(kinds.split(","), M)
     m, k, n, mtk = P.M_TILE, P.K_TILE, P.N_TILE, P.MTK
@@ -59,9 +59,13 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
     cnt_ty = np.ndarray[(8,), np.dtype[np.int32]]
     next_k = ext("prefill_next", [cnt_ty])
     epi_k = ext("prefill_epilogue", [C_l1_ty])
-    norm_k = ext("prefill_norm_row", [A_l1_ty, B_l1_ty, C_l1_ty, np.int32])
-    taps_k = ext("prefill_conv_taps", [A_l1_ty, C_l1_ty, np.int32])
+    norm_k = ext("prefill_row", [A_l1_ty, B_l1_ty, C_l1_ty, np.int32])
+    taps_k = ext("prefill_conv_taps", [A_l1_ty, C_l1_ty])
     conv_k = ext("prefill_conv_row", [B_l1_ty, C_l1_ty, np.int32, np.int32])
+    rnd_k = ext("prefill_attn_round", [cnt_ty, C_l1_ty, np.int32, np.int32])
+    aq_k = ext("prefill_attn_q", [B_l1_ty, C_l1_ty, np.int32])
+    akv_k = ext("prefill_attn_kv", [B_l1_ty, C_l1_ty])
+    aout_k = ext("prefill_attn_out", [C_l1_ty])
 
     a_l3l2_dims = TensorAccessPattern.full((mtk // k, m, k)).permute((1, 0, 2))
     a_l2l1_in = TensorAccessPattern.full((mtk // k * 4, m // 4, k // s, s)).permute((0, 2, 1, 3))
@@ -89,8 +93,10 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
     rows_per_col = M // COLS
     groups = rows_per_col // 16
 
-    def make_core(q):
-        def core_fn(in_a, in_b, out_c, cnt, zero, matmul, nxt, epi, norm, taps, conv):
+    rounds = M // 32 // 2
+
+    def make_core(q, col):
+        def core_fn(in_a, in_b, out_c, cnt, zero, matmul, nxt, epi, norm, taps, conv, rnd, aq, akv, aout):
             def skip_a(nobj):
                 for _ in range_(nobj):
                     in_a.acquire(1)
@@ -111,13 +117,14 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                     zero(acc)
                     for _ in range_(cnt[1]):
                         wb = in_b.acquire(1)
-                        for _ in range(4):
+                        for _ in range_(4):
                             xa = in_a.acquire(1)
                             matmul(xa, wb, acc)
                             in_a.release(1)
                         in_b.release(1)
                     epi(acc)
                     out_c.release(1)
+                # Row phases (norm, or qk-norm + RoPE for qkr; the kernel dispatches):
                 # Norm: the post-norm weight is the first A object of a block. Every core of a
                 # column sees each row; core q writes quarter q of [xn | x1] for 16 rows per C object.
                 for _ in range_(cnt[2]):
@@ -131,9 +138,9 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                 # Conv: taps from two A objects into the tile, 6 state rows, then the tokens.
                 for _ in range_(cnt[3]):
                     o = out_c.acquire(1)
-                    for which in range(2):
+                    for _ in range_(2):
                         tp = in_a.acquire(1)
-                        taps(tp, o, which)
+                        taps(tp, o)
                         in_a.release(1)
                     skip_a(mtk // k * 4 - 2)
                     for _ in range_(P.STATE):
@@ -146,11 +153,26 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                         o = out_c.acquire(1)
                         rows16(o, lambda row, o: conv(row, o, q, 1))
                         out_c.release(1)
+                # Attention: per round, the group's four Q objects, then the round's KV objects.
+                for _ in range_(cnt[5]):
+                    for _ in range_(rounds):
+                        o = out_c.acquire(1)
+                        rnd(cnt, o, q, col)
+                        for _ in range_(4):
+                            qo = in_b.acquire(1)
+                            aq(qo, o, q)
+                            in_b.release(1)
+                        for _ in range_(cnt[6]):
+                            kv = in_b.acquire(1)
+                            akv(kv, o)
+                            in_b.release(1)
+                        aout(o)
+                        out_c.release(1)
         return core_fn
 
-    workers = [Worker(make_core(row), [A_l2l1[row].cons(), B_l2l1[col].cons(), C_l1l2[row][col].prod(),
-                                       Buffer(cnt_ty, name=f"cnt_{row}_{col}"), zero_k, matmul_k, next_k, epi_k,
-                                       norm_k, taps_k, conv_k], stack_size=0xA00)
+    workers = [Worker(make_core(row, col), [A_l2l1[row].cons(), B_l2l1[col].cons(), C_l1l2[row][col].prod(),
+                                            Buffer(cnt_ty, name=f"cnt_{row}_{col}"), zero_k, matmul_k, next_k, epi_k,
+                                            norm_k, taps_k, conv_k, rnd_k, aq_k, akv_k, aout_k], stack_size=0x1100)
                for row in range(ROWS) for col in range(COLS)]
 
     a_size, b_size, c_size = M * P.REC, plan.b_size, plan.c_size
@@ -192,6 +214,38 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                     [("c", (ph["ys"] + col * rows_per_col * P.Y_ROW, [groups, 4, 16, 1024], [16 * P.Y_ROW, 512, P.Y_ROW, 1]))
                      for col in range(COLS)])
                 continue
+            if ph["kind"] == "qkr":
+                per_col = rows_per_col // 16 * 4 * P.PIECE
+                elementwise(
+                    [("c", ph["w"])] * ROWS,
+                    [("c", (ph["qs"] + col * rows_per_col * P.QKV_ROW, [1, rows_per_col, 9, 512], [0, P.QKV_ROW, 512, 1]))
+                     for col in range(COLS)],
+                    # pieces in [column][16-token object][core] order
+                    [("c", (ph["piece"] + col * per_col, [1, 1, per_col // 1024, 1024], [0, 0, 1024, 1])) for col in range(COLS)])
+                continue
+            if ph["kind"] == "attn":
+                oh = plan.oh
+                for r_ in range(rounds):
+                    tg = TaskGroup()
+                    for col in range(COLS):
+                        g, b_ = col % 4, 2 * r_ + col // 4
+                        k0 = max(0, (32 * b_ - 255) // 16) if ph["mode"] else 0
+                        nkb = 2 * b_ + 2 - k0
+                        # the group's four heads: [Q 16 tokens | gates] for both 16-token halves
+                        B_prods[col].fill(c, tap=TAP((c_size,), ph["piece"] + (2 * b_ * 4 + g) * P.PIECE, [4, 2, 9, 256],
+                                                     [2304, 4 * P.PIECE, 256, 1]), group=tg, wait=False)
+                        # KV objects: the two diagonal blocks first (they set the softmax offset), then k0 .. 2 b - 1
+                        for kb0, n_ in ((2 * b_, 2), (k0, 2 * b_ - k0)):
+                            if n_:
+                                B_prods[col].fill(c, tap=TAP((c_size,), ph["piece"] + (kb0 * 4 + g) * P.PIECE + 9216, [1, n_, 9, 512],
+                                                             [0, 4 * P.PIECE, 512, 1]), group=tg, wait=False)
+                    for col in range(COLS):
+                        g, b_ = col % 4, 2 * r_ + col // 4
+                        # per core: three junk quarters (into the junk copies), then O [32 tokens][128]
+                        C_conses[col].drain(c, tap=TAP((c_size,), ph["ao"] + 4 * g * (M * 128) + b_ * 4096 - 3 * oh,
+                                                       [4, 4, 32, 128], [M * 128, oh, 128, 1]), group=tg, wait=True)
+                    tg.finish()
+                continue
             K, N, mode = ph["K"], ph["N"], ph["mode"]
             n_rt, n_ct = M // m // ROWS, N // n // COLS
             slots, done = [None] * 4, [True] * 4
@@ -211,6 +265,9 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                     src = ph["a"]
                     if src[0] == "rec":
                         A_prods[row].fill(a, tap=TAP((a_size,), tr * m * P.REC, [1, K // mtk, m, mtk], [0, mtk, P.REC, 1]), group=tg, wait=False)
+                    elif src[0] == "heads":
+                        A_prods[row].fill(c, tap=TAP((c_size,), src[1] + tr * m * 128, [K // mtk, m, mtk // 128, 128],
+                                                     [mtk // 128 * M * 128, 128, M * 128, 1]), group=tg, wait=False)
                     elif src[0] == "plain":
                         A_prods[row].fill(c, tap=TAP((c_size,), src[1] + tr * m * src[2], [1, K // mtk, m, mtk], [0, mtk, src[2], 1]), group=tg, wait=False)
                     else:  # half
@@ -244,6 +301,8 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
 if __name__ == "__main__":
     out = sys.argv[1]
     kinds = sys.argv[2] if len(sys.argv) > 2 else "conv"
+    if kinds.isdigit():
+        kinds = ",".join(P.lfm3_kinds(int(kinds)))
     M = int(sys.argv[3]) if len(sys.argv) > 3 else 1024
     iron.set_current_device(from_name("npu2", n_cols=None))
     prefill.specialize(kinds=kinds, M=M).compile(xclbin_path=out + ".xclbin", inst_path=out + ".bin")
