@@ -220,3 +220,16 @@ header kept in `mm_bfp_mixed.cc`). One FFN's projections for 1,024 tokens:
 | gate/up, 1024 × 2048 × 16384 | 1.1e-2 | |
 | down, 1024 × 7680 × 2048 | 1.6e-2 | |
 | Both, one run | | 4.25 ms, 23.7 TFLOPS |
+
+`iron/prefill/ffn.py` runs a prefill FFN block in one run:
+
+1. The gate/up GEMM, with weight columns interleaved [gate 64 | up 64] per
+   128-column tile.
+2. SwiGLU as an in-place epilogue on each core's C tile.
+3. The down GEMM, reading the activations back through a strided A tap that
+   skips the up columns.
+
+LFM3-1.7B layer 0, 1,024 tokens (`iron/prefill/ffn_host.py`): 5.89 ms
+(16.4 TFLOPS). The relative error against float64 is 1.9e-2, for both the
+activations and the block output. About 1.7 ms of the time is the SwiGLU
+epilogue.

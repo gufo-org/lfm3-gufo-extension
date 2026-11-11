@@ -159,3 +159,32 @@ void matmul_vectorized_different_datatypes(bfloat16 *__restrict pA_in,
   event1();
 }
 }
+
+// ---- LFM3 prefill epilogues (Gufo).
+
+extern "C" {
+
+// In place on an m x n = 128 x 128 C tile held as 8x8 row-major blocks,
+// block (bi, bj) at (bi * 16 + bj) * 64: columns 0..63 are gate, 64..127 up
+// of the same 64 channels. Writes SiLU(gate) * up into the gate blocks:
+// g * u * (1 + tanh(g / 2)) / 2.
+void prefill_swiglu(bfloat16 *__restrict c) {
+  const aie::vector<float, 16> half = aie::broadcast<float, 16>(0.5f);
+  const aie::vector<float, 16> one = aie::broadcast<float, 16>(1.0f);
+  for (int bi = 0; bi < 16; ++bi)
+    for (int bj = 0; bj < 8; ++bj)
+      for (int e = 0; e < 64; e += 16) {
+        bfloat16 *g = c + (bi * 16 + bj) * 64 + e;
+        const bfloat16 *u = c + (bi * 16 + bj + 8) * 64 + e;
+        aie::accum<accfloat, 16> ga, ua, th;
+        ga.from_vector(aie::load_v<16>(g));
+        ua.from_vector(aie::load_v<16>(u));
+        const aie::vector<float, 16> gf = ga.to_vector<float>();
+        th.from_vector(aie::tanh<bfloat16>(aie::mul(gf, half).to_vector<float>()));
+        const aie::vector<float, 16> sig = aie::mul(aie::add(th.to_vector<float>(), one), half).to_vector<float>();
+        aie::accum<accfloat, 16> a = aie::mul(aie::mul(gf, ua.to_vector<float>()).to_vector<float>(), sig);
+        aie::store_v(g, a.to_vector<bfloat16>());
+      }
+}
+
+}  // extern "C"
