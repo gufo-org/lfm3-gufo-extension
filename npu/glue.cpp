@@ -1,6 +1,7 @@
 #include "glue.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -166,14 +167,16 @@ RowKernel SwiGluPackKernel(std::uint32_t I, std::uint32_t rows, bool partial) {
   k.body = Fill(std::string(partial ? "      %zp = vector.splatf 0.0 : vector<16xf32>\n      %c8p = index.constant 8 : index\n" : "") +
                     R"(      %n = index.constant @P : index
       scf.for %i = [%c0 to %n step %c16] {
-@LOAD        %sg = func.call @sigmoid(%gv) : (vector<16xf32>) -> (vector<16xf32>)
+@LOAD@SIG
         %silu = func.call @fmul2(%gv, %sg) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         %o = func.call @fmul2(%silu, %uv) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         %ob = vector.fptrunc %o : vector<16xf32> to vector<16xbf16>
         vector.store %ob, %xb[%i] : vector<16xbf16>, view<@Pxbf16>
       }
 )",
-                {{"@LOAD", load}, {"@P", S(piece)}});
+                {{"@LOAD", load}, {"@P", S(piece)},
+                 {"@SIG", std::getenv("GUFO_LFM3_NPU_EXP_NOSIG") ? "        %sg = vector.addf %gv, %gv : vector<16xf32>\n"  // experiment only
+                                                                 : "        %sg = func.call @sigmoid(%gv) : (vector<16xf32>) -> (vector<16xf32>)\n"}});
   return k;
 }
 

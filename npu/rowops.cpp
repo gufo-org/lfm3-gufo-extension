@@ -1,5 +1,6 @@
 #include "rowops.hpp"
 
+#include <cstdlib>
 #include <set>
 #include <stdexcept>
 
@@ -287,11 +288,18 @@ std::string RowKernelProgram(const RowKernel& k) {
            "  %" + tag + "_block = index.constant " + S(std::uint64_t(parts(o)) * o.groups * 64) + " : index\n" +
            "  %" + tag + "_piece = index.constant " + S(std::uint64_t(o.floats / 8) * 64) + " : index\n";
   };
+  // Two slots per operand (DMA of the next piece overlaps the body) when
+  // every operand's doubled storage fits the compute tile.
+  std::uint64_t all_bytes = 0;
+  for (const auto* list : {&k.inputs, &k.outputs})
+    for (const auto& o : *list) all_bytes += std::uint64_t(parts(o)) * o.floats * bytes(o);
+  std::uint32_t slots = 2 * all_bytes <= 56 * 1024 ? 2 : 1;
+  if (std::getenv("GUFO_LFM3_NPU_ROW_SLOTS")) slots = std::uint32_t(std::atoi(std::getenv("GUFO_LFM3_NPU_ROW_SLOTS")));  // experiment only
   auto storage = [&](const RowOperand& o, const std::string& tag) {
-    return "  %" + tag + "_size = index.constant " + S(std::uint64_t(parts(o)) * o.floats * bytes(o)) + " : offset\n"
+    return "  %" + tag + "_size = index.constant " + S(slots * std::uint64_t(parts(o)) * o.floats * bytes(o)) + " : offset\n"
            "  %" + tag + "_storage = buffer.alloca<workgroup> pool(%memory) align(64) %" + tag + "_size : buffer\n"
-           "  %" + tag + "_slots = buffer.view %" + tag + "_storage[%origin] : buffer -> view<1x" + tile_type(o) + ">\n"
-           "  %" + tag + "_ch = channel.bind<fifo> %" + tag + "_slots, %c1 : view<1x" + tile_type(o) + ">, index -> channel<" + chan(o) + ">\n";
+           "  %" + tag + "_slots = buffer.view %" + tag + "_storage[%origin] : buffer -> view<" + S(slots) + "x" + tile_type(o) + ">\n"
+           "  %" + tag + "_ch = channel.bind<fifo> %" + tag + "_slots, %c" + S(slots) + " : view<" + S(slots) + "x" + tile_type(o) + ">, index -> channel<" + chan(o) + ">\n";
   };
   auto copy = [&](const std::string& tag, const std::string& from, const std::string& from_type,
                   const std::string& to, const std::string& to_type, bool in) {
@@ -384,7 +392,7 @@ std::string RowKernelProgram(const RowKernel& k) {
   text += kMathLibrary;
   text += "\npipeline.def<kernel> @" + k.name + "_col(%column: index) run(" + args + ") {\n";
   text += "  " + assume_out + " = buffer.assume.alignment " + assume_in + " {minimum_alignment = 64} : " + types + "\n";
-  text += "  %origin = index.constant 0 : offset\n  %c0 = index.constant 0 : index\n  %c1 = index.constant 1 : index\n"
+  text += "  %origin = index.constant 0 : offset\n  %c0 = index.constant 0 : index\n  %c1 = index.constant 1 : index\n  %c2 = index.constant 2 : index\n"
           "  %c4 = index.constant 4 : index\n  %c8 = index.constant 8 : index\n  %c16 = index.constant 16 : index\n"
           "  %segments = index.constant " + S(k.segments) + " : index\n"
           "  %rows = index.constant " + S(k.rows) + " : index\n"
