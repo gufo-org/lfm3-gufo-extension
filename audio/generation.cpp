@@ -190,7 +190,8 @@ struct Generator::Impl {
   std::unique_ptr<lfm3::Session> session;
   std::unique_ptr<Voice> voice;
   std::uint32_t context{};
-  float* frame_embedding{};  // device row of backbone width
+  float* frame_embedding{};  // device row of backbone width (host on NPU)
+  bool host_rows{};          // NPU backbone: rows live in host memory
   // Inputs of the context in order, so Erase can recompute it: runs of
   // tokens or of embedding rows.
   struct Run {
@@ -244,8 +245,12 @@ struct Generator::Impl {
 };
 Generator::Generator() : impl_(std::make_unique<Impl>()) {}
 Generator::~Generator() {
-  if (impl_ && impl_->frame_embedding)
-    (void)hipFree(impl_->frame_embedding);
+  if (impl_ && impl_->frame_embedding) {
+    if (impl_->host_rows)
+      delete[] impl_->frame_embedding;
+    else
+      (void)hipFree(impl_->frame_embedding);
+  }
 }
 Model& Generator::model() const {
   return *impl_->model;
@@ -268,7 +273,11 @@ std::unique_ptr<Generator> Generator::Create(std::shared_ptr<Model> model,
   g->impl_->voice = model->CreateVoice(error);
   if (!g->impl_->voice)
     return nullptr;
-  if (hipMalloc(reinterpret_cast<void**>(&g->impl_->frame_embedding),
+  g->impl_->host_rows = model->backbone().OnNpu();
+  if (g->impl_->host_rows)
+    g->impl_->frame_embedding =
+        new float[model->backbone().config().hidden]();
+  else if (hipMalloc(reinterpret_cast<void**>(&g->impl_->frame_embedding),
                 std::size_t(model->backbone().config().hidden) * 4) !=
       hipSuccess) {
     if (error)
@@ -615,7 +624,9 @@ bool Generator::Continue(const GenerateOptions& o,
             &failure));
         have_logits = false;
         // The frame embedding stays recorded for Replace.
-        if (hipMemcpyAsync(frame_row.data(), impl.frame_embedding,
+        if (impl.host_rows)
+          std::copy_n(impl.frame_embedding, frame_row.size(), frame_row.begin());
+        else if (hipMemcpyAsync(frame_row.data(), impl.frame_embedding,
                            frame_row.size() * 4, hipMemcpyDeviceToHost,
                            static_cast<hipStream_t>(session.DeviceStream())) !=
                 hipSuccess ||

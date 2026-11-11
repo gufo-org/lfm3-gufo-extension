@@ -94,6 +94,9 @@ private:
   friend class Model;
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  // NPU mode: host state, projections on the NPU; pointers are host memory.
+  struct Npu;
+  std::unique_ptr<Npu> npu_;
   explicit Voice(std::shared_ptr<Model> model);
 };
 class Model : public std::enable_shared_from_this<Model> {
