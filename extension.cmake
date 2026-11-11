@@ -98,6 +98,7 @@ gufo_extension_target(
     audio/speak.cpp
     audio/provider.cpp
   LINK_LIBRARIES
+    gufo_lfm3_npu
     roc::hipblas
     gufo_lfm3_hip
     gufo_lfm3
@@ -124,6 +125,7 @@ gufo_extension_target(
   SOURCES
     vl/vision.cpp
   LINK_LIBRARIES
+    gufo_lfm3_npu
     gufo_lfm3_audio
     gufo_lfm3_hip
     gufo_lfm3
