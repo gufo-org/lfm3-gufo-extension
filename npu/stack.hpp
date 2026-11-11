@@ -2,14 +2,16 @@
 // npu::Dense, the rest on the host, following audio/model.cpp RunStack.
 #ifndef GUFO_MODELS_LFM3_NPU_STACK_HPP_
 #define GUFO_MODELS_LFM3_NPU_STACK_HPP_
-
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "../audio/weights.hpp"
 #include "dense.hpp"
 
 namespace gufo::models::lfm3::npu {
+
+struct State;  // npu/backbone.hpp
 
 class Stack {
  public:
@@ -19,6 +21,8 @@ class Stack {
     std::vector<std::vector<_Float16>> k, v;
     std::uint32_t capacity{};
     int position{};
+    // The device-path state when the stack runs as an NPU backbone.
+    std::shared_ptr<::gufo::models::lfm3::npu::State> device;
     void Clear();
   };
   explicit Stack(const lfm3_audio::Stack& weights);

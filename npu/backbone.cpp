@@ -134,14 +134,16 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
     m.w = &w;
     m.dense = &Dense::Shared();
     m.layers.resize(c.layers.size());
+    // K split needs K in multiples of 512; other widths stay row split.
+    const bool ks = c.hidden % 512 == 0;
     for (std::size_t i = 0; i < c.layers.size(); ++i) {
       const auto& l = w.layers[i];
       auto& p = m.layers[i];
       if (c.layers[i] == LayerType::kConvolution) {
         const Tensor* in[] = {&l.in_proj};
         const Tensor* out[] = {&l.out_proj};
-        p.in = m.Make(in, true);  // K split: prompt blocks share each weight record
-        p.out = m.Make(out, true);
+        p.in = m.Make(in, ks);  // K split: prompt blocks share each weight record
+        p.out = m.Make(out, ks);
       } else {
         const Tensor* qkvg[] = {&l.q, &l.k, &l.v, &l.attn_gate};
         const Tensor* out[] = {&l.attn_out};
@@ -155,17 +157,17 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
               r -= t->rows;
             }
             std::fill(out.begin(), out.end(), 0.0f);
-          }, true);
+          }, ks);
         } else {
-          p.qkvg = m.Make(qkvg, true);
+          p.qkvg = m.Make(qkvg, ks);
         }
-        p.out = m.Make(out, true);
+        p.out = m.Make(out, ks);
       }
       const Tensor* gateup[] = {&l.gate, &l.up};
       const Tensor* down[] = {&l.down};
       // K split: prompt passes then stream the weights once for every block
       // held at once; decode costs the same.
-      p.gateup = m.Make(gateup, true);
+      p.gateup = m.Make(gateup, ks);
       p.down = m.Make(down);
     }
     // Audio towers have no vocabulary head.
@@ -682,9 +684,10 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
         const bool swa = c.layers[il] == LayerType::kSlidingAttention;
         const std::uint32_t cap = swa ? d.cap_sliding : d.cap_global;
         timed("proj qkvg", [&] { dense->Enqueue(p.qkvg, d.xb2048, d.y_proj, blocks); });
-        AttentionShape s{c.heads, c.kv_heads[il], D, p.qkvg.shape.m / 8, true, cap, Device::kSlots, d.table_rows, R,
+        const bool gated = w->layers[il].attn_gate.data != nullptr;  // LFM2 stacks have no attention gate
+        AttentionShape s{c.heads, c.kv_heads[il], D, p.qkvg.shape.m / 8, gated, cap, Device::kSlots, d.table_rows, R,
                          decision && !swa && !groups.empty(), d.mma};  // group masks only with groups
-        const std::string tag = std::string(swa ? "s" : "g") + std::to_string(c.kv_heads[il]) + (s.groups ? "x" : "");
+        const std::string tag = std::string(swa ? "s" : "g") + std::to_string(c.kv_heads[il]) + (s.groups ? "x" : "") + (gated ? "" : "n");
         AttentionShape s8 = s;
         s8.rows = R8;
         const std::string pk = "prep" + tag + "_r" + std::to_string(R8);

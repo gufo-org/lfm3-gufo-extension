@@ -310,8 +310,8 @@ struct Model::Impl {
   bool npu{};
   std::unique_ptr<lfm3::npu::Stack> npu_encoder, npu_depth, npu_codec;
   // The codec stack on the NPU device path (every operation on the NPU).
-  std::unique_ptr<lfm3::Weights> codec_weights, depth_weights;
-  std::unique_ptr<lfm3::npu::Backbone> codec_device, depth_device;
+  std::unique_ptr<lfm3::Weights> codec_weights, depth_weights, encoder_weights;
+  std::unique_ptr<lfm3::npu::Backbone> codec_device, depth_device, encoder_device;
   lfm3::npu::State depth_state;
   lfm3::npu::Dense::Matrix npu_pre_out, npu_proj1, npu_proj2, npu_depth_in,
       npu_codec_in, npu_codec_out;
@@ -541,6 +541,14 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
       auto& dense = lfm3::npu::Dense::Shared();
       const auto& w = impl.weights;
       impl.npu_encoder = std::make_unique<lfm3::npu::Stack>(w.encoder);
+        // The encoder stack runs on the NPU device path (GUFO_LFM3_ENCODER_DEVICE=0:
+        // host-glue stack; =check: both, with their largest difference).
+        if (const char* e = std::getenv("GUFO_LFM3_ENCODER_DEVICE"); !(e && std::string_view(e) == "0")) {
+          impl.encoder_weights = std::make_unique<lfm3::Weights>(StackWeights(w.encoder, w.encoder_window));
+          std::string error;
+          impl.encoder_device = lfm3::npu::Backbone::Load(*impl.encoder_weights, &error);
+          if (!impl.encoder_device) throw std::runtime_error("NPU encoder: " + error);
+        }
       const Tensor* pre[] = {&w.pre_out};
       const Tensor* p1[] = {&w.proj1};
       const Tensor* p2[] = {&w.proj2};
@@ -786,7 +794,23 @@ void Model::Impl::EncodeTokensNpu(std::span<const float> mel, int mel_first,
     for (int r = 0; r < n; ++r)
       for (std::uint32_t i = 0; i < e.hidden; ++i)
         x[std::size_t(r) * e.hidden + i] += F(w.pre_out_bias)[i];
-    npu_encoder->Run(x, n, &state, int(w.encoder_window), z);
+    if (encoder_device && state.device) {
+      // Every encoder row on the NPU device path, continuing the stream's
+      // positions; GUFO_LFM3_ENCODER_DEVICE=check also runs the host stack.
+      std::vector<lfm3::npu::Row> rws(n);
+      for (int r = 0; r < n; ++r) rws[r] = {state.device.get(), state.device->position + std::uint32_t(r), false};
+      encoder_device->Forward(x, rws, z, {});
+      static const bool check = std::getenv("GUFO_LFM3_ENCODER_DEVICE") && std::string_view(std::getenv("GUFO_LFM3_ENCODER_DEVICE")) == "check";
+      if (check) {
+        std::vector<float> zh(z.size());
+        npu_encoder->Run(x, n, &state, int(w.encoder_window), zh);
+        double d = 0, mx = 0;
+        for (std::size_t i = 0; i < z.size(); ++i) d = std::max(d, double(std::abs(z[i] - zh[i]))), mx = std::max(mx, double(std::abs(zh[i])));
+        std::fprintf(stderr, "encoder device vs host: max diff %.3g of %.3g\n", d, mx);
+      }
+    } else {
+      npu_encoder->Run(x, n, &state, int(w.encoder_window), z);
+    }
     lfm3::npu::LayerNormRows(z.data(), n, e.hidden, F(w.proj_norm),
                              F(w.proj_norm_bias), 1e-5F, o.data());
     std::vector<float> mid(std::size_t(n) * w.proj1.rows);
@@ -831,6 +855,8 @@ AudioInput::AudioInput(std::shared_ptr<Model> model)
   auto& m = *impl_->model->impl_;
   if (m.npu) {
     impl_->npu_state = m.npu_encoder->NewState(m.weights.encoder_window);
+    if (m.encoder_device)
+      impl_->npu_state.device = std::make_shared<lfm3::npu::State>(m.encoder_device->NewState(1u << 16));
     return;
   }
   impl_->state = StackState(m.weights.encoder, m.weights.encoder_window);
