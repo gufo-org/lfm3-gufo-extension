@@ -215,6 +215,14 @@ func.def inline @@NAME(%x: view<@XEBxi8>, %w: view<@WSBxi8>, %wbase: index, %xba
                   {"@ARGS", with_init ? args : std::string()}});
 }
 
+// Blocks sharing one weight group per dot call: the largest divisor of `bp` up
+// to 4 (accumulators take 4 registers each, 20 are available).
+std::uint32_t BlocksPerCall(std::uint32_t bp) {
+  std::uint32_t n = std::min<std::uint32_t>(bp, 4);
+  while (bp % n) --n;
+  return n;
+}
+
 // Appends `suffix` to every SSA name in `text` except `keep`.
 std::string SuffixNames(const std::string& text, const std::string& suffix, std::initializer_list<const char*> keep) {
   std::string out;
@@ -662,7 +670,7 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
       const auto pa = body.find("@PERBLOCK_BEGIN"), pb = body.find("@PERBLOCK_END");
       body = enc ? body.erase(pa, pb + 13 - pa) : body.erase(pb, 13).erase(pa, 15);
     }
-    const std::uint32_t per_call = std::min<std::uint32_t>(bp, 4);  // accumulators: 4 registers each, 20 available
+    const std::uint32_t per_call = BlocksPerCall(bp);
     auto blocks_call = [&](bool west) {
       std::string text;
       if (chain && !west) text += "            %zv = vector.splatf 0.0 : vector<64xf32>\n            %zi = vector.fragment<init> %zv shape [%c8, %c8] : vector<64xf32>\n";
@@ -721,7 +729,7 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
     }
   }
   if (!enc && R != 1) throw std::invalid_argument("K-multi without encoded activations needs one record per slot");
-  return "aie2p.target<array> @npu\n" + (enc ? TileLoopBlocks(dot, record_tiles, x_tiles, std::min<std::uint32_t>(bp, 4), bp, false, R) : TileLoop(dot, record_tiles, bp * x_tiles)) + body +
+  return "aie2p.target<array> @npu\n" + (enc ? TileLoopBlocks(dot, record_tiles, x_tiles, BlocksPerCall(bp), bp, false, R) : TileLoop(dot, record_tiles, bp * x_tiles)) + body +
          "\npipeline.def<kernel> public retain target(@npu) @" + name + "() run(%x: buffer, %w: buffer, %y: buffer) {\n" +
          compose + "}\n";
 }

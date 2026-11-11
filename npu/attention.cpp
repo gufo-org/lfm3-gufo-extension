@@ -900,8 +900,12 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
         %ho = index.mul %kvh, %dim : index
         %ke = index.add %re, %ho : index
 @OFF_K
-        %k_dense = buffer.view %kpool[%k_at] : buffer -> view<@JDx32x8xbf16>
-        %k_src = view.refine %k_dense : view<@JDx32x8xbf16> -> view<@JDx32x8xbf16, #encoding.layout.strided<strides=[8, @KV, 1]>>
+        // Key-major source (one contiguous run per key), scattered into the
+        // tile's [dim group][key][8] layout.
+        %k_dense = buffer.view %kpool[%k_at] : buffer -> view<32x@JDx8xbf16>
+        %k_src = view.refine %k_dense : view<32x@JDx8xbf16> -> view<32x@JDx8xbf16, #encoding.layout.strided<strides=[@KV, 8, 1]>>
+        %ks_km = view.bitcast %ks : view<@JDx32x8xbf16> -> view<32x@JDx8xbf16>
+        %ks_dst = view.refine %ks_km : view<32x@JDx8xbf16> -> view<32x@JDx8xbf16, #encoding.layout.strided<strides=[8, 256, 1]>>
 @COPY_K
         // S^T tiles [kt][key][q].
         scf.for %kt = [%c0 to %c4 step %c1] {
@@ -1056,8 +1060,12 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
         %ho = index.mul %kvh, %dim : index
         %ke = index.add %re, %ho : index
 @OFF_K
-        %v_dense = buffer.view %vpool[%k_at] : buffer -> view<@JDx32x8xbf16>
-        %v_src = view.refine %v_dense : view<@JDx32x8xbf16> -> view<@JDx32x8xbf16, #encoding.layout.strided<strides=[8, @KV, 1]>>
+        // Key-major source (one contiguous run per key), scattered into the
+        // tile's [dim group][key][8] layout.
+        %v_dense = buffer.view %vpool[%k_at] : buffer -> view<32x@JDx8xbf16>
+        %v_src = view.refine %v_dense : view<32x@JDx8xbf16> -> view<32x@JDx8xbf16, #encoding.layout.strided<strides=[@KV, 8, 1]>>
+        %vs_km = view.bitcast %vs : view<@JDx32x8xbf16> -> view<32x@JDx8xbf16>
+        %vs_dst = view.refine %vs_km : view<32x@JDx8xbf16> -> view<32x@JDx8xbf16, #encoding.layout.strided<strides=[8, 256, 1]>>
 @COPY_V
         %pr_r, %pr = channel.acquire %pc_ch : channel<tile<192xf32>> -> (read<tile<192xf32>>, view<192xf32>)
         %prp0 = view.subview %pr[0] : view<192xf32> -> view<128xf32>
@@ -1186,6 +1194,8 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
   const std::string qf_t = "view<" + S(JD) + "x" + S(hpc) + "x8xf32>";
   const std::string kv_t = "view<" + S(JD) + "x32x8xbf16>";
   const std::string kv_src_t = "view<" + S(JD) + "x32x8xbf16, #encoding.layout.strided<strides=[8, " + S(KV) + ", 1]>>";
+  const std::string kv_key_t = "view<32x" + S(JD) + "x8xbf16, #encoding.layout.strided<strides=[" + S(KV) + ", 8, 1]>>";
+  const std::string kv_dst_t = "view<32x" + S(JD) + "x8xbf16, #encoding.layout.strided<strides=[8, 256, 1]>>";
   std::string text = Fill(body, {
       {"@COMMON", common}, {"@SCRATCH", scratch}, {"@RESERVE_A", reserve_a}, {"@PUBLISH_A", publish_a},
       {"@RESERVE_B", reserve_b}, {"@PUBLISH_B", publish_b},
@@ -1196,8 +1206,8 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
       {"@COPY_Q", Copy("qq", "q_src", "view<" + S(JD) + "x" + S(hpc) + "x8xf32, #encoding.layout.strided<strides=[8, @D, 1]>>", "qf_row", qf_t, true)},
       {"@OFF_G", Offset("g", "%g_e", 4)}, {"@COPY_G", Copy("gg", "g_src", "view<16xf32>", "gv_row", "view<16xf32>", true)},
       {"@OFF_K", Offset("k", "%ke", 2)}, {"@OFF_O", Offset("o", "%ob5", 2)},
-      {"@COPY_K", Copy("kk", "k_src", kv_src_t, "ks", kv_t, true)},
-      {"@COPY_V", Copy("vv", "v_src", kv_src_t, "vs", kv_t, true)},
+      {"@COPY_K", Copy("kk", "k_src", kv_key_t, "ks_dst", kv_dst_t, true)},
+      {"@COPY_V", Copy("vv", "v_src", kv_key_t, "vs_dst", kv_dst_t, true)},
       {"@COPY_O", Copy("oo", "o_shaped", "view<@OGx8xbf16>", "o_glob", "view<@OGx8xbf16, #encoding.layout.strided<strides=[64, 1]>>", false)},
   });
   text = Fill(text, {{"@NAME", name}, {"@QSZ", S(QS)}, {"@Q", S(Q)}, {"@KV", S(KV)}, {"@CAPM", S(s.capacity - 1)}, {"@CAPC", S(s.capacity / 32 - 1)},

@@ -560,7 +560,8 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
   std::lock_guard lock(d.mutex);
   auto& npu = *d.npu;
   // GUFO_LFM3_NPU_PROFILE: wait after every dispatch, report per kind.
-  static const bool profile = std::getenv("GUFO_LFM3_NPU_PROFILE") != nullptr;
+  // GUFO_LFM3_NPU_PROFILE=<passes>: per-stage time, printed every <passes> passes (32 when empty).
+  static const int profile = std::getenv("GUFO_LFM3_NPU_PROFILE") ? std::max(1, std::atoi(std::getenv("GUFO_LFM3_NPU_PROFILE"))) : 0;
   static std::map<std::string, std::pair<double, int>> spent;
   static int passes = 0;
   auto timed = [&](const char* kind, const std::function<void()>& f) {
@@ -574,7 +575,13 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
   };
   const auto& c = w->config;
   const std::uint32_t H = c.hidden, I = c.intermediate, D = c.head_dim, Lw = c.conv_width;
-  const std::size_t pass = decision ? rows.size() : 64;
+  // Prompt rows per pass: every pass streams all weights once and costs about
+  // 200 dispatches, so passes should be as long as the kernels allow.
+  static const std::size_t prompt_pass = [] {
+    const char* e = std::getenv("GUFO_LFM3_NPU_PASS_ROWS");
+    return e ? std::size_t(std::atoi(e)) : std::size_t(192);  // 24 blocks: divisible by every projection's blocks per weight pass
+  }();
+  const std::size_t pass = decision ? rows.size() : prompt_pass;
   if (pass >= Device::kMaxRows) throw std::invalid_argument("NPU decision prompt longer than 255 rows");
   std::size_t logit_row = 0;
   for (std::size_t base = 0; base < rows.size(); base += pass) {
@@ -701,7 +708,7 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
       }
     }
     npu.Finish();
-    if (profile && ++passes % 32 == 0) {
+    if (profile && ++passes % profile == 0) {
       std::fprintf(stderr, "NPU profile over %d passes (rows %u):\n", passes, R);
       for (const auto& [k, v] : spent) std::fprintf(stderr, "  %-12s %8.3f ms per pass (%d calls)\n", k.c_str(), v.first / passes, v.second);
     }

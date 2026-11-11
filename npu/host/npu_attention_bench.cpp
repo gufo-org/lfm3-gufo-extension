@@ -19,7 +19,14 @@ int main(int argc, char** argv) {
   lfm3::npu::Runtime npu;
   AttentionShape s{16, 4, 128, 392, true, 4096, 8, 64, 256, false, !scalar};
   const std::uint32_t D = s.dim, Q = s.heads * D, KV = s.kv_heads * D;
-  const int k = npu.Compile(scalar ? AttendProgram(s, "attend") : AttendMmaProgram(s, "attend", rpb), "attend.loom", "@attend");
+  const std::string program = scalar ? AttendProgram(s, "attend") : AttendMmaProgram(s, "attend", rpb);
+  if (const char* dump = std::getenv("DUMP")) {  // write the program instead of running it
+    FILE* f = std::fopen(dump, "w");
+    std::fputs(program.c_str(), f);
+    std::fclose(f);
+    return 0;
+  }
+  const int k = npu.Compile(program, "attend.loom", "@attend");
   std::mt19937 rng(1);
   std::uniform_real_distribution<float> u(-1, 1);
   std::vector<_Float16> pool(std::size_t(s.slots) * s.capacity * KV);
