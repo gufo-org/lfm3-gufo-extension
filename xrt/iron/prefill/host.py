@@ -42,6 +42,8 @@ def enc(Bkn):
 
 def gemm_weight(md, what):
     """[K, N] float32 weight of a GEMM phase, pre-norm weights folded into K."""
+    if what == ("head",):
+        return (md.deq("token_embd.weight") * md.f("output_norm.weight")).T
     l, name = what
     p = f"blk.{l}."
     if name in ("conv_bx", "conv_c"):
@@ -101,6 +103,9 @@ def pack(plan, md):
         for ph in plan.phases:
             if ph["kind"] == "gemm" and ph["what"][0] == l:
                 E.append(enc(gemm_weight(md, ph["what"])))
+        md.drop()
+    if hasattr(plan, "logits"):
+        E.append(enc(gemm_weight(md, ("head",))))
         md.drop()
     Cs = np.zeros(plan.c_size, np.uint16)
     for off, what in plan.ablocks:
@@ -254,7 +259,7 @@ def main():
         print(f"  y rel err {rel(Y, y):.3e}")
 
 
-if __name__ == "__main__" and sys.argv[1] not in ("debug-attn", "kl"):
+if __name__ == "__main__" and sys.argv[1] not in ("debug-attn", "kl", "head"):
     main()
 
 
@@ -326,4 +331,54 @@ def kl_check(argv):
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "kl":
     kl_check(sys.argv[2:])
+    sys.exit(0)
+
+
+def head_check(argv):
+    """host.py head <xclbin> <insts row0=0> <insts row0=512> <gguf> <ids.json> <n>..."""
+    xclbin, ins0, ins512, gguf, ids_path, *ns = argv
+    import json
+    kinds = P.lfm3_kinds()
+    md = Model(gguf)
+    plan = P.Plan(kinds, head_row0=0)
+    E, Cs = pack(plan, md)
+    ids_all = np.array([1] + json.load(open(ids_path)))
+    emb = md.deq("token_embd.weight")
+    runs = {0: Runner(xclbin, ins0, plan, E, Cs)}
+    del E
+    for n in map(int, ns):
+        row0 = 0 if n - 1 < P.HEAD_ROWS else P.HEAD_ROWS
+        if row0 not in runs:
+            r = runs[0]
+            ins = np.fromfile(ins512, dtype=np.uint32)
+            r.bo_i2 = r.pyxrt.bo(r.dev, ins.nbytes, r.pyxrt.bo.cacheable, r.kern.group_id(1))
+            r.bo_i2.write(ins.tobytes(), 0)
+            r.bo_i2.sync(r.td)
+            runs[row0] = r
+        r = runs[0]
+        x = np.zeros((plan.M, H), np.float32)
+        x[:n] = from_bf16(bf16(emb[ids_all[:n]])).reshape(n, H)
+        bo_i, n_ins = (r.bo_i, r.n_ins) if row0 == 0 else (r.bo_i2, r.bo_i2.size() // 4)
+        R = np.zeros((plan.M, P.REC), np.uint16)
+        R[:, H:2 * H] = bf16(x).reshape(plan.M, H)
+        r.bo_a.write(R.tobytes(), 0)
+        r.bo_a.sync(r.td)
+        t0 = time.perf_counter()
+        r.kern(3, bo_i, n_ins, r.bo_a, r.bo_b, r.bo_c).wait()
+        dt = time.perf_counter() - t0
+        r.bo_c.sync(r.fd)
+        row = n - 1 - row0
+        lg = from_bf16(np.frombuffer(r.bo_c.read(P.VOCAB * 2, (plan.logits + row * P.VOCAB) * 2), np.uint16))
+        md.drop()
+        xs = reference(md, kinds, x[:n])
+        ref = rms(xs[-1][n - 1], md.f("output_norm.weight")) @ emb.T
+        pr = np.exp(ref - ref.max()); pr /= pr.sum()
+        pn = np.exp(lg - lg.max()); pn /= pn.sum()
+        kl = float((pr * (np.log(pr + 1e-30) - np.log(pn + 1e-30))).sum())
+        print(f"n {n} (head rows from {row0}): {dt * 1e3:.1f} ms, KL {kl:.3e}, top1 npu {int(pn.argmax())} ref {int(pr.argmax())} "
+              f"text next {ids_all[n] if n < len(ids_all) else -1}")
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "head":
+    head_check(sys.argv[2:])
     sys.exit(0)

@@ -36,8 +36,9 @@ COLS, ROWS = 8, 4
 
 
 @iron.jit(aiecc_flags=["--dynamic-objFifos"] + os.environ.get("PREFILL_AIECC", "").split())
-def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: CompileTime[int] = 1024):
-    plan = P.Plan(kinds.split(","), M)
+def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: CompileTime[int] = 1024,
+            head_row0: CompileTime[int] = -1):
+    plan = P.Plan(kinds.split(","), M, None if head_row0 < 0 else head_row0)
     m, k, n, mtk = P.M_TILE, P.K_TILE, P.N_TILE, P.MTK
     r, s, t = 8, 8, 8
 
@@ -247,7 +248,7 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                     tg.finish()
                 continue
             K, N, mode = ph["K"], ph["N"], ph["mode"]
-            n_rt, n_ct = M // m // ROWS, N // n // COLS
+            n_rt, n_ct = ph["rows"] // m // ROWS, N // n // COLS
             slots, done = [None] * 4, [True] * 4
 
             def fin(i):
@@ -264,7 +265,8 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                     tr = rt * ROWS + row
                     src = ph["a"]
                     if src[0] == "rec":
-                        A_prods[row].fill(a, tap=TAP((a_size,), tr * m * P.REC, [1, K // mtk, m, mtk], [0, mtk, P.REC, 1]), group=tg, wait=False)
+                        row_base = src[1] if len(src) > 1 else 0
+                        A_prods[row].fill(a, tap=TAP((a_size,), (row_base + tr * m) * P.REC, [1, K // mtk, m, mtk], [0, mtk, P.REC, 1]), group=tg, wait=False)
                     elif src[0] == "heads":
                         A_prods[row].fill(c, tap=TAP((c_size,), src[1] + tr * m * 128, [K // mtk, m, mtk // 128, 128],
                                                      [mtk // 128 * M * 128, 128, M * 128, 1]), group=tg, wait=False)
@@ -304,5 +306,6 @@ if __name__ == "__main__":
     if kinds.isdigit():
         kinds = ",".join(P.lfm3_kinds(int(kinds)))
     M = int(sys.argv[3]) if len(sys.argv) > 3 else 1024
+    head_row0 = int(sys.argv[4]) if len(sys.argv) > 4 else -1
     iron.set_current_device(from_name("npu2", n_cols=None))
-    prefill.specialize(kinds=kinds, M=M).compile(xclbin_path=out + ".xclbin", inst_path=out + ".bin")
+    prefill.specialize(kinds=kinds, M=M, head_row0=head_row0).compile(xclbin_path=out + ".xclbin", inst_path=out + ".bin")

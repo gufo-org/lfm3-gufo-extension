@@ -8,7 +8,7 @@ Buffers (bf16 elements unless noted):
 
 Every phase is a dict with "kind" in gemm, norm, conv, qkr, attn. GEMM phases
 carry an A source and a C destination:
-  A ("rec",)                 xn of the records
+  A ("rec", [row0])          xn of the records (from row row0)
   A ("half", off, stride)    columns 0..63 of every 128 of a scratch matrix
   A ("plain", off, stride)   a scratch matrix
   A ("heads", off)           attention output, head-major [16][M][128]
@@ -25,6 +25,7 @@ LAYERS = 24
 ATTN_LAYERS = [l for l in range(LAYERS) if l >= 2 and l % 2 == 0]
 SWA_LAYERS = {4, 8, 12, 16, 20}
 WINDOW = 256
+VOCAB, HEAD_ROWS = 128000, 512
 
 
 def lfm3_kinds(n=LAYERS):
@@ -34,7 +35,7 @@ ABLOCK = M_TILE * MTK
 
 
 class Plan:
-    def __init__(self, kinds, M=1024):
+    def __init__(self, kinds, M=1024, head_row0=None):
         self.M, self.kinds = M, list(kinds)
         self.c_off = 0
         self.b_off = 0
@@ -66,6 +67,14 @@ class Plan:
                 dict(kind="conv", cs=cs, ys=self.ys, taps=[self._ablock((l, "taps", q)) for q in range(4)]),
                 self._gemm(H, H, "plain", ("plain", self.ys, Y_ROW), ("o",), (l, "conv_out")),
             ] + self._ffn(l)
+        if head_row0 is not None:
+            # LM head over the 512 rows that hold the last token: output_norm is folded into
+            # the weights, logits land as bf16 [512][VOCAB]. The core program does not depend
+            # on head_row0, so its variants share one xclbin.
+            self.logits = self._c(HEAD_ROWS * VOCAB)
+            self.head_row0 = head_row0
+            self.phases.append(self._gemm(H, VOCAB, "plain", ("rec", head_row0), ("plain", self.logits, VOCAB), ("head",),
+                                          rows=HEAD_ROWS))
         self.b_size = self.b_off
         self.c_size = self.c_off
 
@@ -82,7 +91,8 @@ class Plan:
         out = []
         for ph in self.phases:
             if ph["kind"] == "gemm":
-                tiles = (self.M // M_TILE) * (ph["N"] // N_TILE) // 32
+                tiles = (ph["rows"] // M_TILE) * (ph["N"] // N_TILE) // 32
+                assert tiles < 128
                 mode = {"plain": 0, "swiglu": 1, "bx": 2}[ph["mode"]]
                 out.append(0 | mode << 3 | tiles << 5 | (ph["K"] // K_TILE) << 12)
             else:
@@ -102,10 +112,10 @@ class Plan:
     def _norm(self, what):
         return dict(kind="norm", w=self._ablock(what))
 
-    def _gemm(self, K, N, mode, a, c, what):
+    def _gemm(self, K, N, mode, a, c, what, rows=None):
         at = self.b_off
         self.b_off += K * N // 8
-        return dict(kind="gemm", K=K, N=N, mode=mode, a=a, c=c, b=at, what=what)
+        return dict(kind="gemm", K=K, N=N, mode=mode, a=a, c=c, b=at, what=what, rows=rows or self.M)
 
 
 def ablock_put(vec):
