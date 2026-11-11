@@ -321,9 +321,55 @@ efficiency only if its weight bandwidth is well above what the embedding
 program reaches; it wins on concurrency regardless, since it leaves the GPU
 free.
 
-Next: measure the NPU's DRAM-to-tile bandwidth directly, then port one LFM3
-SwiGLU block to the NPU in Loom and measure tokens per joule against the
-GPU's 898 mJ decode figure.
+### NPU GEMV at LFM3's FFN shape
+
+A hand-written Loom NPU program, [`npu/npu_gemv.loom`](../npu/npu_gemv.loom):
+`y = W x` for the gate projection shape (8,192 x 2,048), BF16 weights and
+input, F32 accumulation with `vector.dot2f`. Per column, an ingress strand on
+tile `[c, 2]` copies `x` once and streams 4-row weight records (16 KiB) into a
+two-slot ring on compute tile `[c, 3]`, the compute strand dots two rows per
+pass (two vector accumulators; four exceed the AIE2P accumulator budget) and
+an egress strand on `[c, 4]` drains the outputs. Built with the Loom tools at
+hrx-system `314238a81c` (the later spill-stack commit `a62c887489` costs tile
+memory, see Gufo's hrx-migration log). Every variant passes a 256-row
+`check.scenario` against a scalar F32 oracle (atol 0.05, rtol 0.02).
+`loom-benchmark --measure=dispatch_complete`, median of at least 100 dispatches;
+power from [`npupower.sh`](artifacts/hrx/npupower.sh) (cooled socket, no model
+process, 15 s idle then 20 s under load):
+
+| Variant | Columns | Time | Weight bandwidth | Socket power (idle) |
+| --- | ---: | ---: | ---: | ---: |
+| One row per pass, scalar reduction, no egress strand | 1 | 11.35 ms | 2.96 GB/s | |
+| Two rows per pass, vector reduction, egress strand | 1 | 5.085 ms | 6.60 GB/s | |
+| Weight streaming only (no dot products) | 1 | 3.41 ms | 9.85 GB/s | |
+| Two rows per pass, egress strand | 8 | 0.773-0.787 ms | 42.6-43.4 GB/s | 26.9 W (10.5 W) |
+| Weight streaming only, 16 KiB records | 8 | 0.739 ms | 45.4 GB/s | 26.9 W (9.4 W) |
+| Weight streaming only, 8 KiB records | 8 | 0.845 ms | 39.7 GB/s | |
+| Weight streaming only, three-slot ring | 8 | 0.758 ms | 44.3 GB/s | |
+
+- One column is compute-bound (5.1 ms against 3.4 ms of streaming); across
+  eight columns the dot products hide behind the DMA and the GEMV runs within
+  5% of streaming alone.
+- Eight columns stream 4.6x one column, not 8x: the NPU's shared path to DRAM
+  saturates near 45 GB/s with this access pattern. Smaller records cost 13%; a
+  deeper ring changes nothing. A weight ring in the column memory tile (row 1)
+  does not compile as written (`XDNA/051`: the resident ring needs its
+  producer to own the whole distribution); untried with an explicit memory-tile
+  hop.
+- Twice the bandwidth the embedding program reaches (21 GB/s).
+
+Projection for LFM3 decode on the NPU at 45 GB/s: with BF16 weights (about
+3.4 GB per token) about 13 tok/s; with Q8_0 weights streamed at the same byte
+rate (about 1.8 GB, if the dequantizing dot keeps up) about 25 tok/s. At about
+27 W socket that is about 1.1 J per token against the GPU's 0.90 J (HIP) and
+1.01 J (HRX). Above idle (about 16.5 W against about 89 W for the GPU) the NPU
+would spend about 0.65 J per token against 0.80 J. So NPU decode is not a clear
+efficiency win on the whole socket; its case is running beside the GPU (an
+embedding or a small model while the GPU serves another).
+
+Next: a Q8_0 record format on the NPU (int8 weights with per-32 scales, `x`
+quantized once per token) to see whether the dot keeps up at half the bytes;
+then the fused gate/up SwiGLU block.
 
 ### Why HRX decodes LFM3 14% slower
 

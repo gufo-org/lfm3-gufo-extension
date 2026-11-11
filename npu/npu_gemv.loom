@@ -1,0 +1,1090 @@
+// LFM3 FFN GEMV on the Strix Halo XDNA NPU: y[m] = W[m, :] . x for BF16
+// weights and input, F32 accumulation. One column: a feeder strand on tile
+// [0, 2] copies x once and streams weight records (kRows rows each) into a
+// two-slot ring on compute tile [0, 3]; the compute strand dots each record
+// with the resident x and writes kRows F32 outputs to DRAM.
+// Experiment for measuring NPU weight-streaming throughput; see
+// docs/EXPERIMENTS.md.
+
+aie2p.target<array> @npu
+
+func.def inline @dot_record(%k: index, %rows: index, %x: view<[%k]xbf16>, %w: view<[%rows]x[%k]xbf16>, %y: view<[%rows]xf32>) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %step = index.constant 32 : index
+  %lanes = index.constant 16 : index
+  %initial = vector.splatf 0.0 : vector<16xf32>
+  %fzero = scalar.constant 0.0 : f32
+  %scratch_bytes = index.constant 64 : offset
+  %scratch = buffer.alloca<private> align(64) %scratch_bytes : buffer
+  %scratch_view = buffer.view %scratch[%base] : buffer -> view<16xf32>
+  scf.for %row = [%c0 to %rows step %c1] {
+    %parts = scf.for %position = [%c0 to %k step %step](%accumulator = %initial : vector<16xf32>) -> (vector<16xf32>) {
+      %xv = vector.load %x[%position] : view<[%k]xbf16> -> vector<32xbf16>
+      %wv = vector.load %w[%row, %position] : view<[%rows]x[%k]xbf16> -> vector<32xbf16>
+      %next = vector.dot2f %xv, %wv, %accumulator : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+      scf.yield %next : vector<16xf32>
+    }
+    vector.store %parts, %scratch_view[0] : vector<16xf32>, view<16xf32>
+    %sum = scf.for %lane = [%c0 to %lanes step %c1](%acc = %fzero : f32) -> (f32) {
+      %part = view.load %scratch_view[%lane] : view<16xf32> -> f32
+      %next_sum = scalar.addf %acc, %part : f32
+      scf.yield %next_sum : f32
+    }
+    view.store %sum, %y[%row] : f32, view<[%rows]xf32>
+  }
+  func.return
+}
+
+// Two rows per pass (the AIE2P accumulator budget fits two live vector
+// accumulators): each 32-element step loads x once for both rows, and each
+// row's 16 partial sums reduce with one vector reduction.
+func.def inline @dot_record4(%k: index, %rows: index, %x: view<[%k]xbf16>, %w: view<[%rows]x[%k]xbf16>, %y: view<[%rows]xf32>) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %step = index.constant 32 : index
+  %initial = vector.splatf 0.0 : vector<16xf32>
+  %fzero = scalar.constant 0.0 : f32
+  scf.for %pair = [%c0 to %rows step %c2] {
+    %r1 = index.add %pair, %c1 : index
+    %p0, %p1 = scf.for %position = [%c0 to %k step %step](%a0 = %initial : vector<16xf32>, %a1 = %initial : vector<16xf32>) -> (vector<16xf32>, vector<16xf32>) {
+      %xv = vector.load %x[%position] : view<[%k]xbf16> -> vector<32xbf16>
+      %w0 = vector.load %w[%pair, %position] : view<[%rows]x[%k]xbf16> -> vector<32xbf16>
+      %w1 = vector.load %w[%r1, %position] : view<[%rows]x[%k]xbf16> -> vector<32xbf16>
+      %n0 = vector.dot2f %xv, %w0, %a0 : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+      %n1 = vector.dot2f %xv, %w1, %a1 : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+      scf.yield %n0, %n1 : vector<16xf32>, vector<16xf32>
+    }
+    %s0 = vector.reduce<addf> %p0, %fzero : vector<16xf32>, f32
+    view.store %s0, %y[%pair] : f32, view<[%rows]xf32>
+    %s1 = vector.reduce<addf> %p1, %fzero : vector<16xf32>, f32
+    view.store %s1, %y[%r1] : f32, view<[%rows]xf32>
+  }
+  func.return
+}
+
+func.def inline @fill_weights(%k: index, %rows: index, %record: index, %record_bytes: index, %w: buffer, %ring: channel<tile<[%rows]x[%k]xbf16>>) {
+  %byte_index = index.mul %record, %record_bytes : index
+  %offset = index.cast %byte_index : index to offset
+  %external = buffer.view %w[%offset] : buffer -> view<[%rows]x[%k]xbf16>
+  %write, %payload = channel.reserve %ring : channel<tile<[%rows]x[%k]xbf16>> -> (write<tile<[%rows]x[%k]xbf16>>, view<[%rows]x[%k]xbf16>)
+  %copy = kernel.async.copy %external to %payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<[%rows]x[%k]xbf16> to view<[%rows]x[%k]xbf16> -> kernel.async.token
+  %group = kernel.async.group %copy : kernel.async.token -> kernel.async.group
+  kernel.async.wait %group {newer_groups = 0} : kernel.async.group
+  channel.publish %write : write<tile<[%rows]x[%k]xbf16>>
+  func.return
+}
+
+pipeline.def<kernel> @gemv(%k: index, %rows: index, %records: index) run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {
+  %x_unique, %w_unique, %y_unique = buffer.assume.noalias %x_arg, %w_arg, %y_arg : buffer, buffer, buffer
+  %x_buf, %w_buf, %y_buf = buffer.assume.alignment %x_unique, %w_unique, %y_unique {minimum_alignment = 64} : buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %two = index.constant 2 : index
+  %memory = pipeline.memory<workgroup>[0, 3] : pool
+  // Input: one resident slot.
+  %x_bytes_i = index.mul %k, %two : index
+  %x_bytes = index.cast %x_bytes_i : index to offset
+  %x_storage = buffer.alloca<workgroup> pool(%memory) align(64) %x_bytes : buffer
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<1x[%k]xbf16>
+  %x_channel = channel.bind<fifo> %x_slots, %c1 : view<1x[%k]xbf16>, index -> channel<tile<[%k]xbf16>>
+  // Weights: two record slots of rows x k.
+  %record_elements = index.mul %rows, %k : index
+  %record_bytes_i = index.mul %record_elements, %two : index
+  %ring_bytes_i = index.mul %record_bytes_i, %c2 : index
+  %ring_bytes = index.cast %ring_bytes_i : index to offset
+  %w_storage = buffer.alloca<workgroup> pool(%memory) align(64) %ring_bytes : buffer
+  %w_slots = buffer.view %w_storage[%origin] : buffer -> view<2x[%rows]x[%k]xbf16>
+  %w_channel = channel.bind<fifo> %w_slots, %c2 : view<2x[%rows]x[%k]xbf16>, index -> channel<tile<[%rows]x[%k]xbf16>>
+  // Outputs: rows F32 values per record through a two-slot ring.
+  %y_bytes_i = index.mul %rows, %c4 : index
+  %y_ring_i = index.mul %y_bytes_i, %c2 : index
+  %y_ring = index.cast %y_ring_i : index to offset
+  %y_storage = buffer.alloca<workgroup> pool(%memory) align(64) %y_ring : buffer
+  %y_slots = buffer.view %y_storage[%origin] : buffer -> view<2x[%rows]xf32>
+  %y_channel = channel.bind<fifo> %y_slots, %c2 : view<2x[%rows]xf32>, index -> channel<tile<[%rows]xf32>>
+
+  pipeline.strand workers([0, 2], [1, 1], [1, 1]) {
+    %x_external = buffer.view %x_buf[%origin] : buffer -> view<[%k]xbf16>
+    %x_write, %x_payload = channel.reserve %x_channel : channel<tile<[%k]xbf16>> -> (write<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    %x_copy = kernel.async.copy %x_external to %x_payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<[%k]xbf16> to view<[%k]xbf16> -> kernel.async.token
+    %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
+    kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
+    channel.publish %x_write : write<tile<[%k]xbf16>>
+    // Prefetch up to two weight records, then drain one output and refill.
+    %prefetch = index.min %c2, %records : index
+    scf.for %record = [%c0 to %prefetch step %c1] {
+      func.call @fill_weights(%k, %rows, %record, %record_bytes_i, %w_buf, %w_channel) : (index, index, index, index, buffer, channel<tile<[%rows]x[%k]xbf16>>)
+    }
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %payload = channel.acquire %y_channel : channel<tile<[%rows]xf32>> -> (read<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      %out_index = index.mul %record, %y_bytes_i : index
+      %out_offset = index.cast %out_index : index to offset
+      %y_external = buffer.view %y_buf[%out_offset] : buffer -> view<[%rows]xf32>
+      %y_copy = kernel.async.copy %payload to %y_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<[%rows]xf32> to view<[%rows]xf32> -> kernel.async.token
+      %y_group = kernel.async.group %y_copy : kernel.async.token -> kernel.async.group
+      kernel.async.wait %y_group {newer_groups = 0} : kernel.async.group
+      channel.release %read : read<tile<[%rows]xf32>>
+      %next = index.add %record, %prefetch : index
+      %more = index.cmp ult, %next, %records : index
+      scf.if %more {
+        func.call @fill_weights(%k, %rows, %next, %record_bytes_i, %w_buf, %w_channel) : (index, index, index, index, buffer, channel<tile<[%rows]x[%k]xbf16>>)
+      }
+    }
+  }
+
+  pipeline.strand workers([0, 3], [1, 1], [1, 1]) {
+    %x_read, %x_values = channel.acquire %x_channel : channel<tile<[%k]xbf16>> -> (read<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %weights = channel.acquire %w_channel : channel<tile<[%rows]x[%k]xbf16>> -> (read<tile<[%rows]x[%k]xbf16>>, view<[%rows]x[%k]xbf16>)
+      %y_write, %y_values = channel.reserve %y_channel : channel<tile<[%rows]xf32>> -> (write<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      func.call @dot_record(%k, %rows, %x_values, %weights, %y_values) : (index, index, view<[%k]xbf16>, view<[%rows]x[%k]xbf16>, view<[%rows]xf32>)
+      channel.publish %y_write : write<tile<[%rows]xf32>>
+      channel.release %read : read<tile<[%rows]x[%k]xbf16>>
+    }
+    channel.release %x_read : read<tile<[%k]xbf16>>
+  }
+}
+
+pipeline.def<kernel> @gemv_v2(%k: index, %rows: index, %records: index) run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {
+  %x_unique, %w_unique, %y_unique = buffer.assume.noalias %x_arg, %w_arg, %y_arg : buffer, buffer, buffer
+  %x_buf, %w_buf, %y_buf = buffer.assume.alignment %x_unique, %w_unique, %y_unique {minimum_alignment = 64} : buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %two = index.constant 2 : index
+  %memory = pipeline.memory<workgroup>[0, 3] : pool
+  // Input: one resident slot.
+  %x_bytes_i = index.mul %k, %two : index
+  %x_bytes = index.cast %x_bytes_i : index to offset
+  %x_storage = buffer.alloca<workgroup> pool(%memory) align(64) %x_bytes : buffer
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<1x[%k]xbf16>
+  %x_channel = channel.bind<fifo> %x_slots, %c1 : view<1x[%k]xbf16>, index -> channel<tile<[%k]xbf16>>
+  // Weights: two record slots of rows x k.
+  %record_elements = index.mul %rows, %k : index
+  %record_bytes_i = index.mul %record_elements, %two : index
+  %ring_bytes_i = index.mul %record_bytes_i, %c2 : index
+  %ring_bytes = index.cast %ring_bytes_i : index to offset
+  %w_storage = buffer.alloca<workgroup> pool(%memory) align(64) %ring_bytes : buffer
+  %w_slots = buffer.view %w_storage[%origin] : buffer -> view<2x[%rows]x[%k]xbf16>
+  %w_channel = channel.bind<fifo> %w_slots, %c2 : view<2x[%rows]x[%k]xbf16>, index -> channel<tile<[%rows]x[%k]xbf16>>
+  // Outputs: rows F32 values per record through a two-slot ring.
+  %y_bytes_i = index.mul %rows, %c4 : index
+  %y_ring_i = index.mul %y_bytes_i, %c2 : index
+  %y_ring = index.cast %y_ring_i : index to offset
+  %y_storage = buffer.alloca<workgroup> pool(%memory) align(64) %y_ring : buffer
+  %y_slots = buffer.view %y_storage[%origin] : buffer -> view<2x[%rows]xf32>
+  %y_channel = channel.bind<fifo> %y_slots, %c2 : view<2x[%rows]xf32>, index -> channel<tile<[%rows]xf32>>
+
+  // Ingress: x once, then one regular weight loop that the compiler can move
+  // into DMA descriptors (no per-record core work).
+  pipeline.strand workers([0, 2], [1, 1], [1, 1]) {
+    %x_external = buffer.view %x_buf[%origin] : buffer -> view<[%k]xbf16>
+    %x_write, %x_payload = channel.reserve %x_channel : channel<tile<[%k]xbf16>> -> (write<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    %x_copy = kernel.async.copy %x_external to %x_payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<[%k]xbf16> to view<[%k]xbf16> -> kernel.async.token
+    %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
+    kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
+    channel.publish %x_write : write<tile<[%k]xbf16>>
+    scf.for %record = [%c0 to %records step %c1] {
+      func.call @fill_weights(%k, %rows, %record, %record_bytes_i, %w_buf, %w_channel) : (index, index, index, index, buffer, channel<tile<[%rows]x[%k]xbf16>>)
+    }
+  }
+  // Egress: drain each record's outputs independently of ingress.
+  pipeline.strand workers([0, 4], [1, 1], [1, 1]) {
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %payload = channel.acquire %y_channel : channel<tile<[%rows]xf32>> -> (read<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      %out_index = index.mul %record, %y_bytes_i : index
+      %out_offset = index.cast %out_index : index to offset
+      %y_external = buffer.view %y_buf[%out_offset] : buffer -> view<[%rows]xf32>
+      %y_copy = kernel.async.copy %payload to %y_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<[%rows]xf32> to view<[%rows]xf32> -> kernel.async.token
+      %y_group = kernel.async.group %y_copy : kernel.async.token -> kernel.async.group
+      kernel.async.wait %y_group {newer_groups = 0} : kernel.async.group
+      channel.release %read : read<tile<[%rows]xf32>>
+    }
+  }
+
+  pipeline.strand workers([0, 3], [1, 1], [1, 1]) {
+    %x_read, %x_values = channel.acquire %x_channel : channel<tile<[%k]xbf16>> -> (read<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %weights = channel.acquire %w_channel : channel<tile<[%rows]x[%k]xbf16>> -> (read<tile<[%rows]x[%k]xbf16>>, view<[%rows]x[%k]xbf16>)
+      %y_write, %y_values = channel.reserve %y_channel : channel<tile<[%rows]xf32>> -> (write<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      func.call @dot_record(%k, %rows, %x_values, %weights, %y_values) : (index, index, view<[%k]xbf16>, view<[%rows]x[%k]xbf16>, view<[%rows]xf32>)
+      channel.publish %y_write : write<tile<[%rows]xf32>>
+      channel.release %read : read<tile<[%rows]x[%k]xbf16>>
+    }
+    channel.release %x_read : read<tile<[%k]xbf16>>
+  }
+}
+
+pipeline.def<kernel> @gemv_v3(%k: index, %rows: index, %records: index) run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {
+  %x_unique, %w_unique, %y_unique = buffer.assume.noalias %x_arg, %w_arg, %y_arg : buffer, buffer, buffer
+  %x_buf, %w_buf, %y_buf = buffer.assume.alignment %x_unique, %w_unique, %y_unique {minimum_alignment = 64} : buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %two = index.constant 2 : index
+  %memory = pipeline.memory<workgroup>[0, 3] : pool
+  // Input: one resident slot.
+  %x_bytes_i = index.mul %k, %two : index
+  %x_bytes = index.cast %x_bytes_i : index to offset
+  %x_storage = buffer.alloca<workgroup> pool(%memory) align(64) %x_bytes : buffer
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<1x[%k]xbf16>
+  %x_channel = channel.bind<fifo> %x_slots, %c1 : view<1x[%k]xbf16>, index -> channel<tile<[%k]xbf16>>
+  // Weights: two record slots of rows x k.
+  %record_elements = index.mul %rows, %k : index
+  %record_bytes_i = index.mul %record_elements, %two : index
+  %ring_bytes_i = index.mul %record_bytes_i, %c2 : index
+  %ring_bytes = index.cast %ring_bytes_i : index to offset
+  %w_storage = buffer.alloca<workgroup> pool(%memory) align(64) %ring_bytes : buffer
+  %w_slots = buffer.view %w_storage[%origin] : buffer -> view<2x[%rows]x[%k]xbf16>
+  %w_channel = channel.bind<fifo> %w_slots, %c2 : view<2x[%rows]x[%k]xbf16>, index -> channel<tile<[%rows]x[%k]xbf16>>
+  // Outputs: rows F32 values per record through a two-slot ring.
+  %y_bytes_i = index.mul %rows, %c4 : index
+  %y_ring_i = index.mul %y_bytes_i, %c2 : index
+  %y_ring = index.cast %y_ring_i : index to offset
+  %y_storage = buffer.alloca<workgroup> pool(%memory) align(64) %y_ring : buffer
+  %y_slots = buffer.view %y_storage[%origin] : buffer -> view<2x[%rows]xf32>
+  %y_channel = channel.bind<fifo> %y_slots, %c2 : view<2x[%rows]xf32>, index -> channel<tile<[%rows]xf32>>
+
+  // Ingress: x once, then one regular weight loop that the compiler can move
+  // into DMA descriptors (no per-record core work).
+  pipeline.strand workers([0, 2], [1, 1], [1, 1]) {
+    %x_external = buffer.view %x_buf[%origin] : buffer -> view<[%k]xbf16>
+    %x_write, %x_payload = channel.reserve %x_channel : channel<tile<[%k]xbf16>> -> (write<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    %x_copy = kernel.async.copy %x_external to %x_payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<[%k]xbf16> to view<[%k]xbf16> -> kernel.async.token
+    %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
+    kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
+    channel.publish %x_write : write<tile<[%k]xbf16>>
+    scf.for %record = [%c0 to %records step %c1] {
+      func.call @fill_weights(%k, %rows, %record, %record_bytes_i, %w_buf, %w_channel) : (index, index, index, index, buffer, channel<tile<[%rows]x[%k]xbf16>>)
+    }
+  }
+  // Egress: drain each record's outputs independently of ingress.
+  pipeline.strand workers([0, 4], [1, 1], [1, 1]) {
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %payload = channel.acquire %y_channel : channel<tile<[%rows]xf32>> -> (read<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      %out_index = index.mul %record, %y_bytes_i : index
+      %out_offset = index.cast %out_index : index to offset
+      %y_external = buffer.view %y_buf[%out_offset] : buffer -> view<[%rows]xf32>
+      %y_copy = kernel.async.copy %payload to %y_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<[%rows]xf32> to view<[%rows]xf32> -> kernel.async.token
+      %y_group = kernel.async.group %y_copy : kernel.async.token -> kernel.async.group
+      kernel.async.wait %y_group {newer_groups = 0} : kernel.async.group
+      channel.release %read : read<tile<[%rows]xf32>>
+    }
+  }
+
+  pipeline.strand workers([0, 3], [1, 1], [1, 1]) {
+    %x_read, %x_values = channel.acquire %x_channel : channel<tile<[%k]xbf16>> -> (read<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %weights = channel.acquire %w_channel : channel<tile<[%rows]x[%k]xbf16>> -> (read<tile<[%rows]x[%k]xbf16>>, view<[%rows]x[%k]xbf16>)
+      %y_write, %y_values = channel.reserve %y_channel : channel<tile<[%rows]xf32>> -> (write<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      func.call @dot_record4(%k, %rows, %x_values, %weights, %y_values) : (index, index, view<[%k]xbf16>, view<[%rows]x[%k]xbf16>, view<[%rows]xf32>)
+      channel.publish %y_write : write<tile<[%rows]xf32>>
+      channel.release %read : read<tile<[%rows]x[%k]xbf16>>
+    }
+    channel.release %x_read : read<tile<[%k]xbf16>>
+  }
+}
+
+pipeline.def<kernel> @gemv_stream(%k: index, %rows: index, %records: index) run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {
+  %x_unique, %w_unique, %y_unique = buffer.assume.noalias %x_arg, %w_arg, %y_arg : buffer, buffer, buffer
+  %x_buf, %w_buf, %y_buf = buffer.assume.alignment %x_unique, %w_unique, %y_unique {minimum_alignment = 64} : buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %two = index.constant 2 : index
+  %memory = pipeline.memory<workgroup>[0, 3] : pool
+  // Input: one resident slot.
+  %x_bytes_i = index.mul %k, %two : index
+  %x_bytes = index.cast %x_bytes_i : index to offset
+  %x_storage = buffer.alloca<workgroup> pool(%memory) align(64) %x_bytes : buffer
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<1x[%k]xbf16>
+  %x_channel = channel.bind<fifo> %x_slots, %c1 : view<1x[%k]xbf16>, index -> channel<tile<[%k]xbf16>>
+  // Weights: two record slots of rows x k.
+  %record_elements = index.mul %rows, %k : index
+  %record_bytes_i = index.mul %record_elements, %two : index
+  %ring_bytes_i = index.mul %record_bytes_i, %c2 : index
+  %ring_bytes = index.cast %ring_bytes_i : index to offset
+  %w_storage = buffer.alloca<workgroup> pool(%memory) align(64) %ring_bytes : buffer
+  %w_slots = buffer.view %w_storage[%origin] : buffer -> view<2x[%rows]x[%k]xbf16>
+  %w_channel = channel.bind<fifo> %w_slots, %c2 : view<2x[%rows]x[%k]xbf16>, index -> channel<tile<[%rows]x[%k]xbf16>>
+  // Outputs: rows F32 values per record through a two-slot ring.
+  %y_bytes_i = index.mul %rows, %c4 : index
+  %y_ring_i = index.mul %y_bytes_i, %c2 : index
+  %y_ring = index.cast %y_ring_i : index to offset
+  %y_storage = buffer.alloca<workgroup> pool(%memory) align(64) %y_ring : buffer
+  %y_slots = buffer.view %y_storage[%origin] : buffer -> view<2x[%rows]xf32>
+  %y_channel = channel.bind<fifo> %y_slots, %c2 : view<2x[%rows]xf32>, index -> channel<tile<[%rows]xf32>>
+
+  // Ingress: x once, then one regular weight loop that the compiler can move
+  // into DMA descriptors (no per-record core work).
+  pipeline.strand workers([0, 2], [1, 1], [1, 1]) {
+    %x_external = buffer.view %x_buf[%origin] : buffer -> view<[%k]xbf16>
+    %x_write, %x_payload = channel.reserve %x_channel : channel<tile<[%k]xbf16>> -> (write<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    %x_copy = kernel.async.copy %x_external to %x_payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<[%k]xbf16> to view<[%k]xbf16> -> kernel.async.token
+    %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
+    kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
+    channel.publish %x_write : write<tile<[%k]xbf16>>
+    scf.for %record = [%c0 to %records step %c1] {
+      func.call @fill_weights(%k, %rows, %record, %record_bytes_i, %w_buf, %w_channel) : (index, index, index, index, buffer, channel<tile<[%rows]x[%k]xbf16>>)
+    }
+  }
+  // Egress: drain each record's outputs independently of ingress.
+  pipeline.strand workers([0, 4], [1, 1], [1, 1]) {
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %payload = channel.acquire %y_channel : channel<tile<[%rows]xf32>> -> (read<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      %out_index = index.mul %record, %y_bytes_i : index
+      %out_offset = index.cast %out_index : index to offset
+      %y_external = buffer.view %y_buf[%out_offset] : buffer -> view<[%rows]xf32>
+      %y_copy = kernel.async.copy %payload to %y_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<[%rows]xf32> to view<[%rows]xf32> -> kernel.async.token
+      %y_group = kernel.async.group %y_copy : kernel.async.token -> kernel.async.group
+      kernel.async.wait %y_group {newer_groups = 0} : kernel.async.group
+      channel.release %read : read<tile<[%rows]xf32>>
+    }
+  }
+
+  pipeline.strand workers([0, 3], [1, 1], [1, 1]) {
+    %x_read, %x_values = channel.acquire %x_channel : channel<tile<[%k]xbf16>> -> (read<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %weights = channel.acquire %w_channel : channel<tile<[%rows]x[%k]xbf16>> -> (read<tile<[%rows]x[%k]xbf16>>, view<[%rows]x[%k]xbf16>)
+      %y_write, %y_values = channel.reserve %y_channel : channel<tile<[%rows]xf32>> -> (write<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      channel.publish %y_write : write<tile<[%rows]xf32>>
+      channel.release %read : read<tile<[%rows]x[%k]xbf16>>
+    }
+    channel.release %x_read : read<tile<[%k]xbf16>>
+  }
+}
+
+// Scalar oracle: F32 dot products of BF16 rows with the BF16 input.
+func.def inline @reference(%x: buffer, %w: buffer, %y: buffer, %k: index, %m: index) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %fzero = scalar.constant 0.0 : f32
+  %xv = buffer.view %x[%origin] : buffer -> view<[%k]xbf16>
+  %wv = buffer.view %w[%origin] : buffer -> view<[%m]x[%k]xbf16>
+  %yv = buffer.view %y[%origin] : buffer -> view<[%m]xf32>
+  scf.for %row = [%c0 to %m step %c1] {
+    %sum = scf.for %col = [%c0 to %k step %c1](%acc = %fzero : f32) -> (f32) {
+      %a = view.load %xv[%col] : view<[%k]xbf16> -> bf16
+      %b = view.load %wv[%row, %col] : view<[%m]x[%k]xbf16> -> bf16
+      %af = scalar.extf %a : bf16 to f32
+      %bf = scalar.extf %b : bf16 to f32
+      %next = scalar.fmaf %af, %bf, %acc : f32
+      scf.yield %next : f32
+    }
+    view.store %sum, %yv[%row] : f32, view<[%m]xf32>
+  }
+  func.return
+}
+
+// 256 rows of K = 2048: 64 records of four rows.
+pipeline.def<kernel> public retain target(@npu) @gemv_k2048_m256() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %records = index.constant 64 : index
+  pipeline.compose @gemv[%k, %rows, %records](%x, %w, %y) : [index, index, index](buffer, buffer, buffer)
+}
+
+func.def @gemv_k2048_m256_reference(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %m = index.constant 256 : index
+  func.call @reference(%x, %w, %y, %k, %m) : (buffer, buffer, buffer, index, index)
+  func.return
+}
+
+check.scenario public @gemv_k2048_m256_check {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[%trial] : check.entropy -> i64
+    %x = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<2048xbf16>
+    %w = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<256x2048xbf16>
+    %y = check.generate.fill value(0.0) : tensor<256xf32>
+    check.compare<@gemv_k2048_m256, @gemv_k2048_m256_reference>(%x, %w, %y) : (tensor<2048xbf16>, tensor<256x2048xbf16>, tensor<256xf32>) -> () {
+      check.expect.approximate actual(%y) expected(%y) atol(0.05) rtol(0.02) nan(same) : tensor<256xf32>, tensor<256xf32>
+    }
+  }
+  check.return
+}
+
+// LFM3-1.7B FFN gate (or up) shape: 8192 rows of K = 2048, 2048 records.
+pipeline.def<kernel> public retain target(@npu) @gemv_k2048_m8192() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %records = index.constant 2048 : index
+  pipeline.compose @gemv[%k, %rows, %records](%x, %w, %y) : [index, index, index](buffer, buffer, buffer)
+}
+
+check.case public @gemv_k2048_m8192_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<2048xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(-1.0 to 1.0) : tensor<8192x2048xbf16>
+  %y = check.generate.fill value(0.0) : tensor<8192xf32>
+  kernel.launch @gemv_k2048_m8192(%x, %w, %y) : (tensor<2048xbf16>, tensor<8192x2048xbf16>, tensor<8192xf32>)
+  check.return
+}
+
+check.case public @gemv_k2048_m256_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<2048xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(-1.0 to 1.0) : tensor<256x2048xbf16>
+  %y = check.generate.fill value(0.0) : tensor<256xf32>
+  kernel.launch @gemv_k2048_m256(%x, %w, %y) : (tensor<2048xbf16>, tensor<256x2048xbf16>, tensor<256xf32>)
+  check.return
+}
+
+check.benchmark<@gemv_k2048_m8192_case> @gemv_k2048_m8192_time
+check.benchmark<@gemv_k2048_m256_case> @gemv_k2048_m256_time
+
+pipeline.def<kernel> public retain target(@npu) @gemv_v2_k2048_m8192() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %records = index.constant 2048 : index
+  pipeline.compose @gemv_v2[%k, %rows, %records](%x, %w, %y) : [index, index, index](buffer, buffer, buffer)
+}
+
+pipeline.def<kernel> public retain target(@npu) @gemv_v2_k2048_m256() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %records = index.constant 64 : index
+  pipeline.compose @gemv_v2[%k, %rows, %records](%x, %w, %y) : [index, index, index](buffer, buffer, buffer)
+}
+
+check.scenario public @gemv_v2_k2048_m256_check {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[%trial] : check.entropy -> i64
+    %x = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<2048xbf16>
+    %w = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<256x2048xbf16>
+    %y = check.generate.fill value(0.0) : tensor<256xf32>
+    check.compare<@gemv_v2_k2048_m256, @gemv_k2048_m256_reference>(%x, %w, %y) : (tensor<2048xbf16>, tensor<256x2048xbf16>, tensor<256xf32>) -> () {
+      check.expect.approximate actual(%y) expected(%y) atol(0.05) rtol(0.02) nan(same) : tensor<256xf32>, tensor<256xf32>
+    }
+  }
+  check.return
+}
+
+check.case public @gemv_v2_k2048_m8192_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<2048xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(-1.0 to 1.0) : tensor<8192x2048xbf16>
+  %y = check.generate.fill value(0.0) : tensor<8192xf32>
+  kernel.launch @gemv_v2_k2048_m8192(%x, %w, %y) : (tensor<2048xbf16>, tensor<8192x2048xbf16>, tensor<8192xf32>)
+  check.return
+}
+
+check.benchmark<@gemv_v2_k2048_m8192_case> @gemv_v2_k2048_m8192_time
+
+pipeline.def<kernel> public retain target(@npu) @gemv_stream_k2048_m8192() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %records = index.constant 2048 : index
+  pipeline.compose @gemv_stream[%k, %rows, %records](%x, %w, %y) : [index, index, index](buffer, buffer, buffer)
+}
+
+check.case public @gemv_stream_k2048_m8192_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<2048xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(-1.0 to 1.0) : tensor<8192x2048xbf16>
+  %y = check.generate.fill value(0.0) : tensor<8192xf32>
+  kernel.launch @gemv_stream_k2048_m8192(%x, %w, %y) : (tensor<2048xbf16>, tensor<8192x2048xbf16>, tensor<8192xf32>)
+  check.return
+}
+
+check.benchmark<@gemv_stream_k2048_m8192_case> @gemv_stream_k2048_m8192_time
+
+pipeline.def<kernel> public retain target(@npu) @gemv_v3_k2048_m8192() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %records = index.constant 2048 : index
+  pipeline.compose @gemv_v3[%k, %rows, %records](%x, %w, %y) : [index, index, index](buffer, buffer, buffer)
+}
+
+pipeline.def<kernel> public retain target(@npu) @gemv_v3_k2048_m256() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %records = index.constant 64 : index
+  pipeline.compose @gemv_v3[%k, %rows, %records](%x, %w, %y) : [index, index, index](buffer, buffer, buffer)
+}
+
+check.scenario public @gemv_v3_k2048_m256_check {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[%trial] : check.entropy -> i64
+    %x = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<2048xbf16>
+    %w = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<256x2048xbf16>
+    %y = check.generate.fill value(0.0) : tensor<256xf32>
+    check.compare<@gemv_v3_k2048_m256, @gemv_k2048_m256_reference>(%x, %w, %y) : (tensor<2048xbf16>, tensor<256x2048xbf16>, tensor<256xf32>) -> () {
+      check.expect.approximate actual(%y) expected(%y) atol(0.05) rtol(0.02) nan(same) : tensor<256xf32>, tensor<256xf32>
+    }
+  }
+  check.return
+}
+
+check.case public @gemv_v3_k2048_m8192_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<2048xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(-1.0 to 1.0) : tensor<8192x2048xbf16>
+  %y = check.generate.fill value(0.0) : tensor<8192xf32>
+  kernel.launch @gemv_v3_k2048_m8192(%x, %w, %y) : (tensor<2048xbf16>, tensor<8192x2048xbf16>, tensor<8192xf32>)
+  check.return
+}
+
+check.benchmark<@gemv_v3_k2048_m8192_case> @gemv_v3_k2048_m8192_time
+
+// Eight columns: column c streams records [c * per, (c + 1) * per) with its
+// own ingress [c, 2], compute [c, 3] and egress [c, 4] tiles.
+pipeline.def<kernel> @gemv_col(%k: index, %rows: index, %records: index, %column: index) run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {
+  %x_unique, %w_unique, %y_unique = buffer.assume.noalias %x_arg, %w_arg, %y_arg : buffer, buffer, buffer
+  %x_buf, %w_buf, %y_buf = buffer.assume.alignment %x_unique, %w_unique, %y_unique {minimum_alignment = 64} : buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %two = index.constant 2 : index
+  %first = index.mul %column, %records : index
+  %memory = pipeline.memory<workgroup>[%column, 3] : pool
+  // Input: one resident slot.
+  %x_bytes_i = index.mul %k, %two : index
+  %x_bytes = index.cast %x_bytes_i : index to offset
+  %x_storage = buffer.alloca<workgroup> pool(%memory) align(64) %x_bytes : buffer
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<1x[%k]xbf16>
+  %x_channel = channel.bind<fifo> %x_slots, %c1 : view<1x[%k]xbf16>, index -> channel<tile<[%k]xbf16>>
+  // Weights: two record slots of rows x k.
+  %record_elements = index.mul %rows, %k : index
+  %record_bytes_i = index.mul %record_elements, %two : index
+  %ring_bytes_i = index.mul %record_bytes_i, %c2 : index
+  %ring_bytes = index.cast %ring_bytes_i : index to offset
+  %w_storage = buffer.alloca<workgroup> pool(%memory) align(64) %ring_bytes : buffer
+  %w_slots = buffer.view %w_storage[%origin] : buffer -> view<2x[%rows]x[%k]xbf16>
+  %w_channel = channel.bind<fifo> %w_slots, %c2 : view<2x[%rows]x[%k]xbf16>, index -> channel<tile<[%rows]x[%k]xbf16>>
+  // Outputs: rows F32 values per record through a two-slot ring.
+  %y_bytes_i = index.mul %rows, %c4 : index
+  %y_ring_i = index.mul %y_bytes_i, %c2 : index
+  %y_ring = index.cast %y_ring_i : index to offset
+  %y_storage = buffer.alloca<workgroup> pool(%memory) align(64) %y_ring : buffer
+  %y_slots = buffer.view %y_storage[%origin] : buffer -> view<2x[%rows]xf32>
+  %y_channel = channel.bind<fifo> %y_slots, %c2 : view<2x[%rows]xf32>, index -> channel<tile<[%rows]xf32>>
+
+  // Ingress: x once, then one regular weight loop that the compiler can move
+  // into DMA descriptors (no per-record core work).
+  pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {
+    %x_external = buffer.view %x_buf[%origin] : buffer -> view<[%k]xbf16>
+    %x_write, %x_payload = channel.reserve %x_channel : channel<tile<[%k]xbf16>> -> (write<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    %x_copy = kernel.async.copy %x_external to %x_payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<[%k]xbf16> to view<[%k]xbf16> -> kernel.async.token
+    %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
+    kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
+    channel.publish %x_write : write<tile<[%k]xbf16>>
+    scf.for %record = [%c0 to %records step %c1] {
+      %global_w = index.add %first, %record : index
+      func.call @fill_weights(%k, %rows, %global_w, %record_bytes_i, %w_buf, %w_channel) : (index, index, index, index, buffer, channel<tile<[%rows]x[%k]xbf16>>)
+    }
+  }
+  // Egress: drain each record's outputs independently of ingress.
+  pipeline.strand workers([%column, 4], [1, 1], [1, 1]) {
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %payload = channel.acquire %y_channel : channel<tile<[%rows]xf32>> -> (read<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      %global_y = index.add %first, %record : index
+      %out_index = index.mul %global_y, %y_bytes_i : index
+      %out_offset = index.cast %out_index : index to offset
+      %y_external = buffer.view %y_buf[%out_offset] : buffer -> view<[%rows]xf32>
+      %y_copy = kernel.async.copy %payload to %y_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<[%rows]xf32> to view<[%rows]xf32> -> kernel.async.token
+      %y_group = kernel.async.group %y_copy : kernel.async.token -> kernel.async.group
+      kernel.async.wait %y_group {newer_groups = 0} : kernel.async.group
+      channel.release %read : read<tile<[%rows]xf32>>
+    }
+  }
+
+  pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {
+    %x_read, %x_values = channel.acquire %x_channel : channel<tile<[%k]xbf16>> -> (read<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %weights = channel.acquire %w_channel : channel<tile<[%rows]x[%k]xbf16>> -> (read<tile<[%rows]x[%k]xbf16>>, view<[%rows]x[%k]xbf16>)
+      %y_write, %y_values = channel.reserve %y_channel : channel<tile<[%rows]xf32>> -> (write<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      func.call @dot_record4(%k, %rows, %x_values, %weights, %y_values) : (index, index, view<[%k]xbf16>, view<[%rows]x[%k]xbf16>, view<[%rows]xf32>)
+      channel.publish %y_write : write<tile<[%rows]xf32>>
+      channel.release %read : read<tile<[%rows]x[%k]xbf16>>
+    }
+    channel.release %x_read : read<tile<[%k]xbf16>>
+  }
+}
+
+pipeline.def<kernel> public retain target(@npu) @gemv8_k2048_m8192() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %per = index.constant 256 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  pipeline.compose @gemv_col[%k, %rows, %per, %c0](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c1](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c2](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c3](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c4](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c5](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c6](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c7](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+}
+
+pipeline.def<kernel> public retain target(@npu) @gemv8_k2048_m256() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %per = index.constant 8 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  pipeline.compose @gemv_col[%k, %rows, %per, %c0](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c1](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c2](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c3](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c4](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c5](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c6](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_col[%k, %rows, %per, %c7](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+}
+
+check.scenario public @gemv8_k2048_m256_check {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[%trial] : check.entropy -> i64
+    %x = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<2048xbf16>
+    %w = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<256x2048xbf16>
+    %y = check.generate.fill value(0.0) : tensor<256xf32>
+    check.compare<@gemv8_k2048_m256, @gemv_k2048_m256_reference>(%x, %w, %y) : (tensor<2048xbf16>, tensor<256x2048xbf16>, tensor<256xf32>) -> () {
+      check.expect.approximate actual(%y) expected(%y) atol(0.05) rtol(0.02) nan(same) : tensor<256xf32>, tensor<256xf32>
+    }
+  }
+  check.return
+}
+
+check.case public @gemv8_k2048_m8192_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<2048xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(-1.0 to 1.0) : tensor<8192x2048xbf16>
+  %y = check.generate.fill value(0.0) : tensor<8192xf32>
+  kernel.launch @gemv8_k2048_m8192(%x, %w, %y) : (tensor<2048xbf16>, tensor<8192x2048xbf16>, tensor<8192xf32>)
+  check.return
+}
+
+check.benchmark<@gemv8_k2048_m8192_case> @gemv8_k2048_m8192_time
+
+// Eight-column copy of @gemv_stream, generated by colify.py.
+pipeline.def<kernel> @gemv_stream_col(%k: index, %rows: index, %records: index, %column: index) run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {
+  %x_unique, %w_unique, %y_unique = buffer.assume.noalias %x_arg, %w_arg, %y_arg : buffer, buffer, buffer
+  %x_buf, %w_buf, %y_buf = buffer.assume.alignment %x_unique, %w_unique, %y_unique {minimum_alignment = 64} : buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %two = index.constant 2 : index
+  %first = index.mul %column, %records : index
+  %memory = pipeline.memory<workgroup>[%column, 3] : pool
+  // Input: one resident slot.
+  %x_bytes_i = index.mul %k, %two : index
+  %x_bytes = index.cast %x_bytes_i : index to offset
+  %x_storage = buffer.alloca<workgroup> pool(%memory) align(64) %x_bytes : buffer
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<1x[%k]xbf16>
+  %x_channel = channel.bind<fifo> %x_slots, %c1 : view<1x[%k]xbf16>, index -> channel<tile<[%k]xbf16>>
+  // Weights: two record slots of rows x k.
+  %record_elements = index.mul %rows, %k : index
+  %record_bytes_i = index.mul %record_elements, %two : index
+  %ring_bytes_i = index.mul %record_bytes_i, %c2 : index
+  %ring_bytes = index.cast %ring_bytes_i : index to offset
+  %w_storage = buffer.alloca<workgroup> pool(%memory) align(64) %ring_bytes : buffer
+  %w_slots = buffer.view %w_storage[%origin] : buffer -> view<2x[%rows]x[%k]xbf16>
+  %w_channel = channel.bind<fifo> %w_slots, %c2 : view<2x[%rows]x[%k]xbf16>, index -> channel<tile<[%rows]x[%k]xbf16>>
+  // Outputs: rows F32 values per record through a two-slot ring.
+  %y_bytes_i = index.mul %rows, %c4 : index
+  %y_ring_i = index.mul %y_bytes_i, %c2 : index
+  %y_ring = index.cast %y_ring_i : index to offset
+  %y_storage = buffer.alloca<workgroup> pool(%memory) align(64) %y_ring : buffer
+  %y_slots = buffer.view %y_storage[%origin] : buffer -> view<2x[%rows]xf32>
+  %y_channel = channel.bind<fifo> %y_slots, %c2 : view<2x[%rows]xf32>, index -> channel<tile<[%rows]xf32>>
+
+  // Ingress: x once, then one regular weight loop that the compiler can move
+  // into DMA descriptors (no per-record core work).
+  pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {
+    %x_external = buffer.view %x_buf[%origin] : buffer -> view<[%k]xbf16>
+    %x_write, %x_payload = channel.reserve %x_channel : channel<tile<[%k]xbf16>> -> (write<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    %x_copy = kernel.async.copy %x_external to %x_payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<[%k]xbf16> to view<[%k]xbf16> -> kernel.async.token
+    %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
+    kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
+    channel.publish %x_write : write<tile<[%k]xbf16>>
+    scf.for %record = [%c0 to %records step %c1] {
+      %global_w = index.add %first, %record : index
+      func.call @fill_weights(%k, %rows, %global_w, %record_bytes_i, %w_buf, %w_channel) : (index, index, index, index, buffer, channel<tile<[%rows]x[%k]xbf16>>)
+    }
+  }
+  // Egress: drain each record's outputs independently of ingress.
+  pipeline.strand workers([%column, 4], [1, 1], [1, 1]) {
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %payload = channel.acquire %y_channel : channel<tile<[%rows]xf32>> -> (read<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      %global_y = index.add %first, %record : index
+      %out_index = index.mul %global_y, %y_bytes_i : index
+      %out_offset = index.cast %out_index : index to offset
+      %y_external = buffer.view %y_buf[%out_offset] : buffer -> view<[%rows]xf32>
+      %y_copy = kernel.async.copy %payload to %y_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<[%rows]xf32> to view<[%rows]xf32> -> kernel.async.token
+      %y_group = kernel.async.group %y_copy : kernel.async.token -> kernel.async.group
+      kernel.async.wait %y_group {newer_groups = 0} : kernel.async.group
+      channel.release %read : read<tile<[%rows]xf32>>
+    }
+  }
+
+  pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {
+    %x_read, %x_values = channel.acquire %x_channel : channel<tile<[%k]xbf16>> -> (read<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %weights = channel.acquire %w_channel : channel<tile<[%rows]x[%k]xbf16>> -> (read<tile<[%rows]x[%k]xbf16>>, view<[%rows]x[%k]xbf16>)
+      %y_write, %y_values = channel.reserve %y_channel : channel<tile<[%rows]xf32>> -> (write<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      channel.publish %y_write : write<tile<[%rows]xf32>>
+      channel.release %read : read<tile<[%rows]x[%k]xbf16>>
+    }
+    channel.release %x_read : read<tile<[%k]xbf16>>
+  }
+}
+
+pipeline.def<kernel> public retain target(@npu) @gemv8_stream_k2048_m8192() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %per = index.constant 256 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c0](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c1](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c2](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c3](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c4](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c5](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c6](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c7](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+}
+
+
+check.case public @gemv8_stream_k2048_m8192_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<2048xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(-1.0 to 1.0) : tensor<8192x2048xbf16>
+  %y = check.generate.fill value(0.0) : tensor<8192xf32>
+  kernel.launch @gemv8_stream_k2048_m8192(%x, %w, %y) : (tensor<2048xbf16>, tensor<8192x2048xbf16>, tensor<8192xf32>)
+  check.return
+}
+
+check.benchmark<@gemv8_stream_k2048_m8192_case> @gemv8_stream_k2048_m8192_time
+
+pipeline.def<kernel> public retain target(@npu) @gemv8_stream_r2_k2048_m8192() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 2 : index
+  %per = index.constant 512 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c0](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c1](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c2](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c3](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c4](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c5](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c6](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_col[%k, %rows, %per, %c7](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+}
+
+check.case public @gemv8_stream_r2_k2048_m8192_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<2048xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(-1.0 to 1.0) : tensor<8192x2048xbf16>
+  %y = check.generate.fill value(0.0) : tensor<8192xf32>
+  kernel.launch @gemv8_stream_r2_k2048_m8192(%x, %w, %y) : (tensor<2048xbf16>, tensor<8192x2048xbf16>, tensor<8192xf32>)
+  check.return
+}
+
+check.benchmark<@gemv8_stream_r2_k2048_m8192_case> @gemv8_stream_r2_k2048_m8192_time
+
+// Stream-only, weight ring in the column memory tile.
+pipeline.def<kernel> @gemv_stream_mt_col(%k: index, %rows: index, %records: index, %column: index) run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {
+  %x_unique, %w_unique, %y_unique = buffer.assume.noalias %x_arg, %w_arg, %y_arg : buffer, buffer, buffer
+  %x_buf, %w_buf, %y_buf = buffer.assume.alignment %x_unique, %w_unique, %y_unique {minimum_alignment = 64} : buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %two = index.constant 2 : index
+  %first = index.mul %column, %records : index
+  %memory = pipeline.memory<workgroup>[%column, 3] : pool
+  // Input: one resident slot.
+  %x_bytes_i = index.mul %k, %two : index
+  %x_bytes = index.cast %x_bytes_i : index to offset
+  %x_storage = buffer.alloca<workgroup> pool(%memory) align(64) %x_bytes : buffer
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<1x[%k]xbf16>
+  %x_channel = channel.bind<fifo> %x_slots, %c1 : view<1x[%k]xbf16>, index -> channel<tile<[%k]xbf16>>
+  // Weights: two record slots of rows x k.
+  %record_elements = index.mul %rows, %k : index
+  %record_bytes_i = index.mul %record_elements, %two : index
+  %ring_bytes_i = index.mul %record_bytes_i, %c2 : index
+  %ring_bytes = index.cast %ring_bytes_i : index to offset
+  %w_memory = pipeline.memory<workgroup>[%column, 1] : pool
+  %w_storage = buffer.alloca<workgroup> pool(%w_memory) align(64) %ring_bytes : buffer
+  %w_slots = buffer.view %w_storage[%origin] : buffer -> view<2x[%rows]x[%k]xbf16>
+  %w_channel = channel.bind<fifo> %w_slots, %c2 : view<2x[%rows]x[%k]xbf16>, index -> channel<tile<[%rows]x[%k]xbf16>>
+  // Outputs: rows F32 values per record through a two-slot ring.
+  %y_bytes_i = index.mul %rows, %c4 : index
+  %y_ring_i = index.mul %y_bytes_i, %c2 : index
+  %y_ring = index.cast %y_ring_i : index to offset
+  %y_storage = buffer.alloca<workgroup> pool(%memory) align(64) %y_ring : buffer
+  %y_slots = buffer.view %y_storage[%origin] : buffer -> view<2x[%rows]xf32>
+  %y_channel = channel.bind<fifo> %y_slots, %c2 : view<2x[%rows]xf32>, index -> channel<tile<[%rows]xf32>>
+
+  // Ingress: x once, then one regular weight loop that the compiler can move
+  // into DMA descriptors (no per-record core work).
+  pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {
+    %x_external = buffer.view %x_buf[%origin] : buffer -> view<[%k]xbf16>
+    %x_write, %x_payload = channel.reserve %x_channel : channel<tile<[%k]xbf16>> -> (write<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    %x_copy = kernel.async.copy %x_external to %x_payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<[%k]xbf16> to view<[%k]xbf16> -> kernel.async.token
+    %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
+    kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
+    channel.publish %x_write : write<tile<[%k]xbf16>>
+    scf.for %record = [%c0 to %records step %c1] {
+      %global_w = index.add %first, %record : index
+      func.call @fill_weights(%k, %rows, %global_w, %record_bytes_i, %w_buf, %w_channel) : (index, index, index, index, buffer, channel<tile<[%rows]x[%k]xbf16>>)
+    }
+  }
+  // Egress: drain each record's outputs independently of ingress.
+  pipeline.strand workers([%column, 4], [1, 1], [1, 1]) {
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %payload = channel.acquire %y_channel : channel<tile<[%rows]xf32>> -> (read<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      %global_y = index.add %first, %record : index
+      %out_index = index.mul %global_y, %y_bytes_i : index
+      %out_offset = index.cast %out_index : index to offset
+      %y_external = buffer.view %y_buf[%out_offset] : buffer -> view<[%rows]xf32>
+      %y_copy = kernel.async.copy %payload to %y_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<[%rows]xf32> to view<[%rows]xf32> -> kernel.async.token
+      %y_group = kernel.async.group %y_copy : kernel.async.token -> kernel.async.group
+      kernel.async.wait %y_group {newer_groups = 0} : kernel.async.group
+      channel.release %read : read<tile<[%rows]xf32>>
+    }
+  }
+
+  pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {
+    %x_read, %x_values = channel.acquire %x_channel : channel<tile<[%k]xbf16>> -> (read<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %weights = channel.acquire %w_channel : channel<tile<[%rows]x[%k]xbf16>> -> (read<tile<[%rows]x[%k]xbf16>>, view<[%rows]x[%k]xbf16>)
+      %y_write, %y_values = channel.reserve %y_channel : channel<tile<[%rows]xf32>> -> (write<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      channel.publish %y_write : write<tile<[%rows]xf32>>
+      channel.release %read : read<tile<[%rows]x[%k]xbf16>>
+    }
+    channel.release %x_read : read<tile<[%k]xbf16>>
+  }
+}
+
+pipeline.def<kernel> public retain target(@npu) @gemv8_stream_mt_r4_k2048_m8192() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %per = index.constant 256 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c0](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c1](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c2](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c3](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c4](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c5](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c6](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c7](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+}
+
+check.case public @gemv8_stream_mt_r4_k2048_m8192_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<2048xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(-1.0 to 1.0) : tensor<8192x2048xbf16>
+  %y = check.generate.fill value(0.0) : tensor<8192xf32>
+  kernel.launch @gemv8_stream_mt_r4_k2048_m8192(%x, %w, %y) : (tensor<2048xbf16>, tensor<8192x2048xbf16>, tensor<8192xf32>)
+  check.return
+}
+
+check.benchmark<@gemv8_stream_mt_r4_k2048_m8192_case> @gemv8_stream_mt_r4_k2048_m8192_time
+
+pipeline.def<kernel> public retain target(@npu) @gemv8_stream_mt_r16_k2048_m8192() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 16 : index
+  %per = index.constant 64 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c0](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c1](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c2](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c3](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c4](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c5](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c6](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_mt_col[%k, %rows, %per, %c7](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+}
+
+check.case public @gemv8_stream_mt_r16_k2048_m8192_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<2048xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(-1.0 to 1.0) : tensor<8192x2048xbf16>
+  %y = check.generate.fill value(0.0) : tensor<8192xf32>
+  kernel.launch @gemv8_stream_mt_r16_k2048_m8192(%x, %w, %y) : (tensor<2048xbf16>, tensor<8192x2048xbf16>, tensor<8192xf32>)
+  check.return
+}
+
+check.benchmark<@gemv8_stream_mt_r16_k2048_m8192_case> @gemv8_stream_mt_r16_k2048_m8192_time
+
+// Stream-only, three-slot weight ring.
+pipeline.def<kernel> @gemv_stream_d3_col(%k: index, %rows: index, %records: index, %column: index) run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {
+  %x_unique, %w_unique, %y_unique = buffer.assume.noalias %x_arg, %w_arg, %y_arg : buffer, buffer, buffer
+  %x_buf, %w_buf, %y_buf = buffer.assume.alignment %x_unique, %w_unique, %y_unique {minimum_alignment = 64} : buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %two = index.constant 2 : index
+  %first = index.mul %column, %records : index
+  %memory = pipeline.memory<workgroup>[%column, 3] : pool
+  // Input: one resident slot.
+  %x_bytes_i = index.mul %k, %two : index
+  %x_bytes = index.cast %x_bytes_i : index to offset
+  %x_storage = buffer.alloca<workgroup> pool(%memory) align(64) %x_bytes : buffer
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<1x[%k]xbf16>
+  %x_channel = channel.bind<fifo> %x_slots, %c1 : view<1x[%k]xbf16>, index -> channel<tile<[%k]xbf16>>
+  // Weights: two record slots of rows x k.
+  %record_elements = index.mul %rows, %k : index
+  %record_bytes_i = index.mul %record_elements, %two : index
+  %c3 = index.constant 3 : index
+  %ring_bytes_i = index.mul %record_bytes_i, %c3 : index
+  %ring_bytes = index.cast %ring_bytes_i : index to offset
+  %w_storage = buffer.alloca<workgroup> pool(%memory) align(64) %ring_bytes : buffer
+  %w_slots = buffer.view %w_storage[%origin] : buffer -> view<3x[%rows]x[%k]xbf16>
+  %w_channel = channel.bind<fifo> %w_slots, %c3 : view<3x[%rows]x[%k]xbf16>, index -> channel<tile<[%rows]x[%k]xbf16>>
+  // Outputs: rows F32 values per record through a two-slot ring.
+  %y_bytes_i = index.mul %rows, %c4 : index
+  %y_ring_i = index.mul %y_bytes_i, %c2 : index
+  %y_ring = index.cast %y_ring_i : index to offset
+  %y_storage = buffer.alloca<workgroup> pool(%memory) align(64) %y_ring : buffer
+  %y_slots = buffer.view %y_storage[%origin] : buffer -> view<2x[%rows]xf32>
+  %y_channel = channel.bind<fifo> %y_slots, %c2 : view<2x[%rows]xf32>, index -> channel<tile<[%rows]xf32>>
+
+  // Ingress: x once, then one regular weight loop that the compiler can move
+  // into DMA descriptors (no per-record core work).
+  pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {
+    %x_external = buffer.view %x_buf[%origin] : buffer -> view<[%k]xbf16>
+    %x_write, %x_payload = channel.reserve %x_channel : channel<tile<[%k]xbf16>> -> (write<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    %x_copy = kernel.async.copy %x_external to %x_payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<[%k]xbf16> to view<[%k]xbf16> -> kernel.async.token
+    %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
+    kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
+    channel.publish %x_write : write<tile<[%k]xbf16>>
+    scf.for %record = [%c0 to %records step %c1] {
+      %global_w = index.add %first, %record : index
+      func.call @fill_weights(%k, %rows, %global_w, %record_bytes_i, %w_buf, %w_channel) : (index, index, index, index, buffer, channel<tile<[%rows]x[%k]xbf16>>)
+    }
+  }
+  // Egress: drain each record's outputs independently of ingress.
+  pipeline.strand workers([%column, 4], [1, 1], [1, 1]) {
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %payload = channel.acquire %y_channel : channel<tile<[%rows]xf32>> -> (read<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      %global_y = index.add %first, %record : index
+      %out_index = index.mul %global_y, %y_bytes_i : index
+      %out_offset = index.cast %out_index : index to offset
+      %y_external = buffer.view %y_buf[%out_offset] : buffer -> view<[%rows]xf32>
+      %y_copy = kernel.async.copy %payload to %y_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<[%rows]xf32> to view<[%rows]xf32> -> kernel.async.token
+      %y_group = kernel.async.group %y_copy : kernel.async.token -> kernel.async.group
+      kernel.async.wait %y_group {newer_groups = 0} : kernel.async.group
+      channel.release %read : read<tile<[%rows]xf32>>
+    }
+  }
+
+  pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {
+    %x_read, %x_values = channel.acquire %x_channel : channel<tile<[%k]xbf16>> -> (read<tile<[%k]xbf16>>, view<[%k]xbf16>)
+    scf.for %record = [%c0 to %records step %c1] {
+      %read, %weights = channel.acquire %w_channel : channel<tile<[%rows]x[%k]xbf16>> -> (read<tile<[%rows]x[%k]xbf16>>, view<[%rows]x[%k]xbf16>)
+      %y_write, %y_values = channel.reserve %y_channel : channel<tile<[%rows]xf32>> -> (write<tile<[%rows]xf32>>, view<[%rows]xf32>)
+      channel.publish %y_write : write<tile<[%rows]xf32>>
+      channel.release %read : read<tile<[%rows]x[%k]xbf16>>
+    }
+    channel.release %x_read : read<tile<[%k]xbf16>>
+  }
+}
+
+pipeline.def<kernel> public retain target(@npu) @gemv8_stream_d3_k2048_m8192() run(%x: buffer, %w: buffer, %y: buffer) {
+  %k = index.constant 2048 : index
+  %rows = index.constant 4 : index
+  %per = index.constant 256 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  pipeline.compose @gemv_stream_d3_col[%k, %rows, %per, %c0](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_d3_col[%k, %rows, %per, %c1](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_d3_col[%k, %rows, %per, %c2](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_d3_col[%k, %rows, %per, %c3](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_d3_col[%k, %rows, %per, %c4](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_d3_col[%k, %rows, %per, %c5](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_d3_col[%k, %rows, %per, %c6](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+  pipeline.compose @gemv_stream_d3_col[%k, %rows, %per, %c7](%x, %w, %y) : [index, index, index, index](buffer, buffer, buffer)
+}
+
+check.case public @gemv8_stream_d3_k2048_m8192_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<2048xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(-1.0 to 1.0) : tensor<8192x2048xbf16>
+  %y = check.generate.fill value(0.0) : tensor<8192xf32>
+  kernel.launch @gemv8_stream_d3_k2048_m8192(%x, %w, %y) : (tensor<2048xbf16>, tensor<8192x2048xbf16>, tensor<8192xf32>)
+  check.return
+}
+
+check.benchmark<@gemv8_stream_d3_k2048_m8192_case> @gemv8_stream_d3_k2048_m8192_time
