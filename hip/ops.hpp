@@ -62,8 +62,11 @@ bool ResidualNorm(const float* branch, const Tensor* post_norm, float* x,
                   bool split, hipStream_t stream, DenseWorkspace workspace);
 void Dense(const Tensor& weight, const float* x, float* out, int n,
            hipStream_t stream, DenseWorkspace workspace = {});
+// Reads history before the first row; with update, then stores the last
+// width - 1 rows' products into it.
 void ShortConv(const float* projection, const float* weight, float* history,
-               float* out, int n, int hidden, int width, hipStream_t stream);
+               float* out, int n, int hidden, int width, hipStream_t stream,
+               bool update = true);
 // Writes the dim / 2 RoPE frequencies of theta for Rope.
 void RopeFrequencies(float* out, int dim, float theta, hipStream_t stream);
 void Rope(float* x, const float* frequencies, const float* factors, int n,

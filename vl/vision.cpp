@@ -6,6 +6,7 @@
 #include <gufo/ext/experimental/ggml_dequant.hpp>
 #include <gufo/ext/gguf_identity.hpp>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -53,8 +54,36 @@ struct Block {
 const float* F(const Tensor& t) {
   return static_cast<const float*>(t.data);
 }
+// Activations of one encode, grown to the largest picture so far, up to
+// kKeptPatches (a 1-megapixel picture, about 285 MiB). Larger pictures
+// allocate their own: allocation is a small part of their encode.
+constexpr std::size_t kKeptPatches = 4096;
+struct Scratch {
+  Stream stream;
+  std::size_t patches{};
+  Buffer x, z, o, mix, q, k, v, a, gate, up, workspace;
+  void Reserve(std::size_t n) {
+    if (n <= patches)
+      return;
+    x = Buffer(n * 1024 * 4);
+    z = Buffer(n * 4096 * 4);
+    o = Buffer(n * 1024 * 4);
+    mix = Buffer(n * 3072 * 4);
+    q = Buffer(n * 1024 * 4);
+    k = Buffer(n * 512 * 4);
+    v = Buffer(n * 512 * 4);
+    a = Buffer(n * 1024 * 4);
+    gate = Buffer(n * 2560 * 4);
+    up = Buffer(n * 2560 * 4);
+    workspace = Buffer(lfm3::gpu::DenseWorkspaceBytes(n, 4096));
+    patches = n;
+  }
+};
 }  // namespace
 struct Vision::Impl {
+  // Reused by one encode at a time; concurrent encodes allocate their own.
+  std::mutex scratch_mutex;
+  Scratch scratch;
   std::string identity;
   std::once_flag identity_once;
   std::unique_ptr<core::GgufReader> reader;
@@ -203,14 +232,16 @@ std::vector<float> Vision::Encode(const Picture& p) {
     throw std::invalid_argument("invalid LFM3 picture patches");
   const int n = p.height * p.width;
   auto& m = *impl_;
-  Stream stream;
-  const auto s = stream.s;
-  Buffer x(std::size_t(n) * 1024 * 4), z(std::size_t(n) * 4096 * 4),
-      o(std::size_t(n) * 1024 * 4), mix(std::size_t(n) * 3072 * 4),
-      q(std::size_t(n) * 1024 * 4), k(std::size_t(n) * 512 * 4),
-      v(std::size_t(n) * 512 * 4), a(std::size_t(n) * 1024 * 4),
-      gate(std::size_t(n) * 2560 * 4), up(std::size_t(n) * 2560 * 4),
-      workspace(lfm3::gpu::DenseWorkspaceBytes(n, 4096));
+  std::unique_lock lock(m.scratch_mutex, std::defer_lock);
+  if (std::size_t(n) <= kKeptPatches)
+    (void)lock.try_lock();
+  std::optional<Scratch> own;
+  auto& scratch = lock ? m.scratch : own.emplace();
+  scratch.Reserve(n);
+  const auto s = scratch.stream.s;
+  auto &x = scratch.x, &z = scratch.z, &o = scratch.o, &mix = scratch.mix,
+       &q = scratch.q, &k = scratch.k, &v = scratch.v, &a = scratch.a,
+       &gate = scratch.gate, &up = scratch.up, &workspace = scratch.workspace;
   auto dense = [&](const Tensor& t, const float* in, float* out, int rows) {
     if (t.type == GgmlType::kBF16)
       lfm3_audio::gpu::SgemmBf16(in, t.data, nullptr, out, rows, t.rows, t.cols,

@@ -2067,35 +2067,52 @@ SplitK PlanSplit(int token_blocks, int tiles, int k_blocks, int resident,
   }
   return plan;
 }
+// Unsplit launches with fewer 256-row tiles than this take 128-row tiles.
+constexpr int kFewTiles = 56;
 template<bool kSwiGLU = false>
 void LaunchSplit(std::span<const Output> outputs, HalfActivations split, int n,
                  int K, hipStream_t s, DenseWorkspace workspace = {}) {
   constexpr int BN = 64;
-  Projections jobs{};
-  jobs.count = int(outputs.size());
-  int row_blocks = 0;
   bool wide = false;
   for (const auto& o : outputs)
     wide = wide || o.weight->rows >= 1024;
-  const int tile_rows = (wide ? 256 : 64) / (kSwiGLU ? 2 : 1);
+  const auto row_blocks = [&](int tile_rows) {
+    int blocks = 0;
+    for (std::size_t i = 0; i < outputs.size(); ++i)
+      if (!kSwiGLU || i == 0)
+        blocks += (int(outputs[i].weight->rows) + tile_rows - 1) / tile_rows;
+    return blocks;
+  };
+  const int token_blocks = (n + BN - 1) / BN;
+  // Without split-K (decision passes keep every output's sums independent
+  // of what shares the launch), few 256-row tiles leave the device idle;
+  // 128-row tiles of four waves have the same sums.
+  const bool narrow = wide && !kSwiGLU && !workspace.partial &&
+                      token_blocks * row_blocks(256) < kFewTiles;
+  const int tile_rows = narrow ? 128 : (wide ? 256 : 64) / (kSwiGLU ? 2 : 1);
+  Projections jobs{};
+  jobs.count = int(outputs.size());
+  int blocks = 0;
   for (int i = 0; i < jobs.count; ++i) {
     const auto& w = *outputs[i].weight;
     jobs.job[i] = {w.data, outputs[i].out, int(w.rows)};
-    jobs.first_block[i] = row_blocks;
+    jobs.first_block[i] = blocks;
     if (!kSwiGLU || i == 0)
-      row_blocks += (int(w.rows) + tile_rows - 1) / tile_rows;
+      blocks += (int(w.rows) + tile_rows - 1) / tile_rows;
   }
-  const int token_blocks = (n + BN - 1) / BN, tiles = token_blocks * row_blocks;
+  const int tiles = token_blocks * blocks;
   if (kSwiGLU)
     jobs.count = 1;  // Both weights belong to every row block.
-  const auto launch = [&]<auto kernel>() {
+  const auto launch = [&]<auto kernel, int kThreads = 256>() {
     const auto plan = kSwiGLU ? SplitK{token_blocks, tiles}
                               : PlanSplit(token_blocks, tiles, K / 32,
                                           ResidentBlocks<kernel>(), workspace);
     const int units = plan.split_from + (tiles - plan.split_from) * plan.parts;
-    kernel<<<units, 256, 0, s>>>(jobs, split, n, K, plan);
+    kernel<<<units, kThreads, 0, s>>>(jobs, split, n, K, plan);
   };
-  if (wide)
+  if (narrow)
+    launch.template operator()<RegQ8Gemm<BN / 16, false, 4>, 128>();
+  else if (wide)
     launch.template operator()<RegQ8Gemm<BN / 16, kSwiGLU>>();
   else
     launch.template operator()<TiledQ8Gemm<64, BN, 4, 2, kSwiGLU>>();
@@ -2231,8 +2248,8 @@ void Dense(const Tensor& w, const float* x, float* out, int n, hipStream_t s,
                  out + std::size_t(i) * w.rows, w.rows, w.cols, s);
 }
 void ShortConv(const float* p, const float* w, float* h, float* out, int n,
-               int H, int L, hipStream_t s) {
-  if (n == 1) {
+               int H, int L, hipStream_t s, bool update) {
+  if (n == 1 && update) {
     ConvolutionStep<<<(H + 127) / 128, 128, 0, s>>>(p, w, h, out, H, L);
     return;
   }
@@ -2242,7 +2259,8 @@ void ShortConv(const float* p, const float* w, float* h, float* out, int n,
             p, w, h, out, n, H);
   else
     Convolution<<<dim3((H + 127) / 128, n), 128, 0, s>>>(p, w, h, out, n, H, L);
-  ConvolutionHistory<<<(H + 127) / 128, 128, 0, s>>>(p, h, n, H, L);
+  if (update)
+    ConvolutionHistory<<<(H + 127) / 128, 128, 0, s>>>(p, h, n, H, L);
 }
 void RopeFrequencies(float* out, int d, float theta, hipStream_t s) {
   Frequencies<<<1, d / 2, 0, s>>>(out, d, theta);

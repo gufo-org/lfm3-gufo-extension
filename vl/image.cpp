@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
+#include <thread>
 
 #include "vision.hpp"
 namespace gufo::models::lfm3_vl {
@@ -8,7 +10,8 @@ namespace {
 // Torchvision's uint8 antialiased bicubic path uses the Pillow filter
 // (a = -0.5), separable passes, signed fixed-point coefficients, and uint8
 // saturation after each pass. A floating-point resize followed by one cast
-// changes pixels and, consequently, the embedding.
+// changes pixels and, consequently, the embedding. As in Pillow, sums fit
+// 32 bits: coefficients total about 2^precision < 2^23, times 255.
 double Cubic(double x) {
   x = std::abs(x);
   if (x < 1.0) {
@@ -68,6 +71,24 @@ std::vector<Filter> Filters(int input, int output) {
   return filters;
 }
 
+// Runs body(first, last) over [0, count) rows, split across threads when the
+// pass is large (each row is independent).
+template<class F>
+void ForRows(int count, std::size_t work, F body) {
+  const unsigned threads = std::min<std::size_t>(
+      {std::max(1U, std::thread::hardware_concurrency()), 16,
+       std::max<std::size_t>(1, work / (1U << 20)), std::size_t(count)});
+  if (threads <= 1) {
+    body(0, count);
+    return;
+  }
+  std::vector<std::jthread> pool;
+  for (unsigned t = 1; t < threads; ++t)
+    pool.emplace_back([&, t] {
+      body(int(count * t / threads), int(count * (t + 1) / threads));
+    });
+  body(0, int(count / threads));
+}
 std::vector<std::uint8_t> Resize(const core::Image& image, int width,
                                  int height) {
   const int source_width = static_cast<int>(image.width);
@@ -80,39 +101,49 @@ std::vector<std::uint8_t> Resize(const core::Image& image, int width,
   std::vector<std::uint8_t> intermediate(std::size_t{image.height} * width * 3);
   std::vector<std::uint8_t> output(static_cast<std::size_t>(height) * width *
                                    3);
-  for (int y = 0; y < source_height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      const auto& filter = horizontal[x];
-      for (int c = 0; c < 3; ++c) {
-        std::int64_t sum = 1 << (filter.precision - 1);
-        for (std::size_t k = 0; k < filter.weights.size(); ++k) {
-          sum += static_cast<std::int64_t>(filter.weights[k]) *
-                 image.pixels[(static_cast<std::size_t>(y) * source_width +
-                               filter.begin + k) *
-                                  3 +
-                              c];
+  std::size_t taps = horizontal.empty() ? 0 : horizontal[0].weights.size();
+  ForRows(
+      source_height, std::size_t(source_height) * width * taps * 3,
+      [&](int first, int last) {
+        for (int y = first; y < last; ++y) {
+          for (int x = 0; x < width; ++x) {
+            const auto& filter = horizontal[x];
+            for (int c = 0; c < 3; ++c) {
+              std::int32_t sum = 1 << (filter.precision - 1);
+              for (std::size_t k = 0; k < filter.weights.size(); ++k) {
+                sum +=
+                    filter.weights[k] *
+                    image.pixels[(static_cast<std::size_t>(y) * source_width +
+                                  filter.begin + k) *
+                                     3 +
+                                 c];
+              }
+              intermediate[(static_cast<std::size_t>(y) * width + x) * 3 + c] =
+                  static_cast<std::uint8_t>(std::clamp<std::int32_t>(
+                      sum >> filter.precision, 0, 255));
+            }
+          }
         }
-        intermediate[(static_cast<std::size_t>(y) * width + x) * 3 + c] =
-            static_cast<std::uint8_t>(
-                std::clamp<std::int64_t>(sum >> filter.precision, 0, 255));
-      }
-    }
-  }
-  for (int y = 0; y < height; ++y) {
-    const auto& filter = vertical[y];
-    for (int x = 0; x < width; ++x) {
-      for (int c = 0; c < 3; ++c) {
-        std::int64_t sum = 1 << (filter.precision - 1);
-        for (std::size_t k = 0; k < filter.weights.size(); ++k) {
-          sum += static_cast<std::int64_t>(filter.weights[k]) *
-                 intermediate[((filter.begin + k) * width + x) * 3 + c];
+      });
+  taps = vertical.empty() ? 0 : vertical[0].weights.size();
+  ForRows(
+      height, std::size_t(height) * width * taps * 3, [&](int first, int last) {
+        for (int y = first; y < last; ++y) {
+          const auto& filter = vertical[y];
+          for (int x = 0; x < width; ++x) {
+            for (int c = 0; c < 3; ++c) {
+              std::int32_t sum = 1 << (filter.precision - 1);
+              for (std::size_t k = 0; k < filter.weights.size(); ++k) {
+                sum += filter.weights[k] *
+                       intermediate[((filter.begin + k) * width + x) * 3 + c];
+              }
+              output[(static_cast<std::size_t>(y) * width + x) * 3 + c] =
+                  static_cast<std::uint8_t>(std::clamp<std::int32_t>(
+                      sum >> filter.precision, 0, 255));
+            }
+          }
         }
-        output[(static_cast<std::size_t>(y) * width + x) * 3 + c] =
-            static_cast<std::uint8_t>(
-                std::clamp<std::int64_t>(sum >> filter.precision, 0, 255));
-      }
-    }
-  }
+      });
   return output;
 }
 
@@ -143,19 +174,24 @@ Picture ProcessImage(const core::Image& image, unsigned max_pixels) {
   }
   auto pixels = Resize(image, width, height);
   Picture p{height / 16, width / 16, {}};
-  p.patches.reserve(std::size_t(height) * width * 3);
+  // Every byte value's normalized float, by the same expression.
+  std::array<float, 256> value;
+  for (int i = 0; i < 256; ++i)
+    value[i] = (i / 255.0F - 0.5F) / 0.5F;
+  p.patches.resize(std::size_t(height) * width * 3);
+  float* out = p.patches.data();
   for (int by = 0; by < p.height; by += 2)
     for (int bx = 0; bx < p.width; bx += 2)
       for (int dy = 0; dy < 2; ++dy)
         for (int dx = 0; dx < 2; ++dx)
           for (int c = 0; c < 3; ++c)
-            for (int y = 0; y < 16; ++y)
+            for (int y = 0; y < 16; ++y) {
+              const auto* row = pixels.data() +
+                                ((by + dy) * 16 + y) * width * 3 +
+                                (bx + dx) * 16 * 3 + c;
               for (int x = 0; x < 16; ++x)
-                p.patches.push_back((pixels[((by + dy) * 16 + y) * width * 3 +
-                                            ((bx + dx) * 16 + x) * 3 + c] /
-                                         255.0F -
-                                     0.5F) /
-                                    0.5F);
+                *out++ = value[row[x * 3]];
+            }
   return p;
 }
 }  // namespace gufo::models::lfm3_vl

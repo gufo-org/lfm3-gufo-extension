@@ -261,73 +261,105 @@ json::Value Model::Decide(const Value& request) {
   }
   auto answers = Value::object();
   std::size_t input_tokens = 0;
-  std::vector<float> full_logits;
   const std::string header = state && !state->is_null() ? "QUESTION:\n" : "";
+  const auto H = m.host.config.hidden;
+  struct Pass {
+    std::size_t first, count;
+    Prompt prompt;
+    bool media;
+  };
+  std::vector<Pass> packs;
   for (std::size_t first = 0; first < questions.size(); first += set_size) {
     const auto count =
         std::min<std::size_t>(set_size, questions.size() - first);
-    auto own_questions = std::span(questions).subspan(first, count);
-    auto prompt =
-        Pack(m.tokenizer(), prefix, header,
-             std::span(suffixes).subspan(first, count), own_questions);
-    const auto& ids = prompt.tokens;
-    if (ids.size() > m.context)
+    auto prompt = Pack(m.tokenizer(), prefix, header,
+                       std::span(suffixes).subspan(first, count),
+                       std::span(questions).subspan(first, count));
+    if (prompt.tokens.size() > m.context)
       throw std::invalid_argument(
           "packed decision prompt exceeds --context; use a smaller set_size or "
           "larger context");
-    std::vector<float> embeddings;
-    const bool has_voices =
+    const bool voiced =
         std::any_of(voices.begin() + first, voices.begin() + first + count,
                     [](const auto& v) { return !v.empty(); });
-    if (!media.empty() || has_voices) {
-      embeddings.resize(ids.size() * m.host.config.hidden);
+    packs.push_back(
+        {first, count, std::move(prompt), !media.empty() || voiced});
+  }
+  // Packs are independent prompts: as many as fit the context share a pass,
+  // so the weights are read once for all of them.
+  for (std::size_t begin = 0; begin < packs.size();) {
+    std::size_t end = begin, rows = 0;
+    bool with_media = false;
+    while (
+        end < packs.size() &&
+        (end == begin || rows + packs[end].prompt.tokens.size() <= m.context)) {
+      rows += packs[end].prompt.tokens.size();
+      with_media = with_media || packs[end].media;
+      ++end;
+    }
+    std::vector<std::uint32_t> ids;
+    ids.reserve(rows);
+    std::vector<lfm3::Session::DecisionPrompt> prompts;
+    std::size_t slots = 0;
+    for (auto i = begin; i < end; ++i) {
+      const auto& prompt = packs[i].prompt;
+      ids.insert(ids.end(), prompt.tokens.begin(), prompt.tokens.end());
+      prompts.push_back({prompt.tokens.size(), prompt.groups, prompt.slots});
+      slots += prompt.slots.size();
+    }
+    std::vector<float> embeddings;
+    if (with_media) {
+      embeddings.resize(ids.size() * H);
       for (std::size_t i = 0; i < ids.size(); ++i)
-        lfm3::DecodeRow(
-            m.host.embedding, ids[i],
-            std::span(embeddings)
-                .subspan(i * m.host.config.hidden, m.host.config.hidden));
+        lfm3::DecodeRow(m.host.embedding, ids[i],
+                        std::span(embeddings).subspan(i * H, H));
       std::size_t offset = 0;
-      const auto place = [&](const Media& item) {
-        while (offset < ids.size() && ids[offset] != item.token)
+      const auto place = [&](const Media& item, std::size_t end_row) {
+        while (offset < end_row && ids[offset] != item.token)
           ++offset;
-        const auto rows = item.rows.size() / m.host.config.hidden;
-        if (rows > ids.size() - offset ||
+        const auto rows = item.rows.size() / H;
+        if (rows > end_row - offset ||
             !std::all_of(ids.begin() + offset, ids.begin() + offset + rows,
                          [&](auto id) { return id == item.token; }))
           throw std::runtime_error(
               "media placeholder count differs from embeddings");
         std::copy(item.rows.begin(), item.rows.end(),
-                  embeddings.begin() + offset * m.host.config.hidden);
+                  embeddings.begin() + offset * H);
         offset += rows;
       };
-      for (const auto& item : media)
-        place(item);
-      for (std::size_t q = first; q < first + count; ++q)
-        for (const auto& item : voices[q])
-          place(item);
+      std::size_t start = 0;
+      for (auto i = begin; i < end; ++i) {
+        const auto stop = start + packs[i].prompt.tokens.size();
+        offset = start;
+        if (packs[i].media) {
+          for (const auto& item : media)
+            place(item, stop);
+          for (auto q = packs[i].first; q < packs[i].first + packs[i].count;
+               ++q)
+            for (const auto& item : voices[q])
+              place(item, stop);
+        }
+        start = stop;
+      }
     }
-    std::vector<float> logits(prompt.slots.size() * vocabulary.size());
+    std::vector<float> logits(slots * vocabulary.size());
     std::string error;
-    if (count == 1 && !own_questions[0].IsBox()) {
-      // set_size=1 primitives retain the established single-slot readout.
-      full_logits.resize(m.host.config.vocab);
-      if (!m.session->ForwardDecision(ids, embeddings, full_logits, &error))
-        throw std::runtime_error(error);
-      for (std::size_t i = 0; i < vocabulary.size(); ++i)
-        logits[i] = full_logits[vocabulary[i]];
-    } else if (!m.session->ForwardDecision(ids, embeddings, prompt.groups,
-                                           prompt.slots, vocabulary, logits,
-                                           &error))
+    if (!m.session->ForwardDecisions(ids, embeddings, prompts, vocabulary,
+                                     logits, &error))
       throw std::runtime_error(error);
     std::size_t slot = 0;
-    for (const auto& q : own_questions) {
-      auto own_logits = std::span(logits).subspan(
-          slot * vocabulary.size(), q.Slots() * vocabulary.size());
-      answers[q.name] = q.IsBox() ? ReadBoxes(q, own_logits, vocabulary.size())
-                                  : ReadAnswer(q, own_logits);
-      slot += q.Slots();
-    }
-    input_tokens += ids.size();
+    for (auto i = begin; i < end; ++i)
+      for (const auto& q :
+           std::span(questions).subspan(packs[i].first, packs[i].count)) {
+        auto own_logits = std::span(logits).subspan(
+            slot * vocabulary.size(), q.Slots() * vocabulary.size());
+        answers[q.name] = q.IsBox()
+                              ? ReadBoxes(q, own_logits, vocabulary.size())
+                              : ReadAnswer(q, own_logits);
+        slot += q.Slots();
+      }
+    input_tokens += rows;
+    begin = end;
   }
   auto result = Value::object();
   result["answers"] = answers;

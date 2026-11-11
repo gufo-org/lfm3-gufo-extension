@@ -56,6 +56,23 @@ public:
                        std::span<const std::uint32_t> positions,
                        std::span<const std::uint32_t> vocabulary,
                        std::span<float> logits, std::string* error = nullptr);
+  // One d1 prompt of ForwardDecisions: rows consecutive input rows, its
+  // groups (as above; empty for one bidirectional prompt) and answer
+  // positions within the prompt.
+  struct DecisionPrompt {
+    std::size_t rows;
+    std::span<const std::int32_t> groups;
+    std::span<const std::uint32_t> positions;
+  };
+  // Independent d1 prompts, side by side in tokens/embeddings, in one pass
+  // (at most the session context rows): each starts from empty state at
+  // position 0 and matches its own ForwardDecision. logits is
+  // [all positions][vocabulary.size() or config.vocab], in prompt order.
+  bool ForwardDecisions(std::span<const std::uint32_t> tokens,
+                        std::span<const float> embeddings,
+                        std::span<const DecisionPrompt> prompts,
+                        std::span<const std::uint32_t> vocabulary,
+                        std::span<float> logits, std::string* error = nullptr);
   // Advances text tokens and optionally returns the final logits.
   // State is session-owned; device weights are shared by sessions.
   bool Forward(std::span<const std::uint32_t> tokens,
