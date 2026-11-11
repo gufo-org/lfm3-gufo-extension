@@ -33,7 +33,9 @@ std::string ProjectionProgram(const ProjectionShape& shape);
 // K-split shapes over several blocks: each weight record is applied to
 // KSplitBlocksPerPass blocks held at once. Root is ProjectionRoot + "_kmulti".
 std::uint32_t KSplitBlocksPerPass(const ProjectionShape& shape);
-std::string ProjectionKMultiProgram(const ProjectionShape& shape);
+// With `chain`, the eight column partial sums are added on chip and y holds
+// one part (ProjectionProgram's row-split layout); root suffix "_kchain".
+std::string ProjectionKMultiProgram(const ProjectionShape& shape, bool chain = false);
 
 constexpr std::uint32_t kColumns = 8;
 // func.def inline @<name>(x view, record view, first x tile, acc) -> acc:

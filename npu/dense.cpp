@@ -34,9 +34,10 @@ struct Dense::Impl {
   int Kernel(ProjectionShape s) {
     const auto key = std::make_tuple(s.k, s.m, s.blocks, int(s.split));
     if (auto it = kernels.find(key); it != kernels.end()) return it->second;
-    // K split over several blocks: each weight record serves the blocks held at once.
-    const bool multi = s.split == Split::kColumns && s.blocks > 1 && KSplitBlocksPerPass(s) > 1;
-    const int id = multi ? npu.Compile(ProjectionKMultiProgram(s), "projection.loom", ProjectionRoot(s) + "_kmulti")
+    // K split: each weight record serves every block held at once, and the
+    // columns add their partial sums on chip (one output part).
+    const bool chain = s.split == Split::kColumns;
+    const int id = chain ? npu.Compile(ProjectionKMultiProgram(s, true), "projection.loom", ProjectionRoot(s) + "_kchain")
                          : npu.Compile(ProjectionProgram(s), "projection.loom", ProjectionRoot(s));
     kernels.emplace(key, id);
     return id;
@@ -105,7 +106,7 @@ void Dense::Run(const Matrix& w, std::span<const float> x, std::uint32_t rows, s
   auto& m = *impl_;
   std::lock_guard lock(m.mutex);
   const std::uint32_t kp = w.shape.k, mp = w.shape.m;
-  const std::uint32_t parts = w.shape.split == Split::kColumns ? kColumns : 1;
+  const std::uint32_t parts = 1;  // K-split matrices sum their columns on chip
   for (std::uint32_t row0 = 0; row0 < rows;) {
     const std::uint32_t remaining = (rows - row0 + 7) / 8;
     const std::uint32_t blocks = DispatchBlocks(std::min(remaining, kMaxBlocks));

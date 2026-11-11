@@ -141,17 +141,17 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
         const Tensor* in[] = {&l.in_proj};
         const Tensor* out[] = {&l.out_proj};
         p.in = m.Make(in, true);  // K split: prompt blocks share each weight record
-        p.out = m.Make(out);
+        p.out = m.Make(out, true);
       } else {
         const Tensor* qkvg[] = {&l.q, &l.k, &l.v, &l.attn_gate};
         const Tensor* out[] = {&l.attn_out};
-        p.qkvg = m.Make(qkvg);
-        p.out = m.Make(out);
+        p.qkvg = m.Make(qkvg, true);
+        p.out = m.Make(out, true);
       }
       const Tensor* gateup[] = {&l.gate, &l.up};
       const Tensor* down[] = {&l.down};
       // K split: prompt passes then stream the weights once for every block
-      // held at once (SwiGLU sums the eight partials); decode costs the same.
+      // held at once; decode costs the same.
       p.gateup = m.Make(gateup, true);
       p.down = m.Make(down);
     }
@@ -636,7 +636,7 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
       const auto& p = layers[il];
       if (c.layers[il] == LayerType::kConvolution) {
         timed("proj in", [&] { dense->Enqueue(p.in, d.xb2048, d.y_proj, blocks); });
-        const bool cpart = p.in.shape.split == Split::kColumns;
+        const bool cpart = false;  // K-split projections sum their columns on chip
         const std::string cn = cpart ? "convp_dyn" : "conv_dyn";
         const int conv = d.Kernel(cn, [&] { return ConvProgram(H, Lw, Device::kMaxRows, Device::kSlots, cn, cpart); },
                                   "@" + cn);
@@ -682,24 +682,19 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
       }
       timed("proj gateup", [&] { dense->Enqueue(p.gateup, d.xb2048, d.y_proj, blocks); });
       {
-        const int k = row_kernel(SwiGluPackKernel(I, R8, p.gateup.shape.split == Split::kColumns));
+        const int k = row_kernel(SwiGluPackKernel(I, R8, false));
         const int b[] = {d.y_proj, d.xb_ffn, d.count};
         timed("swiglu", [&] { npu.Enqueue(k, b); });
       }
       timed("proj down", [&] { dense->Enqueue(p.down, d.xb_ffn, d.y_down, blocks); });
       {
-        const int k = row_kernel(ReducePartialKernel(H, R8));
-        const int b[] = {d.y_down, d.o, d.count};
-        timed("reduce", [&] { npu.Enqueue(k, b); });
-      }
-      {
         const bool last = il + 1 == c.layers.size();
-        const int k = row_kernel(NormPackKernel(H, R8, Residual::kRows, true, last, c.eps));
+        const int k = row_kernel(NormPackKernel(H, R8, Residual::kBlocked, true, last, c.eps));
         if (last) {
-          const int b[] = {x, d.o, d.w_ffn[il], d.xb2048, d.z, d.count};
+          const int b[] = {x, d.y_down, d.w_ffn[il], d.xb2048, d.z, d.count};
           timed("norm (ffn)", [&] { npu.Enqueue(k, b); });
         } else {
-          const int b[] = {x, d.o, d.w_ffn[il], x2, d.xb2048, d.count};
+          const int b[] = {x, d.y_down, d.w_ffn[il], x2, d.xb2048, d.count};
           timed("norm (ffn)", [&] { npu.Enqueue(k, b); });
         }
         std::swap(x, x2);

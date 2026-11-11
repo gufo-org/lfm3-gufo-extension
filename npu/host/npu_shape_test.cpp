@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
                        std::uint32_t(std::stoul(argv[i + 2]))});
   }
   int failures = 0;
+  const bool chain = std::getenv("CHAIN") != nullptr;  // K-multi with on-chip column sums
   for (const auto& c : cases) {
     auto shape = g::PlanProjection(c.k, c.m, c.blocks);
     if (std::getenv("FORCEK") && shape.split == g::Split::kRows) {  // K split at any K (multiple of 512)
@@ -38,13 +39,13 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     int kernel;
     try {
-      const bool kmulti = std::getenv("KMULTI") && c.blocks > 1 && shape.split == g::Split::kColumns;
-      std::string program = kmulti ? g::ProjectionKMultiProgram(shape) : std::string();
+      const bool kmulti = (chain || (std::getenv("KMULTI") && c.blocks > 1)) && shape.split == g::Split::kColumns;
+      std::string program = kmulti ? g::ProjectionKMultiProgram(shape, chain) : std::string();
       if (const char* f = std::getenv("KM_FILE")) {  // experiment: a hand-edited program
         std::ifstream in(f);
         program.assign(std::istreambuf_iterator<char>(in), {});
       }
-      kernel = kmulti ? npu.Compile(program, "projection.loom", g::ProjectionRoot(shape) + "_kmulti")
+      kernel = kmulti ? npu.Compile(program, "projection.loom", g::ProjectionRoot(shape) + (chain ? "_kchain" : "_kmulti"))
                       : npu.Compile(g::ProjectionProgram(shape), "projection.loom", g::ProjectionRoot(shape));
     } catch (const std::exception& e) {
       std::printf("%s: %s\n", g::ProjectionRoot(shape).c_str(), e.what());
@@ -68,7 +69,7 @@ int main(int argc, char** argv) {
     for (std::uint32_t b = 0; b < c.blocks; ++b)
       PackActivations(std::span(x).subspan(std::size_t(b) * 8 * shape.k, 8 * shape.k), 8, shape.k,
                       std::span(xb).subspan(std::size_t(b) * 8 * shape.k, 8 * shape.k));
-    const std::uint32_t parts = split == Split::kColumns ? 8 : 1;
+    const std::uint32_t parts = split == Split::kColumns && !chain ? 8 : 1;
     const int bx = npu.Upload(std::span<const std::uint16_t>(xb));
     const int bw = npu.Upload(std::span<const std::uint8_t>(weights));
     const std::size_t block_out = std::size_t(parts) * shape.m * 8;
@@ -84,6 +85,25 @@ int main(int argc, char** argv) {
     for (std::uint32_t b = 0; b < c.blocks; ++b)
       UnpackOutputs(std::span(blocked).subspan(b * block_out, block_out), 8, c.m,
                     std::span(y).subspan(std::size_t(b) * 8 * c.m, 8 * c.m), parts, shape.m);
+    if (chain && std::getenv("CMP")) {  // chain against the eight-part kernel, both on the device
+      const int k8 = npu.Compile(c.blocks > 1 ? g::ProjectionKMultiProgram(shape) : g::ProjectionProgram(shape), "projection.loom",
+                                 g::ProjectionRoot(shape) + (c.blocks > 1 ? "_kmulti" : ""));
+      const std::size_t bo8 = std::size_t(8) * shape.m * 8;
+      const int by8 = npu.Alloc(bo8 * c.blocks * 4);
+      const int bind8[] = {bx, bw, by8};
+      npu.Dispatch(k8, bind8);
+      std::vector<float> b8(bo8 * c.blocks), y8(std::size_t(R) * c.m);
+      npu.Read(by8, 0, b8.data(), b8.size() * 4);
+      for (std::uint32_t b = 0; b < c.blocks; ++b)
+        UnpackOutputs(std::span(b8).subspan(b * bo8, bo8), 8, c.m, std::span(y8).subspan(std::size_t(b) * 8 * c.m, 8 * c.m), 8, shape.m);
+      double d = 0, mx = 0, rel = 0;
+      for (std::size_t i = 0; i < y.size(); ++i) {
+        d = std::max(d, double(std::abs(y[i] - y8[i])));
+        mx = std::max(mx, double(std::abs(y8[i])));
+        if (std::abs(y8[i]) > 1e-3) rel = std::max(rel, double(std::abs(y[i] - y8[i]) / std::abs(y8[i])));
+      }
+      std::printf("chain vs parts: max abs diff %.3g of %.3g, max rel %.3g\n", d, mx, rel);
+    }
     const std::uint32_t tiles = shape.k / 8, groups = shape.m / 8;
     double worst = 0, scale = 0;
     for (std::uint32_t r = 0; r < c.m; r += std::max(1u, c.m / 256)) {

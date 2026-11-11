@@ -1,6 +1,8 @@
 #include "program.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <initializer_list>
 #include <cstdlib>
 #include <stdexcept>
 #include <utility>
@@ -152,7 +154,7 @@ func.def inline @@NAME(%x: view<@XEBxi8>, %w: view<@WSBxi8>, %wbase: index, %til
 // each weight chunk loads once and feeds every block's accumulator (the
 // chains are independent, so consecutive matrix ops overlap).
 std::string TileLoopBlocks(const std::string& name, std::uint32_t record_tiles, std::uint32_t x_tiles,
-                           std::uint32_t blocks, std::uint32_t resident) {
+                           std::uint32_t blocks, std::uint32_t resident, bool with_init = false) {
   std::string body, iters, yields, types, results, args;
   for (std::uint32_t b = 0; b < blocks; ++b) {
     const std::string B = S(b);
@@ -164,7 +166,8 @@ std::string TileLoopBlocks(const std::string& name, std::uint32_t record_tiles, 
 )",
                     {{"@XO", S(std::uint64_t(b) * x_tiles * 72)}, {"@B", B}, {"@XEB", S(std::uint64_t(resident) * x_tiles * 72)},
                      {"@GB", S(kPer * 72)}});
-    iters += (b ? ", %a" : "%a") + B + "_0 = %zinit : vector<64xf32>";
+    iters += (b ? ", %a" : "%a") + B + "_0 = " + (with_init ? "%i" + B : std::string("%zinit")) + " : vector<64xf32>";
+    args += ", %i" + B + ": vector<64xf32>";
     types += b ? ", vector<64xf32>" : "vector<64xf32>";
     results += (b ? ", %r" : "%r") + B;
     yields += (b ? ", %a" : "%a") + B + "_" + S(kPer);
@@ -185,7 +188,7 @@ std::string TileLoopBlocks(const std::string& name, std::uint32_t record_tiles, 
     }
   }
   return Replace(R"(
-func.def inline @@NAME(%x: view<@XEBxi8>, %w: view<@WSBxi8>, %wbase: index, %xbase: index) -> (@TYPES) {
+func.def inline @@NAME(%x: view<@XEBxi8>, %w: view<@WSBxi8>, %wbase: index, %xbase: index@ARGS) -> (@TYPES) {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c8 = index.constant 8 : index
@@ -207,7 +210,28 @@ func.def inline @@NAME(%x: view<@XEBxi8>, %w: view<@WSBxi8>, %wbase: index, %xba
 )",
                  {{"@NAME", name}, {"@XEB", S(std::uint64_t(resident) * x_tiles * 72)}, {"@WSB", S(record_tiles * 72)},
                   {"@PER", S(kPer)}, {"@GB", S(kPer * 72)}, {"@CHUNKS", S(record_tiles / kPer)}, {"@SCHEMA", kSchema},
-                  {"@BODY", body}, {"@RESULTS", results}, {"@ITERS", iters}, {"@TYPES", types}, {"@YIELDS", yields}});
+                  {"@BODY", body}, {"@RESULTS", results}, {"@ITERS", iters}, {"@TYPES", types}, {"@YIELDS", yields},
+                  {"@ARGS", with_init ? args : std::string()}});
+}
+
+// Appends `suffix` to every SSA name in `text` except `keep`.
+std::string SuffixNames(const std::string& text, const std::string& suffix, std::initializer_list<const char*> keep) {
+  std::string out;
+  out.reserve(text.size() + text.size() / 8);
+  for (std::size_t p = 0; p < text.size();) {
+    if (text[p] == '%' && p + 1 < text.size() && (std::isalnum(static_cast<unsigned char>(text[p + 1])) || text[p + 1] == '_')) {
+      std::size_t q = p + 1;
+      while (q < text.size() && (std::isalnum(static_cast<unsigned char>(text[q])) || text[q] == '_')) ++q;
+      const std::string name = text.substr(p, q - p);
+      bool kept = false;
+      for (const char* k : keep) kept |= name == k;
+      out += kept ? name : name + suffix;
+      p = q;
+    } else {
+      out += text[p++];
+    }
+  }
+  return out;
 }
 }  // namespace
 
@@ -422,7 +446,7 @@ Staging PlanStaging(const ProjectionShape& s) {
 
 std::uint32_t KSplitBlocksPerPass(const ProjectionShape& s) { return PlanStaging(s).bp; }
 
-std::string ProjectionKMultiProgram(const ProjectionShape& s) {
+std::string ProjectionKMultiProgram(const ProjectionShape& s, bool chain) {
   // K split for several row blocks: column c holds K / 8 of `bp` blocks'
   // activations and applies each weight record to all of them, so the
   // weights stream blocks / bp times instead of `blocks` times. Layouts as
@@ -441,7 +465,11 @@ std::string ProjectionKMultiProgram(const ProjectionShape& s) {
   const std::string rec = S(R * record_tiles * 72) + "xi8", rtile = "tile<" + rec + ">";
   const std::string xr = S(std::uint64_t(nb) * ct * 64) + "xbf16", xt = "tile<" + xr + ">";
   const std::string dot = "dot_x" + S(x_tiles) + "_r" + S(record_tiles);
-  const std::string name = ProjectionRoot(s).substr(1) + "_kmulti";
+  const std::string name = ProjectionRoot(s).substr(1) + (chain ? "_kchain" : "_kmulti");
+  // With `chain`, column c seeds its accumulators with column c - 1's sums
+  // (read from that neighbour's tile) and only column 7 writes, so the
+  // output holds one part instead of eight partial sums.
+  const std::uint32_t parts = chain ? 1 : kColumns;
   const std::string column = Replace(R"(
 pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {
   %x_unique, %w_unique, %y_unique = buffer.assume.noalias %x_arg, %w_arg, %y_arg : buffer, buffer, buffer
@@ -463,7 +491,7 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
   %column_tiles = index.constant @XTILES : index
   %x_column = index.mul %column, %column_tiles : index
   %first_record = index.mul %column, %groups : index
-  %out_column = index.mul %column, %groups : index
+  %out_column = index.mul @OUTCOL, %groups : index
   %block_outputs = index.constant @BLOCKOUT : index
   %memory = pipeline.memory<workgroup>[%column, 3] : pool
   %x_size = index.constant @XBYTES : offset
@@ -528,7 +556,7 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
     }
   }
 
-  pipeline.strand workers([%column, 4], [1, 1], [1, 1]) {
+@STORER_BEGIN  pipeline.strand workers([%column, 4], [1, 1], [1, 1]) {
     scf.for %pass = [%c0 to %passes step %c1] {
       %blk0 = index.mul %pass, %bp : index
       scf.for %g = [%c0 to %groups step %c1] {
@@ -549,7 +577,7 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
       }
     }
   }
-
+@STORER_END
 
   pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {
     %c8 = index.constant 8 : index
@@ -589,7 +617,7 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
         %w_read, %w_values = channel.acquire %w_channel : channel<@RT> -> (read<@RT>, view<@REC>)
         scf.for %r = [%c0 to %rper step %c1] {
           %wb = index.mul %r, %rtb : index
-          %y_write, %y_rec = channel.reserve %y_channel : channel<tile<@BPx64xf32>> -> (write<tile<@BPx64xf32>>, view<@BPx64xf32>)
+#WACQ#          %y_write, %y_rec = channel.reserve %y_channel : channel<tile<@BPx64xf32>> -> (write<tile<@BPx64xf32>>, view<@BPx64xf32>)
 #BLOCKS#@PERBLOCK_BEGIN          scf.for %b = [%c0 to %bp step %c1] {
             %zero = vector.splatf 0.0 : vector<64xf32>
             %init = vector.fragment<init> %zero shape [%c8, %c8] : vector<64xf32>
@@ -600,6 +628,7 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
             vector.fragment.store<result> %acc, %y_values[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>
           }
 @PERBLOCK_END          channel.publish %y_write : write<tile<@BPx64xf32>>
+#WREL#
         }
         channel.release %w_read : read<@RT>
       }
@@ -611,14 +640,15 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
                                      {{"@COL", name + "_col"}, {"@PASSES", S(passes)}, {"@BP", S(bp)},
                                       {"@GROUPS", S(groups)}, {"@RECBYTES", S(record_tiles * 72)},
                                       {"@XTILES", S(x_tiles)}, {"@TILES", S(tiles)},
-                                      {"@BLOCKOUT", S(std::uint64_t(groups) * kColumns)},
+                                      {"@BLOCKOUT", S(std::uint64_t(groups) * parts)},
+                                      {"@OUTCOL", chain ? "%c0" : "%column"},
                                       {"@XBYTES", S(std::uint64_t(st.slots) * nb * ct * 128)}, {"@NQ", S(nq)}, {"@CT", S(ct)},
                                       {"@XSLOTS", S(st.slots)}, {"@NB", S(nb)}, {"@BCHUNKS", S(bp / nb)},
                                       {"@RINGBYTES", S(2ull * R * record_tiles * 72)},
                                       {"@BSTRIDE", S(std::uint64_t(tiles) * 64)},
                                       {"@XR", xr}, {"@XT", xt}, {"@REC", rec}, {"@RT", rtile},
-                                      {"@DOT", dot}, {"@YBYTES", S(2ull * bp * 256)}, {"@BSF", S(std::uint64_t(groups) * kColumns * 64)},
-                                      {"@BST", S(std::uint64_t(groups) * kColumns)}, {"@RPER", S(R)}, {"@NSLOTS", S(groups / R)}, {"@ZRTB", S(record_tiles * 72)}, {"@XEBYTES", S(enc ? (std::uint64_t(bp) * x_tiles * 72 + 63) / 64 * 64 : 64)},
+                                      {"@DOT", dot}, {"@YBYTES", S(2ull * bp * 256)}, {"@BSF", S(std::uint64_t(groups) * parts * 64)},
+                                      {"@BST", S(std::uint64_t(groups) * parts)}, {"@RPER", S(R)}, {"@NSLOTS", S(groups / R)}, {"@ZRTB", S(record_tiles * 72)}, {"@XEBYTES", S(enc ? (std::uint64_t(bp) * x_tiles * 72 + 63) / 64 * 64 : 64)},
                                       {"@XEN", S(enc ? std::uint64_t(bp) * x_tiles * 72 : 64)},
                                       {"@SCHEMA", kSchema}});
   std::string compose;
@@ -631,30 +661,63 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
       const auto pa = body.find("@PERBLOCK_BEGIN"), pb = body.find("@PERBLOCK_END");
       body = enc ? body.erase(pa, pb + 13 - pa) : body.erase(pb, 13).erase(pa, 15);
     }
-    std::string blocks_call;
     const std::uint32_t per_call = std::min<std::uint32_t>(bp, 4);  // accumulators: 4 registers each, 20 available
-    if (enc) {
+    auto blocks_call = [&](bool west) {
+      std::string text;
+      if (chain && !west) text += "            %zv = vector.splatf 0.0 : vector<64xf32>\n            %zi = vector.fragment<init> %zv shape [%c8, %c8] : vector<64xf32>\n";
       for (std::uint32_t b0 = 0; b0 < bp; b0 += per_call) {
-        std::string res, types, stores;
+        std::string res, types, stores, inits, init_types;
         for (std::uint32_t b = b0; b < b0 + per_call; ++b) {
-          res += (b > b0 ? ", %acc" : "%acc") + S(b);
+          const std::string B = S(b);
+          res += (b > b0 ? ", %acc" : "%acc") + B;
           types += b > b0 ? ", vector<64xf32>" : "vector<64xf32>";
-          stores += "            %ys" + S(b) + " = view.subview %y_rec[" + S(b) + ", 0] : view<" + S(bp) + "x64xf32> -> view<1x64xf32>\n" +
-                    "            %yv" + S(b) + " = view.bitcast %ys" + S(b) + " : view<1x64xf32> -> view<8x8xf32>\n" +
-                    "            vector.fragment.store<result> %acc" + S(b) + ", %yv" + S(b) + "[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>\n";
+          stores += "            %ys" + B + " = view.subview %y_rec[" + B + ", 0] : view<" + S(bp) + "x64xf32> -> view<1x64xf32>\n" +
+                    "            %yv" + B + " = view.bitcast %ys" + B + " : view<1x64xf32> -> view<8x8xf32>\n" +
+                    "            vector.fragment.store<result> %acc" + B + ", %yv" + B + "[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>\n";
+          if (chain) {
+            if (west)
+              text += "            %ws" + B + " = view.subview %west_rec[" + B + ", 0] : view<" + S(bp) + "x64xf32> -> view<1x64xf32>\n" +
+                      "            %wv" + B + " = view.bitcast %ws" + B + " : view<1x64xf32> -> view<64xf32>\n" +
+                      "            %wl" + B + " = vector.load %wv" + B + "[%c0] : view<64xf32> -> vector<64xf32>\n" +
+                      "            %wi" + B + " = vector.fragment<init> %wl" + B + " shape [%c8, %c8] : vector<64xf32>\n";
+            inits += west ? ", %wi" + B : std::string(", %zi");
+            init_types += ", vector<64xf32>";
+          }
         }
-        blocks_call += "            %xb" + S(b0) + " = index.constant " + S(std::uint64_t(b0) * x_tiles * 72) + " : index\n            " + res +
-                       " = func.call @" + dot + "(%xe, %w_values, %wb, %xb" + S(b0) + ") : (view<" +
-                       S(std::uint64_t(bp) * x_tiles * 72) + "xi8>, view<" + rec + ">, index, index) -> (" + types + ")\n" + stores;
+        text += "            %xb" + S(b0) + " = index.constant " + S(std::uint64_t(b0) * x_tiles * 72) + " : index\n            " + res +
+                " = func.call @" + dot + "(%xe, %w_values, %wb, %xb" + S(b0) + inits + ") : (view<" +
+                S(std::uint64_t(bp) * x_tiles * 72) + "xi8>, view<" + rec + ">, index, index" + init_types + ") -> (" + types + ")\n" + stores;
       }
-    }
-    body = Replace(body, {{"#BLOCKS#", blocks_call}});
+      return text;
+    };
     body = Replace(body, {{"#DOTCALL#", enc ? "            %acc = func.call @" + dot + "(%xe, %w_values, %wb, %xo, %init) : (view<" +
                                                 S(std::uint64_t(bp) * x_tiles * 72) + "xi8>, view<" + rec +
                                                 ">, index, index, vector<64xf32>) -> (vector<64xf32>)"
                                           : "            %acc = func.call @" + dot + "(%x_bf, %w_values, %xo, %init) : (view<" +
                                                 S(std::uint64_t(bp) * x_tiles * 64) + "xbf16>, view<" + rec +
                                                 ">, index, vector<64xf32>) -> (vector<64xf32>)"}});
+    if (!chain) {
+      body = Replace(body, {{"#BLOCKS#", blocks_call(false)}, {"#WACQ#", ""}, {"#WREL#", ""}, {"@STORER_BEGIN", ""}, {"@STORER_END", ""}});
+    } else {
+      // One flat definition: each column's body with its own SSA names.
+      const std::string yt = "tile<" + S(bp) + "x64xf32>";
+      const auto open = body.find("{\n", body.find("pipeline.def<kernel> @")) + 2;
+      const auto close = body.rfind("}");
+      const std::string inner = body.substr(open, close - open);
+      std::string flat;
+      for (std::uint32_t c = 0; c < kColumns; ++c) {
+        std::string t = "  %column = index.constant " + S(c) + " : index\n" + inner;
+        const auto sa = t.find("@STORER_BEGIN"), sb = t.find("@STORER_END");
+        t = c + 1 == kColumns ? t.erase(sb, 11).erase(sa, 13) : t.erase(sa, sb + 11 - sa);
+        t = Replace(t, {{"#BLOCKS#", blocks_call(c > 0)},
+                        {"#WACQ#", c ? "          %west_read, %west_rec = channel.acquire #WEST# : channel<" + yt + "> -> (read<" + yt + ">, view<" + S(bp) + "x64xf32>)\n" : ""},
+                        {"#WREL#", c ? "          channel.release %west_read : read<" + yt + ">\n" : ""}});
+        t = SuffixNames(t, "_k" + S(c), {"%x_arg", "%w_arg", "%y_arg"});
+        flat += Replace(t, {{"#WEST#", "%y_channel_k" + S(c - 1)}});
+      }
+      return "aie2p.target<array> @npu\n" + TileLoopBlocks(dot, record_tiles, x_tiles, per_call, bp, true) +
+             "\npipeline.def<kernel> public retain target(@npu) @" + name + "() run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {\n" + flat + "}\n";
+    }
   }
   if (!enc && R != 1) throw std::invalid_argument("K-multi without encoded activations needs one record per slot");
   return "aie2p.target<array> @npu\n" + (enc ? TileLoopBlocks(dot, record_tiles, x_tiles, std::min<std::uint32_t>(bp, 4), bp) : TileLoop(dot, record_tiles, bp * x_tiles)) + body +
