@@ -55,7 +55,8 @@ class Backbone {
   void Head(std::span<const float> hidden, std::uint32_t n, std::span<float> logits);
   const Config& config() const;
 
-  static constexpr std::uint32_t kRows = 8;
+  // Rows per pass: they share each weight read.
+  static constexpr std::uint32_t kRows = 64;
 
  private:
   Backbone();

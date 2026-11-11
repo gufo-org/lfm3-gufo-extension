@@ -4,27 +4,12 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
-#include <string_view>
 
+#include "dense.hpp"
 #include "host/bfp.hpp"
-#include "host/npu_runtime.hpp"
 
 namespace gufo::models::lfm3::npu {
 namespace {
-
-constexpr std::string_view kProgram =
-#include "lfm3_proj.inc"
-    ;
-
-constexpr std::uint32_t kQkvgRows = 3136;  // q 2048 + k 512 + v 512 + gate 16, padded
-using ::lfm3::npu::Split;
-
-// A projection: encoded weights on the NPU and the kernel that reads them.
-struct Projection {
-  int kernel{-1}, weights{-1};
-  std::uint32_t k{}, m{}, padded{};
-  Split split{Split::kRows};
-};
 
 const float* Floats(const Tensor& t) { return static_cast<const float*>(t.data); }
 
@@ -48,76 +33,16 @@ void State::Reset() {
 
 struct Backbone::Impl {
   const Weights* w{};
-  std::unique_ptr<::lfm3::npu::Runtime> npu;
+  Dense* dense{};
   struct Layer {
-    Projection in, out, qkvg, gateup, down;
+    Dense::Matrix in, out, qkvg, gateup, down;
   };
   std::vector<Layer> layers;
-  Projection head;
-  // Activation and output buffers per K and per output shape.
-  int x2048{-1}, x7680{-1};
-  std::vector<std::pair<std::uint32_t, int>> outputs;  // padded rows x parts -> buffer
-  std::vector<std::uint16_t> xb;
-  std::vector<float> yb;
+  Dense::Matrix head;
 
-  int Kernel(std::uint32_t k, std::uint32_t m, Split split) {
-    const std::string root = split == Split::kRows
-                                 ? "@proj_m_k" + std::to_string(k) + "_m" + std::to_string(m)
-                                 : "@proj_k_k" + std::to_string(k) + "_m" + std::to_string(m);
-    for (const auto& l : layers)
-      for (const auto* p : {&l.in, &l.out, &l.qkvg, &l.gateup, &l.down})
-        if (p->kernel >= 0 && p->k == k && p->padded == m && p->split == split) return p->kernel;
-    if (head.kernel >= 0 && head.k == k && head.padded == m) return head.kernel;
-    return npu->Compile(kProgram, "lfm3_proj.loom", root);
-  }
-
-  int Output(std::uint32_t padded, std::uint32_t parts) {
-    const std::uint32_t key = padded * 16 + parts;
-    for (auto& [k, id] : outputs)
-      if (k == key) return id;
-    const int id = npu->Alloc(std::uint64_t(parts) * padded * 8 * 4);
-    outputs.emplace_back(key, id);
-    return id;
-  }
-
-  // rows: [r][tensor rows] from consecutive tensors.
-  Projection Make(std::span<const Tensor* const> tensors, std::uint32_t padded, Split split) {
-    Projection p;
-    p.k = tensors[0]->cols;
-    p.split = split;
-    for (const auto* t : tensors) {
-      if (t->cols != p.k) throw std::runtime_error("NPU projection with mixed K");
-      p.m += t->rows;
-    }
-    p.padded = padded ? padded : p.m;
-    p.kernel = Kernel(p.k, p.padded, split);
-    auto bytes = ::lfm3::npu::PackWeights(p.m, p.k, p.padded, split, [&](std::uint32_t r, std::span<float> out) {
-      for (const auto* t : tensors) {
-        if (r < t->rows) return DecodeRow(*t, r, out);
-        r -= t->rows;
-      }
-    });
-    p.weights = npu->Alloc(bytes.size());
-    constexpr std::size_t kChunk = 64u << 20;
-    for (std::size_t off = 0; off < bytes.size(); off += kChunk)
-      npu->Write(p.weights, off, bytes.data() + off, std::min(kChunk, bytes.size() - off));
-    Output(p.padded, split == Split::kColumns ? 8 : 1);
-    return p;
-  }
-
-  // y[r][m] = W x[r] for rows r < n (n <= 8).
-  void Run(const Projection& p, std::span<const float> x, std::uint32_t n, std::span<float> y) {
-    const int xbuf = p.k == 2048 ? x2048 : x7680;
-    xb.resize(std::size_t(p.k) * 8);
-    ::lfm3::npu::PackActivations(x, n, p.k, xb);
-    npu->Write(xbuf, 0, xb.data(), xb.size() * 2);
-    const std::uint32_t parts = p.split == Split::kColumns ? 8 : 1;
-    const int ybuf = Output(p.padded, parts);
-    const int bind[] = {xbuf, p.weights, ybuf};
-    npu->Dispatch(p.kernel, bind);
-    yb.resize(std::size_t(parts) * p.padded * 8);
-    npu->Read(ybuf, 0, yb.data(), yb.size() * 4);
-    ::lfm3::npu::UnpackOutputs(yb, n, p.m, y, parts, p.padded);
+  Dense::Matrix Make(std::span<const Tensor* const> tensors) { return dense->Upload(tensors); }
+  void Run(const Dense::Matrix& p, std::span<const float> x, std::uint32_t n, std::span<float> y) {
+    dense->Run(p, x, n, y);
   }
 };
 
@@ -128,14 +53,10 @@ const Config& Backbone::config() const { return impl_->w->config; }
 std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
   try {
     const auto& c = w.config;
-    if (c.hidden != 2048 || c.intermediate != 7680 || c.heads * c.head_dim != 2048)
-      throw std::runtime_error("NPU backbone supports the LFM3 1.7B/2B shape only");
     auto b = std::unique_ptr<Backbone>(new Backbone);
     auto& m = *b->impl_;
     m.w = &w;
-    m.npu = std::make_unique<::lfm3::npu::Runtime>();
-    m.x2048 = m.npu->Alloc(2048 * 8 * 2);
-    m.x7680 = m.npu->Alloc(7680 * 8 * 2);
+    m.dense = &Dense::Shared();
     m.layers.resize(c.layers.size());
     for (std::size_t i = 0; i < c.layers.size(); ++i) {
       const auto& l = w.layers[i];
@@ -143,21 +64,21 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       if (c.layers[i] == LayerType::kConvolution) {
         const Tensor* in[] = {&l.in_proj};
         const Tensor* out[] = {&l.out_proj};
-        p.in = m.Make(in, 0, Split::kRows);
-        p.out = m.Make(out, 0, Split::kRows);
+        p.in = m.Make(in);
+        p.out = m.Make(out);
       } else {
         const Tensor* qkvg[] = {&l.q, &l.k, &l.v, &l.attn_gate};
         const Tensor* out[] = {&l.attn_out};
-        p.qkvg = m.Make(qkvg, kQkvgRows, Split::kRows);
-        p.out = m.Make(out, 0, Split::kRows);
+        p.qkvg = m.Make(qkvg);
+        p.out = m.Make(out);
       }
       const Tensor* gateup[] = {&l.gate, &l.up};
       const Tensor* down[] = {&l.down};
-      p.gateup = m.Make(gateup, 0, Split::kRows);
-      p.down = m.Make(down, 0, Split::kColumns);
+      p.gateup = m.Make(gateup);
+      p.down = m.Make(down);
     }
     const Tensor* head[] = {&w.output};
-    m.head = m.Make(head, 0, Split::kRows);
+    m.head = m.Make(head);
     return b;
   } catch (const std::exception& e) {
     if (error) *error = e.what();
