@@ -140,7 +140,7 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       if (c.layers[i] == LayerType::kConvolution) {
         const Tensor* in[] = {&l.in_proj};
         const Tensor* out[] = {&l.out_proj};
-        p.in = m.Make(in);
+        p.in = m.Make(in, true);  // K split: prompt blocks share each weight record
         p.out = m.Make(out);
       } else {
         const Tensor* qkvg[] = {&l.q, &l.k, &l.v, &l.attn_gate};
@@ -636,8 +636,10 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
       const auto& p = layers[il];
       if (c.layers[il] == LayerType::kConvolution) {
         timed("proj in", [&] { dense->Enqueue(p.in, d.xb2048, d.y_proj, blocks); });
-        const int conv = d.Kernel("conv_dyn", [&] { return ConvProgram(H, Lw, Device::kMaxRows, Device::kSlots, "conv_dyn"); },
-                                  "@conv_dyn");
+        const bool cpart = p.in.shape.split == Split::kColumns;
+        const std::string cn = cpart ? "convp_dyn" : "conv_dyn";
+        const int conv = d.Kernel(cn, [&] { return ConvProgram(H, Lw, Device::kMaxRows, Device::kSlots, cn, cpart); },
+                                  "@" + cn);
         const int b[] = {d.y_proj, d.hist[il], d.conv_w[il], d.meta_g, d.xb2048, d.count};
         timed("conv", [&] { npu.Enqueue(conv, b); });
       } else {

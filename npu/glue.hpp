@@ -27,7 +27,7 @@ RowKernel SwiGluPackKernel(std::uint32_t intermediate, std::uint32_t rows, bool 
 // history pool [slot][width - 1][H] (tap-major), weights [width][H],
 // meta (slot at element 16 r), out blocked BF16 (H).
 std::string ConvProgram(std::uint32_t hidden, std::uint32_t width, std::uint32_t rows, std::uint32_t slots,
-                        const std::string& name);
+                        const std::string& name, bool partial = false);
 
 }  // namespace gufo::models::lfm3::npu
 

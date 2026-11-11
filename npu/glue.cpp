@@ -181,7 +181,7 @@ RowKernel SwiGluPackKernel(std::uint32_t I, std::uint32_t rows, bool partial) {
 }
 
 std::string ConvProgram(std::uint32_t H, std::uint32_t L, std::uint32_t rows, std::uint32_t slots,
-                        const std::string& name) {
+                        const std::string& name, bool partial) {
   // Column c owns channels [c * H / 8, (c + 1) * H / 8) and walks the rows in
   // order, so prompt rows of one session see each other's history.
   const std::uint32_t slice = H / 8, G = 3 * H / 8, sg = slice / 8;
@@ -220,8 +220,8 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%proj_arg: buffer, %hist_arg
   %h_ch = channel.bind<fifo> %h_slots, %c1 : view<1x@TAPSx@SLICExf32>, index -> channel<tile<@TAPSx@SLICExf32>>
   %p_size = index.constant @PBYTES : offset
   %p_storage = buffer.alloca<workgroup> pool(%memory) align(64) %p_size : buffer
-  %p_slots = buffer.view %p_storage[%origin] : buffer -> view<1x3x@SLICExf32>
-  %p_ch = channel.bind<fifo> %p_slots, %c1 : view<1x3x@SLICExf32>, index -> channel<tile<3x@SLICExf32>>
+  %p_slots = buffer.view %p_storage[%origin] : buffer -> view<1x@PR3x@SLICExf32>
+  %p_ch = channel.bind<fifo> %p_slots, %c1 : view<1x@PR3x@SLICExf32>, index -> channel<tile<@PR3x@SLICExf32>>
   %o_size = index.constant @OBYTES : offset
   %o_storage = buffer.alloca<workgroup> pool(%memory) align(64) %o_size : buffer
   %o_slots = buffer.view %o_storage[%origin] : buffer -> view<1x@SLICExbf16>
@@ -233,7 +233,7 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%proj_arg: buffer, %hist_arg
   pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {
     %ww, %w = channel.reserve %w_ch : channel<tile<@Lx@SLICExf32>> -> (write<tile<@Lx@SLICExf32>>, view<@Lx@SLICExf32>)
     %hw, %h = channel.reserve %h_ch : channel<tile<@TAPSx@SLICExf32>> -> (write<tile<@TAPSx@SLICExf32>>, view<@TAPSx@SLICExf32>)
-    %pw, %p = channel.reserve %p_ch : channel<tile<3x@SLICExf32>> -> (write<tile<3x@SLICExf32>>, view<3x@SLICExf32>)
+    %pw, %p = channel.reserve %p_ch : channel<tile<@PR3x@SLICExf32>> -> (write<tile<@PR3x@SLICExf32>>, view<@PR3x@SLICExf32>)
     %ow, %o = channel.reserve %o_ch : channel<tile<@SLICExbf16>> -> (write<tile<@SLICExbf16>>, view<@SLICExbf16>)
     %mw, %m = channel.reserve %m_ch : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)
     %w_at_i = index.mul %first, %c4 : index
@@ -289,19 +289,38 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%proj_arg: buffer, %hist_arg
         %pe = index.add %pa, %part_off : index
         %p_bytes = index.mul %pe, %c4 : index
         %p_at = index.cast %p_bytes : index to offset
-        %p_dense = buffer.view %proj[%p_at] : buffer -> view<@SGx64xf32>
-        %p_strided = view.refine %p_dense : view<@SGx64xf32> -> view<@SGx64xf32, #encoding.layout.strided<strides=[64, 1]>>
-        %p_global = view.subview %p_strided[0, 0] : view<@SGx64xf32, #encoding.layout.strided<strides=[64, 1]>> -> view<@SGx8xf32, #encoding.layout.strided<strides=[64, 1]>>
-        %p_row = view.subview %p[%part, 0] : view<3x@SLICExf32> -> view<1x@SLICExf32>
-        %p_tile = view.bitcast %p_row : view<1x@SLICExf32> -> view<@SGx8xf32>
-        %pc = kernel.async.copy %p_global to %p_tile {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<@SGx8xf32, #encoding.layout.strided<strides=[64, 1]>> to view<@SGx8xf32> -> kernel.async.token
+        %p_dense = buffer.view %proj[%p_at] : buffer -> view<@PPx@SGx64xf32>
+        %p_strided = view.refine %p_dense : view<@PPx@SGx64xf32> -> view<@PPx@SGx64xf32, #encoding.layout.strided<strides=[@QS, 64, 1]>>
+        %p_global = view.subview %p_strided[0, 0, 0] : view<@PPx@SGx64xf32, #encoding.layout.strided<strides=[@QS, 64, 1]>> -> view<@PPx@SGx8xf32, #encoding.layout.strided<strides=[@QS, 64, 1]>>
+        %p_r0 = index.mul %part, %pparts : index
+        %p_row = view.subview %p[%p_r0, 0] : view<@PR3x@SLICExf32> -> view<@PPx@SLICExf32>
+        %p_tile = view.bitcast %p_row : view<@PPx@SLICExf32> -> view<@PPx@SGx8xf32>
+        %pc = kernel.async.copy %p_global to %p_tile {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<@PPx@SGx8xf32, #encoding.layout.strided<strides=[@QS, 64, 1]>> to view<@PPx@SGx8xf32> -> kernel.async.token
         %pgw = kernel.async.group %pc : kernel.async.token -> kernel.async.group
         kernel.async.wait %pgw {newer_groups = 0} : kernel.async.group
       }
       scf.for %i = [%c0 to %slice step %c16] {
-        %bv = vector.load %p[%c0, %i] : view<3x@SLICExf32> -> vector<16xf32>
-        %cv = vector.load %p[%c1, %i] : view<3x@SLICExf32> -> vector<16xf32>
-        %xv = vector.load %p[%c2, %i] : view<3x@SLICExf32> -> vector<16xf32>
+        %bv = scf.for %q = [%c0 to %pparts step %c1](%qa = %pzero : vector<16xf32>) -> (vector<16xf32>) {
+          %qr00 = index.mul %c0, %pparts : index
+          %qr0 = index.add %qr00, %q : index
+          %qv = vector.load %p[%qr0, %i] : view<@PR3x@SLICExf32> -> vector<16xf32>
+          %qs = vector.addf %qa, %qv : vector<16xf32>
+          scf.yield %qs : vector<16xf32>
+        }
+        %cv = scf.for %q = [%c0 to %pparts step %c1](%qa = %pzero : vector<16xf32>) -> (vector<16xf32>) {
+          %qr10 = index.mul %c1, %pparts : index
+          %qr1 = index.add %qr10, %q : index
+          %qv = vector.load %p[%qr1, %i] : view<@PR3x@SLICExf32> -> vector<16xf32>
+          %qs = vector.addf %qa, %qv : vector<16xf32>
+          scf.yield %qs : vector<16xf32>
+        }
+        %xv = scf.for %q = [%c0 to %pparts step %c1](%qa = %pzero : vector<16xf32>) -> (vector<16xf32>) {
+          %qr20 = index.mul %c2, %pparts : index
+          %qr2 = index.add %qr20, %q : index
+          %qv = vector.load %p[%qr2, %i] : view<@PR3x@SLICExf32> -> vector<16xf32>
+          %qs = vector.addf %qa, %qv : vector<16xf32>
+          scf.yield %qs : vector<16xf32>
+        }
         %bx = func.call @fmul(%bv, %xv) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         %wl = vector.load %w[%taps, %i] : view<@Lx@SLICExf32> -> vector<16xf32>
         %acc0 = func.call @fmul(%wl, %bx) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
@@ -340,20 +359,20 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%proj_arg: buffer, %hist_arg
     }
     channel.publish %ww : write<tile<@Lx@SLICExf32>>
     channel.publish %hw : write<tile<@TAPSx@SLICExf32>>
-    channel.publish %pw : write<tile<3x@SLICExf32>>
+    channel.publish %pw : write<tile<@PR3x@SLICExf32>>
     channel.publish %ow : write<tile<@SLICExbf16>>
     channel.publish %mw : write<tile<16xi32>>
   }
 }
 )",
             {{"@NAME", name}, {"@SLICE", S(slice)}, {"@TAPS", S(L - 1)}, {"@LAST", S(L - 2)}, {"@ROWS", S(rows)},
-             {"@HSTRIDE", S(std::uint64_t(L - 1) * H)}, {"@PBLOCK", S(std::uint64_t(G) * 64)},
+             {"@HSTRIDE", S(std::uint64_t(L - 1) * H)}, {"@PBLOCK", S(std::uint64_t(G) * 64 * (partial ? 8 : 1))},
              {"@OBLOCK", S(std::uint64_t(H / 8) * 64)}, {"@CGROUP", S(sg)}, {"@WBYTES", S(std::uint64_t(L) * slice * 4)},
-             {"@HBYTES", S(std::uint64_t(L - 1) * slice * 4)}, {"@PBYTES", S(3ull * slice * 4)},
+             {"@HBYTES", S(std::uint64_t(L - 1) * slice * 4)}, {"@PBYTES", S(3ull * slice * 4 * (partial ? 8 : 1))},
              {"@OBYTES", S(slice * 2)}, {"@SLOTM", S(slots - 1)}, {"@SG", S(sg)}, {"@L", S(L)}, {"@H", S(H)}});
   // Parts B, C, x sit H / 8 groups apart in the projection's blocked row.
   t = Fill(t, {{"  %first = index.mul %column, %slice : index",
-                "  %c3p = index.constant 3 : index\n  %part_stride = index.constant " + S(std::uint64_t(H / 8) * 64) +
+                "  %c3p = index.constant 3 : index\n  %pparts = index.constant " + S(partial ? 8 : 1) + " : index\n  %pzero = vector.splatf 0.0 : vector<16xf32>\n  %part_stride = index.constant " + S(std::uint64_t(H / 8) * 64) +
                     " : index\n  %first = index.mul %column, %slice : index"}});
   std::string compose = "\npipeline.def<kernel> public retain target(@npu) @" + name +
                         "() run(%proj: buffer, %hist: buffer, %wts: buffer, %meta: buffer, %out: buffer, %cnt: buffer) {\n";
@@ -361,6 +380,8 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%proj_arg: buffer, %hist_arg
   for (int c = 0; c < 8; ++c)
     compose += "  pipeline.compose @" + name + "_col[%k" + S(c) +
                "](%proj, %hist, %wts, %meta, %out, %cnt) : [index](buffer, buffer, buffer, buffer, buffer, buffer)\n";
+  // Partial-sum mode placeholders (filled last: they appear in nested templates).
+  t = Fill(t, {{"@PPx", partial ? "8x" : "1x"}, {"@PR3x", partial ? "24x" : "3x"}, {"@QS", S(std::uint64_t(G) * 64)}});
   return t + compose + "}\n";
 }
 
