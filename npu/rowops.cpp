@@ -8,7 +8,7 @@ namespace gufo::models::lfm3::npu {
 const char* const kMathLibrary = R"LOOM(
 // a * b per lane to about F32 precision: each operand splits into three
 // BF16 parts; the six leading cross products accumulate, smallest first.
-func.def inline @fmul(%a: vector<16xf32>, %b: vector<16xf32>) -> (vector<16xf32>) {
+func.def @fmul(%a: vector<16xf32>, %b: vector<16xf32>) -> (vector<16xf32>) {
   %a1 = vector.fptrunc %a : vector<16xf32> to vector<16xbf16>
   %a1f = vector.extf %a1 : vector<16xbf16> to vector<16xf32>
   %ar = vector.subf %a, %a1f : vector<16xf32>
@@ -36,8 +36,47 @@ func.def inline @fmul(%a: vector<16xf32>, %b: vector<16xf32>) -> (vector<16xf32>
   func.return %s2 : vector<16xf32>
 }
 
+// a * b to about 16 significant bits: two BF16 parts each, three cross
+// products (for values stored as F16/BF16 next).
+func.def @fmul2(%a: vector<16xf32>, %b: vector<16xf32>) -> (vector<16xf32>) {
+  %a1 = vector.fptrunc %a : vector<16xf32> to vector<16xbf16>
+  %a1f = vector.extf %a1 : vector<16xbf16> to vector<16xf32>
+  %ar = vector.subf %a, %a1f : vector<16xf32>
+  %a2 = vector.fptrunc %ar : vector<16xf32> to vector<16xbf16>
+  %b1 = vector.fptrunc %b : vector<16xf32> to vector<16xbf16>
+  %b1f = vector.extf %b1 : vector<16xbf16> to vector<16xf32>
+  %br = vector.subf %b, %b1f : vector<16xf32>
+  %b2 = vector.fptrunc %br : vector<16xf32> to vector<16xbf16>
+  %zero = vector.splatf 0.0 : vector<16xf32>
+  %l0 = vector.interleave<0> %a1, %a2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %r0 = vector.interleave<0> %b2, %b1 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %s0 = vector.dot2f %l0, %r0, %zero : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+  %zb = vector.splatf 0.0 : vector<16xbf16>
+  %l1 = vector.interleave<0> %a1, %zb : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %r1 = vector.interleave<0> %b1, %zb : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %s1 = vector.dot2f %l1, %r1, %s0 : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+  func.return %s1 : vector<16xf32>
+}
+
+// x to F16 with its sign: AIE2P's vector.fptrunc to f16 drops the sign
+// bit (Loom at gufo-staging d8345774e3), so it is restored from x.
+func.def @tof16(%x: vector<16xf32>) -> (vector<16xf16>) {
+  %h = vector.fptrunc %x : vector<16xf32> to vector<16xf16>
+  %hb = vector.bitcast %h : vector<16xf16> to vector<16xi16>
+  %hw = vector.extui %hb : vector<16xi16> to vector<16xi32>
+  %bits = vector.bitcast %x : vector<16xf32> to vector<16xi32>
+  %c16 = vector.splati 16 : vector<16xi32>
+  %mask = vector.splati 32768 : vector<16xi32>
+  %top = vector.shrui %bits, %c16 : vector<16xi32>
+  %sign = vector.andi %top, %mask : vector<16xi32>
+  %signed = vector.ori %hw, %sign : vector<16xi32>
+  %narrow = vector.trunci %signed : vector<16xi32> to vector<16xi16>
+  %out = vector.bitcast %narrow : vector<16xi16> to vector<16xf16>
+  func.return %out : vector<16xf16>
+}
+
 // 1 / sqrt(x) for x > 0: bit estimate and three Newton steps.
-func.def inline @rsqrt(%x: vector<16xf32>) -> (vector<16xf32>) {
+func.def @rsqrt(%x: vector<16xf32>) -> (vector<16xf32>) {
   %magic = vector.splati 1597463007 : vector<16xi32>
   %one_i = vector.splati 1 : vector<16xi32>
   %half = vector.splatf 0.5 : vector<16xf32>
@@ -55,15 +94,11 @@ func.def inline @rsqrt(%x: vector<16xf32>) -> (vector<16xf32>) {
   %b1 = func.call @fmul(%hx, %a1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
   %c1 = vector.subf %three_halves, %b1 : vector<16xf32>
   %y2 = func.call @fmul(%y1, %c1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %a2 = func.call @fmul(%y2, %y2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %b2 = func.call @fmul(%hx, %a2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %c2 = vector.subf %three_halves, %b2 : vector<16xf32>
-  %y3 = func.call @fmul(%y2, %c2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  func.return %y3 : vector<16xf32>
+  func.return %y2 : vector<16xf32>
 }
 
-// 1 / x for finite nonzero x: bit estimate and four Newton steps.
-func.def inline @recip(%x: vector<16xf32>) -> (vector<16xf32>) {
+// 1 / x for finite nonzero x: bit estimate and three Newton steps.
+func.def @recip(%x: vector<16xf32>) -> (vector<16xf32>) {
   %magic = vector.splati 2129859559 : vector<16xi32>
   %two = vector.splatf 2.0 : vector<16xf32>
   %bits = vector.bitcast %x : vector<16xf32> to vector<16xi32>
@@ -78,16 +113,13 @@ func.def inline @recip(%x: vector<16xf32>) -> (vector<16xf32>) {
   %a2 = func.call @fmul(%x, %y2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
   %b2 = vector.subf %two, %a2 : vector<16xf32>
   %y3 = func.call @fmul(%y2, %b2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %a3 = func.call @fmul(%x, %y3) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  %b3 = vector.subf %two, %a3 : vector<16xf32>
-  %y4 = func.call @fmul(%y3, %b3) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-  func.return %y4 : vector<16xf32>
+  func.return %y3 : vector<16xf32>
 }
 
 // e^x: x log2(e) = n + f with round-to-nearest n, a degree-6 polynomial of
 // 2^f on [-0.5, 0.5] by Horner, then 2^n added to the exponent bits.
 // Inputs below -87 give 0; above 88 saturate.
-func.def inline @exp(%x: vector<16xf32>) -> (vector<16xf32>) {
+func.def @exp(%x: vector<16xf32>) -> (vector<16xf32>) {
   %low = vector.splatf -87.0 : vector<16xf32>
   %high = vector.splatf 88.0 : vector<16xf32>
   %xc0 = vector.maxnumf %x, %low : vector<16xf32>
@@ -132,7 +164,7 @@ func.def inline @exp(%x: vector<16xf32>) -> (vector<16xf32>) {
 }
 
 // 1 / (1 + e^-x).
-func.def inline @sigmoid(%x: vector<16xf32>) -> (vector<16xf32>) {
+func.def @sigmoid(%x: vector<16xf32>) -> (vector<16xf32>) {
   %zero = vector.splatf 0.0 : vector<16xf32>
   %one = vector.splatf 1.0 : vector<16xf32>
   %neg = vector.subf %zero, %x : vector<16xf32>
