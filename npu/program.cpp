@@ -389,23 +389,38 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
 
 
 namespace {
-// Largest divisor of `blocks` whose resident activations (BF16, plus the
-// encoded copy when `encoded`), two weight slots and two output records fit.
-std::uint32_t BlocksPerPass(const ProjectionShape& s, bool encoded) {
-  const std::uint64_t x_tiles = s.k / 8 / kColumns, rec = x_tiles * 72;
-  std::uint32_t bp = 1;
-  for (std::uint32_t b = 1; b <= s.blocks; ++b) {
-    const std::uint64_t need = b * x_tiles * (128 + (encoded ? 72 : 0)) + 2 * rec + 2ull * b * 256 + 1024;
-    if (s.blocks % b == 0 && need <= 62 * 1024) bp = b;
-  }
-  return bp;
+// BF16 activation tiles per staging DMA: the largest divisor of a column's
+// slice up to 32 tiles (4 KB).
+std::uint32_t StageTiles(std::uint32_t x_tiles) {
+  std::uint32_t t = 1;
+  for (std::uint32_t d = 1; d <= std::min<std::uint32_t>(x_tiles, 32); ++d)
+    if (x_tiles % d == 0) t = d;
+  return t;
 }
-// Pre-encoded activations shorten the matrix loop; use them unless they
-// would cost resident blocks (more weight passes).
-bool EncodedActivations(const ProjectionShape& s) { return BlocksPerPass(s, true) == BlocksPerPass(s, false); }
+
+// Activation staging for the K-multi projection: blocks and tiles per BF16
+// DMA chunk, and chunk slots. Whole passes stay resident when that costs no
+// blocks; otherwise chunks of one block's slice (up to 32 tiles) stream in
+// and only their encoded form (72 bytes per tile instead of 128) stays.
+struct Staging { std::uint32_t bp, chunk_blocks, chunk_tiles, slots; };
+
+Staging PlanStaging(const ProjectionShape& s) {
+  const std::uint32_t x_tiles = s.k / 8 / kColumns;
+  const std::uint64_t rec = std::uint64_t(x_tiles) * 72, ct = StageTiles(x_tiles);
+  auto fit = [&](auto&& stage_bytes) {
+    std::uint32_t bp = 1;
+    for (std::uint32_t b = 1; b <= s.blocks; ++b)
+      if (s.blocks % b == 0 && b * rec + stage_bytes(b) + 2 * rec + 2ull * b * 256 + 1024 <= 62 * 1024) bp = b;
+    return bp;
+  };
+  const std::uint32_t resident = fit([&](std::uint64_t b) { return b * x_tiles * 128; });
+  const std::uint32_t staged = fit([&](std::uint64_t) { return 2 * ct * 128; });
+  if (resident >= staged) return {resident, resident, x_tiles, 1};
+  return {staged, 1, std::uint32_t(ct), 2};
+}
 }  // namespace
 
-std::uint32_t KSplitBlocksPerPass(const ProjectionShape& s) { return BlocksPerPass(s, EncodedActivations(s)); }
+std::uint32_t KSplitBlocksPerPass(const ProjectionShape& s) { return PlanStaging(s).bp; }
 
 std::string ProjectionKMultiProgram(const ProjectionShape& s) {
   // K split for several row blocks: column c holds K / 8 of `bp` blocks'
@@ -415,16 +430,16 @@ std::string ProjectionKMultiProgram(const ProjectionShape& s) {
   if (s.split != Split::kColumns) throw std::invalid_argument("K-multi projection needs the K split");
   const std::uint32_t tiles = s.k / 8, x_tiles = tiles / kColumns, record_tiles = tiles / kColumns, groups = s.m / 8;
   if (record_tiles % kPer || s.m % 8) throw std::invalid_argument("unsupported NPU projection shape");
-  const std::uint32_t bp = KSplitBlocksPerPass(s), passes = s.blocks / bp;
+  const Staging st = PlanStaging(s);
+  const std::uint32_t bp = st.bp, passes = s.blocks / bp;
   // R consecutive group records per weight slot (one DMA), as many as fit
   // next to the resident activations (BF16 and encoded).
-  const bool enc = EncodedActivations(s);
-  const std::uint64_t x_res = 0;
+  const bool enc = true;
+  const std::uint32_t nb = st.chunk_blocks, ct = st.chunk_tiles, nq = x_tiles / ct;
   std::uint32_t R = 1;
-  (void)x_res;
   if (const char* e = std::getenv("GUFO_LFM3_NPU_KMULTI_R")) R = std::uint32_t(std::atoi(e));
   const std::string rec = S(R * record_tiles * 72) + "xi8", rtile = "tile<" + rec + ">";
-  const std::string xb = S(x_tiles * 64) + "xbf16", xr = S(bp) + "x" + xb, xt = "tile<" + xr + ">";
+  const std::string xr = S(std::uint64_t(nb) * ct * 64) + "xbf16", xt = "tile<" + xr + ">";
   const std::string dot = "dot_x" + S(x_tiles) + "_r" + S(record_tiles);
   const std::string name = ProjectionRoot(s).substr(1) + "_kmulti";
   const std::string column = Replace(R"(
@@ -453,8 +468,13 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
   %memory = pipeline.memory<workgroup>[%column, 3] : pool
   %x_size = index.constant @XBYTES : offset
   %x_storage = buffer.alloca<workgroup> pool(%memory) align(64) %x_size : buffer
-  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<1x@XR>
-  %x_channel = channel.bind<fifo> %x_slots, %c1 : view<1x@XR>, index -> channel<@XT>
+  %x_depth = index.constant @XSLOTS : index
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<@XSLOTSx@XR>
+  %x_channel = channel.bind<fifo> %x_slots, %x_depth : view<@XSLOTSx@XR>, index -> channel<@XT>
+  %nb = index.constant @NB : index
+  %bchunks = index.constant @BCHUNKS : index
+  %nq = index.constant @NQ : index
+  %ct = index.constant @CT : index
   %ring_size = index.constant @RINGBYTES : offset
   %w_storage = buffer.alloca<workgroup> pool(%memory) align(64) %ring_size : buffer
   %w_slots = buffer.view %w_storage[%origin] : buffer -> view<2x@REC>
@@ -471,22 +491,28 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
 
   pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {
     scf.for %pass = [%c0 to %passes step %c1] {
-      // bp blocks' slices, block stride TILES tiles.
+      // bp blocks' slices in chunks of CT tiles.
       %blk0 = index.mul %pass, %bp : index
-      %x_block = index.mul %blk0, %block_tiles : index
-      %x_first = index.add %x_block, %x_column : index
-      %x_byte = index.mul %x_first, %tile_bytes : index
-      %x_offset = index.cast %x_byte : index to offset
-      // Three DMA dimensions: block, tile, element (a block slice alone
-      // exceeds one dimension's wrap).
-      %x_dense = buffer.view %x_buf[%x_offset] : buffer -> view<@X3>
-      %x_external = view.refine %x_dense : view<@X3> -> view<@X3, #encoding.layout.strided<strides=[@BSTRIDE, 64, 1]>>
-      %x_write, %x_payload = channel.reserve %x_channel : channel<@XT> -> (write<@XT>, view<@XR>)
-      %x_local = view.bitcast %x_payload : view<@XR> -> view<@X3>
-      %x_copy = kernel.async.copy %x_external to %x_local {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<@X3, #encoding.layout.strided<strides=[@BSTRIDE, 64, 1]>> to view<@X3> -> kernel.async.token
-      %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
-      kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
-      channel.publish %x_write : write<@XT>
+      scf.for %b = [%c0 to %bchunks step %c1] {
+        %bb = index.mul %b, %nb : index
+        %blk = index.add %blk0, %bb : index
+        %x_block = index.mul %blk, %block_tiles : index
+        %x_first = index.add %x_block, %x_column : index
+        scf.for %q = [%c0 to %nq step %c1] {
+          %x_q = index.mul %q, %ct : index
+          %x_tile = index.add %x_first, %x_q : index
+          %x_byte = index.mul %x_tile, %tile_bytes : index
+          %x_offset = index.cast %x_byte : index to offset
+          %x_dense = buffer.view %x_buf[%x_offset] : buffer -> view<@NBx@CTx64xbf16>
+          %x_external = view.refine %x_dense : view<@NBx@CTx64xbf16> -> view<@NBx@CTx64xbf16, #encoding.layout.strided<strides=[@BSTRIDE, 64, 1]>>
+          %x_write, %x_payload = channel.reserve %x_channel : channel<@XT> -> (write<@XT>, view<@XR>)
+          %x_local = view.bitcast %x_payload : view<@XR> -> view<@NBx@CTx64xbf16>
+          %x_copy = kernel.async.copy %x_external to %x_local {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<@NBx@CTx64xbf16, #encoding.layout.strided<strides=[@BSTRIDE, 64, 1]>> to view<@NBx@CTx64xbf16> -> kernel.async.token
+          %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
+          kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
+          channel.publish %x_write : write<@XT>
+        }
+      }
       scf.for %rs = [%c0 to %nslots step %c1] {
         %rsr = index.mul %rs, %rper : index
         %global = index.add %rsr, %first_record : index
@@ -529,22 +555,36 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
     %c8 = index.constant 8 : index
     %c0t = index.constant 0 : index
     %xe_w, %xe = channel.reserve %xe_channel : channel<tile<@XENxi8>> -> (write<tile<@XENxi8>>, view<@XENxi8>)
-    %ntile = index.constant @NTILE : index
     %c64e = index.constant 64 : index
     %c72e = index.constant 72 : index
     @SCHEMA
     scf.for %pass = [%c0 to %passes step %c1] {
-      %x_read, %x_all = channel.acquire %x_channel : channel<@XT> -> (read<@XT>, view<@XR>)
-      %x_bf = view.bitcast %x_all : view<@XR> -> view<@XBALL>
-@ENCODE_BEGIN      // Encode every resident activation tile once per pass.
-      scf.for %et = [%c0 to %ntile step %c1] {
-        %eo = index.mul %et, %c64e : index
-        %ev = vector.load %x_bf[%eo] : view<@XBALL> -> vector<64xbf16>
-        %ee = vector.encode %ev using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
-        %ed = index.mul %et, %c72e : index
-        vector.store %ee, %xe[%ed] : vector<72xi8>, view<@XENxi8>
+      // Encode every activation chunk into the resident tiles once per pass.
+      scf.for %eb = [%c0 to %bchunks step %c1] {
+        %ebb = index.mul %eb, %nb : index
+        %eb_tiles = index.mul %ebb, %column_tiles : index
+        scf.for %q = [%c0 to %nq step %c1] {
+          %x_read, %x_bf = channel.acquire %x_channel : channel<@XT> -> (read<@XT>, view<@XR>)
+          %eq = index.mul %q, %ct : index
+          %e0 = index.add %eb_tiles, %eq : index
+          // Chunk tile (block j, tile t) encodes to resident tile e0 + j * XTILES + t.
+          scf.for %ej = [%c0 to %nb step %c1] {
+            %ejt = index.mul %ej, %column_tiles : index
+            %ejc = index.mul %ej, %ct : index
+            %e1 = index.add %e0, %ejt : index
+            scf.for %et = [%c0 to %ct step %c1] {
+              %eti = index.add %ejc, %et : index
+              %eo = index.mul %eti, %c64e : index
+              %ev = vector.load %x_bf[%eo] : view<@XR> -> vector<64xbf16>
+              %ee = vector.encode %ev using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+              %ei = index.add %e1, %et : index
+              %ed = index.mul %ei, %c72e : index
+              vector.store %ee, %xe[%ed] : vector<72xi8>, view<@XENxi8>
+            }
+          }
+          channel.release %x_read : read<@XT>
+        }
       }
-@ENCODE_END
       scf.for %g = [%c0 to %nslots step %c1] {
         %w_read, %w_values = channel.acquire %w_channel : channel<@RT> -> (read<@RT>, view<@REC>)
         scf.for %r = [%c0 to %rper step %c1] {
@@ -563,7 +603,6 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
         }
         channel.release %w_read : read<@RT>
       }
-      channel.release %x_read : read<@XT>
     }
     channel.publish %xe_w : write<tile<@XENxi8>>
   }
@@ -573,14 +612,14 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
                                       {"@GROUPS", S(groups)}, {"@RECBYTES", S(record_tiles * 72)},
                                       {"@XTILES", S(x_tiles)}, {"@TILES", S(tiles)},
                                       {"@BLOCKOUT", S(std::uint64_t(groups) * kColumns)},
-                                      {"@XBYTES", S(std::uint64_t(bp) * x_tiles * 128)},
+                                      {"@XBYTES", S(std::uint64_t(st.slots) * nb * ct * 128)}, {"@NQ", S(nq)}, {"@CT", S(ct)},
+                                      {"@XSLOTS", S(st.slots)}, {"@NB", S(nb)}, {"@BCHUNKS", S(bp / nb)},
                                       {"@RINGBYTES", S(2ull * R * record_tiles * 72)},
                                       {"@BSTRIDE", S(std::uint64_t(tiles) * 64)},
-                                      {"@XBALL", S(std::uint64_t(bp) * x_tiles * 64) + "xbf16"},
-                                      {"@X3", S(bp) + "x" + S(x_tiles) + "x64xbf16"}, {"@XR", xr}, {"@XT", xt}, {"@XB", xb}, {"@REC", rec}, {"@RT", rtile},
+                                      {"@XR", xr}, {"@XT", xt}, {"@REC", rec}, {"@RT", rtile},
                                       {"@DOT", dot}, {"@YBYTES", S(2ull * bp * 256)}, {"@BSF", S(std::uint64_t(groups) * kColumns * 64)},
                                       {"@BST", S(std::uint64_t(groups) * kColumns)}, {"@RPER", S(R)}, {"@NSLOTS", S(groups / R)}, {"@ZRTB", S(record_tiles * 72)}, {"@XEBYTES", S(enc ? (std::uint64_t(bp) * x_tiles * 72 + 63) / 64 * 64 : 64)},
-                                      {"@XEN", S(enc ? std::uint64_t(bp) * x_tiles * 72 : 64)}, {"@NTILE", S(std::uint64_t(bp) * x_tiles)},
+                                      {"@XEN", S(enc ? std::uint64_t(bp) * x_tiles * 72 : 64)},
                                       {"@SCHEMA", kSchema}});
   std::string compose;
   for (std::uint32_t c = 0; c < kColumns; ++c) compose += "  %c" + S(c) + " = index.constant " + S(c) + " : index\n";
@@ -592,8 +631,6 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
       const auto pa = body.find("@PERBLOCK_BEGIN"), pb = body.find("@PERBLOCK_END");
       body = enc ? body.erase(pa, pb + 13 - pa) : body.erase(pb, 13).erase(pa, 15);
     }
-    const auto a = body.find("@ENCODE_BEGIN"), b = body.find("@ENCODE_END");
-    body = enc ? body.erase(b, 11).erase(a, 13) : body.erase(a, b + 11 - a);
     std::string blocks_call;
     const std::uint32_t per_call = std::min<std::uint32_t>(bp, 4);  // accumulators: 4 registers each, 20 available
     if (enc) {

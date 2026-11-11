@@ -2,6 +2,8 @@
 // family needs, against a CPU reference over the same encoded weights.
 // Usage: npu_shape_test [k m blocks ...]
 #include <chrono>
+#include <fstream>
+#include <iterator>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -37,7 +39,12 @@ int main(int argc, char** argv) {
     int kernel;
     try {
       const bool kmulti = std::getenv("KMULTI") && c.blocks > 1 && shape.split == g::Split::kColumns;
-      kernel = kmulti ? npu.Compile(g::ProjectionKMultiProgram(shape), "projection.loom", g::ProjectionRoot(shape) + "_kmulti")
+      std::string program = kmulti ? g::ProjectionKMultiProgram(shape) : std::string();
+      if (const char* f = std::getenv("KM_FILE")) {  // experiment: a hand-edited program
+        std::ifstream in(f);
+        program.assign(std::istreambuf_iterator<char>(in), {});
+      }
+      kernel = kmulti ? npu.Compile(program, "projection.loom", g::ProjectionRoot(shape) + "_kmulti")
                       : npu.Compile(g::ProjectionProgram(shape), "projection.loom", g::ProjectionRoot(shape));
     } catch (const std::exception& e) {
       std::printf("%s: %s\n", g::ProjectionRoot(shape).c_str(), e.what());
