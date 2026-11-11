@@ -106,3 +106,31 @@ would add about 0.6 ms to its 36 ms of weight streaming.
 python iron/gemv.py -M 8192 -K 2048 [-P 24] --xclbin-path gemv.xclbin --insts-path gemv.bin
 host/gemv_bench $PWD/gemv.xclbin $PWD/gemv.bin 8192 2048 8 [24]
 ```
+
+### FFN block
+
+`iron/ffn.py` runs one LFM3 decode FFN block in one XRT run, on all 32 cores,
+in two phases:
+
+- **F1.** Each core computes the post-norm residual `h += rmsnorm(o) * w_post`,
+  then `rmsnorm(h) * w_ffn`, quantized to Q8_0. It then runs its 240
+  gate/up channels and writes `SiLU(gate) * up` as bf16.
+- **F2.** Each core quantizes the 7,680 activations and runs its 64 down rows.
+
+Every vector stays in natural order in DDR; the host packs the weight
+records to match. Both shim MM2S channels of every column stream weights, and
+each phase's input rides at the head of the weight streams.
+
+`iron/ffn_host.py` (pyxrt) checks the block against float64 math on the
+GGUF's own Q8_0 weights. On layer 0 of LFM3-1.7B:
+
+| | Relative error |
+| --- | ---: |
+| Residual after the post-norm | 2.6e-8 |
+| SwiGLU activations | 8.3e-3 |
+| Block output after its post-norm | 1.2e-2 |
+
+The error comes from quantizing activations to Q8_0, as llama.cpp's CPU path
+also does. The block takes 1,242 µs per run, including the host's wait: 41 GB/s
+over its 51 MB of weights. With the dot products stubbed out it takes 1,168 µs,
+so the streaming side, not the arithmetic, sets the time.
