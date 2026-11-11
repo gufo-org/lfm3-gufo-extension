@@ -36,18 +36,22 @@ func.def inline @record_dot_p(%x: view<2048xbf16>, %row: view<64xbf16>, %w: view
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c8 = index.constant 8 : index
-  %cper = index.constant 4 : index
-  %cbytes = index.constant 288 : index
-  %chunks = index.constant 32 : index
+  %cper = index.constant 8 : index
+  %cbytes = index.constant 576 : index
+  %chunks = index.constant 16 : index
   %c0_x = index.constant 0 : index
   %c8_x = index.constant 8 : index
   %c16_x = index.constant 16 : index
   %c24_x = index.constant 24 : index
+  %c32_x = index.constant 32 : index
+  %c40_x = index.constant 40 : index
+  %c48_x = index.constant 48 : index
+  %c56_x = index.constant 56 : index
   %schema = encoding.define #encoding.operand<element_format=bfp16ebs8, payload_elements=64, payload_packing=target_fragment, payload_registers=18, rounding=flush_subnormal> : encoding<schema>
   %result = scf.for %chunk = [%c0 to %chunks step %c1](%a0 = %acc : vector<64xf32>) -> (vector<64xf32>) {
     %w_at = index.mul %chunk, %cbytes : index
-    %w_group = vector.load %w[%w_at] : view<9216xi8> -> vector<288xi8>
-    %w_blocks = vector.fragment<rhs> %w_group shape [blocks(%cper), %c8, %c8] using {schema = %schema : encoding<schema>} : vector<288xi8>
+    %w_group = vector.load %w[%w_at] : view<9216xi8> -> vector<576xi8>
+    %w_blocks = vector.fragment<rhs> %w_group shape [blocks(%cper), %c8, %c8] using {schema = %schema : encoding<schema>} : vector<576xi8>
     %tile_in = index.mul %chunk, %cper : index
     %tile = index.add %tile0, %tile_in : index
     %x_base = index.mul %tile, %c8 : index
@@ -57,7 +61,7 @@ func.def inline @record_dot_p(%x: view<2048xbf16>, %row: view<64xbf16>, %w: view
     %x_values0 = vector.load %row[0] : view<64xbf16> -> vector<64xbf16>
     %x_bytes0 = vector.encode %x_values0 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
     %lhs0 = vector.fragment<lhs> %x_bytes0 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
-    %w_bytes0 = vector.slice %w_blocks[0] : vector<288xi8> -> vector<72xi8>
+    %w_bytes0 = vector.slice %w_blocks[0] : vector<576xi8> -> vector<72xi8>
     %rhs0 = vector.fragment<rhs> %w_bytes0 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
     %a1 = vector.mma %lhs0, %rhs0, %a0 : vector<72xi8>, vector<72xi8>, vector<64xf32>
     %x_at1 = index.add %x_base, %c8_x : index
@@ -66,7 +70,7 @@ func.def inline @record_dot_p(%x: view<2048xbf16>, %row: view<64xbf16>, %w: view
     %x_values1 = vector.load %row[0] : view<64xbf16> -> vector<64xbf16>
     %x_bytes1 = vector.encode %x_values1 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
     %lhs1 = vector.fragment<lhs> %x_bytes1 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
-    %w_bytes1 = vector.slice %w_blocks[72] : vector<288xi8> -> vector<72xi8>
+    %w_bytes1 = vector.slice %w_blocks[72] : vector<576xi8> -> vector<72xi8>
     %rhs1 = vector.fragment<rhs> %w_bytes1 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
     %a2 = vector.mma %lhs1, %rhs1, %a1 : vector<72xi8>, vector<72xi8>, vector<64xf32>
     %x_at2 = index.add %x_base, %c16_x : index
@@ -75,7 +79,7 @@ func.def inline @record_dot_p(%x: view<2048xbf16>, %row: view<64xbf16>, %w: view
     %x_values2 = vector.load %row[0] : view<64xbf16> -> vector<64xbf16>
     %x_bytes2 = vector.encode %x_values2 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
     %lhs2 = vector.fragment<lhs> %x_bytes2 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
-    %w_bytes2 = vector.slice %w_blocks[144] : vector<288xi8> -> vector<72xi8>
+    %w_bytes2 = vector.slice %w_blocks[144] : vector<576xi8> -> vector<72xi8>
     %rhs2 = vector.fragment<rhs> %w_bytes2 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
     %a3 = vector.mma %lhs2, %rhs2, %a2 : vector<72xi8>, vector<72xi8>, vector<64xf32>
     %x_at3 = index.add %x_base, %c24_x : index
@@ -84,10 +88,46 @@ func.def inline @record_dot_p(%x: view<2048xbf16>, %row: view<64xbf16>, %w: view
     %x_values3 = vector.load %row[0] : view<64xbf16> -> vector<64xbf16>
     %x_bytes3 = vector.encode %x_values3 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
     %lhs3 = vector.fragment<lhs> %x_bytes3 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
-    %w_bytes3 = vector.slice %w_blocks[216] : vector<288xi8> -> vector<72xi8>
+    %w_bytes3 = vector.slice %w_blocks[216] : vector<576xi8> -> vector<72xi8>
     %rhs3 = vector.fragment<rhs> %w_bytes3 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
     %a4 = vector.mma %lhs3, %rhs3, %a3 : vector<72xi8>, vector<72xi8>, vector<64xf32>
-    scf.yield %a4 : vector<64xf32>
+    %x_at4 = index.add %x_base, %c32_x : index
+    %slice4 = vector.load %x[%x_at4] : view<2048xbf16> -> vector<8xbf16>
+    vector.store %slice4, %row[0] : vector<8xbf16>, view<64xbf16>
+    %x_values4 = vector.load %row[0] : view<64xbf16> -> vector<64xbf16>
+    %x_bytes4 = vector.encode %x_values4 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs4 = vector.fragment<lhs> %x_bytes4 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes4 = vector.slice %w_blocks[288] : vector<576xi8> -> vector<72xi8>
+    %rhs4 = vector.fragment<rhs> %w_bytes4 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a5 = vector.mma %lhs4, %rhs4, %a4 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    %x_at5 = index.add %x_base, %c40_x : index
+    %slice5 = vector.load %x[%x_at5] : view<2048xbf16> -> vector<8xbf16>
+    vector.store %slice5, %row[0] : vector<8xbf16>, view<64xbf16>
+    %x_values5 = vector.load %row[0] : view<64xbf16> -> vector<64xbf16>
+    %x_bytes5 = vector.encode %x_values5 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs5 = vector.fragment<lhs> %x_bytes5 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes5 = vector.slice %w_blocks[360] : vector<576xi8> -> vector<72xi8>
+    %rhs5 = vector.fragment<rhs> %w_bytes5 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a6 = vector.mma %lhs5, %rhs5, %a5 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    %x_at6 = index.add %x_base, %c48_x : index
+    %slice6 = vector.load %x[%x_at6] : view<2048xbf16> -> vector<8xbf16>
+    vector.store %slice6, %row[0] : vector<8xbf16>, view<64xbf16>
+    %x_values6 = vector.load %row[0] : view<64xbf16> -> vector<64xbf16>
+    %x_bytes6 = vector.encode %x_values6 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs6 = vector.fragment<lhs> %x_bytes6 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes6 = vector.slice %w_blocks[432] : vector<576xi8> -> vector<72xi8>
+    %rhs6 = vector.fragment<rhs> %w_bytes6 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a7 = vector.mma %lhs6, %rhs6, %a6 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    %x_at7 = index.add %x_base, %c56_x : index
+    %slice7 = vector.load %x[%x_at7] : view<2048xbf16> -> vector<8xbf16>
+    vector.store %slice7, %row[0] : vector<8xbf16>, view<64xbf16>
+    %x_values7 = vector.load %row[0] : view<64xbf16> -> vector<64xbf16>
+    %x_bytes7 = vector.encode %x_values7 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs7 = vector.fragment<lhs> %x_bytes7 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes7 = vector.slice %w_blocks[504] : vector<576xi8> -> vector<72xi8>
+    %rhs7 = vector.fragment<rhs> %w_bytes7 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a8 = vector.mma %lhs7, %rhs7, %a7 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    scf.yield %a8 : vector<64xf32>
   }
   func.return %result : vector<64xf32>
 }
@@ -560,6 +600,215 @@ pipeline.def<kernel> public retain target(@npu) @bfp_q_m512() run(%x: buffer, %w
   pipeline.compose @bfp_q_col[%groups, %c7](%x, %w, %y) : [index, index](buffer, buffer, buffer)
 }
 
+func.def inline @record_dot_batch(%x: view<16384xbf16>, %w: view<9216xi8>, %tile0: index, %acc: vector<64xf32>) -> (vector<64xf32>) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c64 = index.constant 64 : index
+  %cper = index.constant 8 : index
+  %cbytes = index.constant 576 : index
+  %chunks = index.constant 16 : index
+  %c0_x = index.constant 0 : index
+  %c64_x = index.constant 64 : index
+  %c128_x = index.constant 128 : index
+  %c192_x = index.constant 192 : index
+  %c256_x = index.constant 256 : index
+  %c320_x = index.constant 320 : index
+  %c384_x = index.constant 384 : index
+  %c448_x = index.constant 448 : index
+  %schema = encoding.define #encoding.operand<element_format=bfp16ebs8, payload_elements=64, payload_packing=target_fragment, payload_registers=18, rounding=flush_subnormal> : encoding<schema>
+  %result = scf.for %chunk = [%c0 to %chunks step %c1](%a0 = %acc : vector<64xf32>) -> (vector<64xf32>) {
+    %w_at = index.mul %chunk, %cbytes : index
+    %w_group = vector.load %w[%w_at] : view<9216xi8> -> vector<576xi8>
+    %w_blocks = vector.fragment<rhs> %w_group shape [blocks(%cper), %c8, %c8] using {schema = %schema : encoding<schema>} : vector<576xi8>
+    %tile_in = index.mul %chunk, %cper : index
+    %tile = index.add %tile0, %tile_in : index
+    %x_base = index.mul %tile, %c64 : index
+    %x_at0 = index.add %x_base, %c0_x : index
+    %x_values0 = vector.load %x[%x_at0] : view<16384xbf16> -> vector<64xbf16>
+    %x_bytes0 = vector.encode %x_values0 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs0 = vector.fragment<lhs> %x_bytes0 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes0 = vector.slice %w_blocks[0] : vector<576xi8> -> vector<72xi8>
+    %rhs0 = vector.fragment<rhs> %w_bytes0 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a1 = vector.mma %lhs0, %rhs0, %a0 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    %x_at1 = index.add %x_base, %c64_x : index
+    %x_values1 = vector.load %x[%x_at1] : view<16384xbf16> -> vector<64xbf16>
+    %x_bytes1 = vector.encode %x_values1 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs1 = vector.fragment<lhs> %x_bytes1 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes1 = vector.slice %w_blocks[72] : vector<576xi8> -> vector<72xi8>
+    %rhs1 = vector.fragment<rhs> %w_bytes1 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a2 = vector.mma %lhs1, %rhs1, %a1 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    %x_at2 = index.add %x_base, %c128_x : index
+    %x_values2 = vector.load %x[%x_at2] : view<16384xbf16> -> vector<64xbf16>
+    %x_bytes2 = vector.encode %x_values2 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs2 = vector.fragment<lhs> %x_bytes2 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes2 = vector.slice %w_blocks[144] : vector<576xi8> -> vector<72xi8>
+    %rhs2 = vector.fragment<rhs> %w_bytes2 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a3 = vector.mma %lhs2, %rhs2, %a2 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    %x_at3 = index.add %x_base, %c192_x : index
+    %x_values3 = vector.load %x[%x_at3] : view<16384xbf16> -> vector<64xbf16>
+    %x_bytes3 = vector.encode %x_values3 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs3 = vector.fragment<lhs> %x_bytes3 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes3 = vector.slice %w_blocks[216] : vector<576xi8> -> vector<72xi8>
+    %rhs3 = vector.fragment<rhs> %w_bytes3 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a4 = vector.mma %lhs3, %rhs3, %a3 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    %x_at4 = index.add %x_base, %c256_x : index
+    %x_values4 = vector.load %x[%x_at4] : view<16384xbf16> -> vector<64xbf16>
+    %x_bytes4 = vector.encode %x_values4 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs4 = vector.fragment<lhs> %x_bytes4 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes4 = vector.slice %w_blocks[288] : vector<576xi8> -> vector<72xi8>
+    %rhs4 = vector.fragment<rhs> %w_bytes4 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a5 = vector.mma %lhs4, %rhs4, %a4 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    %x_at5 = index.add %x_base, %c320_x : index
+    %x_values5 = vector.load %x[%x_at5] : view<16384xbf16> -> vector<64xbf16>
+    %x_bytes5 = vector.encode %x_values5 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs5 = vector.fragment<lhs> %x_bytes5 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes5 = vector.slice %w_blocks[360] : vector<576xi8> -> vector<72xi8>
+    %rhs5 = vector.fragment<rhs> %w_bytes5 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a6 = vector.mma %lhs5, %rhs5, %a5 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    %x_at6 = index.add %x_base, %c384_x : index
+    %x_values6 = vector.load %x[%x_at6] : view<16384xbf16> -> vector<64xbf16>
+    %x_bytes6 = vector.encode %x_values6 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs6 = vector.fragment<lhs> %x_bytes6 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes6 = vector.slice %w_blocks[432] : vector<576xi8> -> vector<72xi8>
+    %rhs6 = vector.fragment<rhs> %w_bytes6 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a7 = vector.mma %lhs6, %rhs6, %a6 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    %x_at7 = index.add %x_base, %c448_x : index
+    %x_values7 = vector.load %x[%x_at7] : view<16384xbf16> -> vector<64xbf16>
+    %x_bytes7 = vector.encode %x_values7 using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs7 = vector.fragment<lhs> %x_bytes7 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %w_bytes7 = vector.slice %w_blocks[504] : vector<576xi8> -> vector<72xi8>
+    %rhs7 = vector.fragment<rhs> %w_bytes7 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a8 = vector.mma %lhs7, %rhs7, %a7 : vector<72xi8>, vector<72xi8>, vector<64xf32>
+    scf.yield %a8 : vector<64xf32>
+  }
+  func.return %result : vector<64xf32>
+}
+
+// One column: ingress [c, 2] streams records (half a group: 128 tiles), compute
+// [c, 3] multiplies, egress [c, 4] drains 8 outputs per group.
+pipeline.def<kernel> @bfp_b_col(%groups: index, %column: index) run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {
+  %x_unique, %w_unique, %y_unique = buffer.assume.noalias %x_arg, %w_arg, %y_arg : buffer, buffer, buffer
+  %x_buf, %w_buf, %y_buf = buffer.assume.alignment %x_unique, %w_unique, %y_unique {minimum_alignment = 64} : buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c32 = index.constant 256 : index
+  %record_bytes = index.constant 9216 : index
+  %records = index.mul %groups, %c2 : index
+  %first_group = index.mul %column, %groups : index
+  %first_record = index.mul %first_group, %c2 : index
+  %memory = pipeline.memory<workgroup>[%column, 3] : pool
+  %x_size = index.constant 32768 : offset
+  %x_storage = buffer.alloca<workgroup> pool(%memory) align(64) %x_size : buffer
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<1x16384xbf16>
+  %x_channel = channel.bind<fifo> %x_slots, %c1 : view<1x16384xbf16>, index -> channel<tile<16384xbf16>>
+  %ring_size = index.constant 18432 : offset
+  %w_storage = buffer.alloca<workgroup> pool(%memory) align(64) %ring_size : buffer
+  %w_slots = buffer.view %w_storage[%origin] : buffer -> view<2x9216xi8>
+  %w_channel = channel.bind<fifo> %w_slots, %c2 : view<2x9216xi8>, index -> channel<tile<9216xi8>>
+  %y_size = index.constant 512 : offset
+  %y_storage = buffer.alloca<workgroup> pool(%memory) align(64) %y_size : buffer
+  %y_slots = buffer.view %y_storage[%origin] : buffer -> view<2x8x8xf32>
+  %y_channel = channel.bind<fifo> %y_slots, %c2 : view<2x8x8xf32>, index -> channel<tile<8x8xf32>>
+
+  pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {
+    %x_external = buffer.view %x_buf[%origin] : buffer -> view<16384xbf16>
+    %x_write, %x_payload = channel.reserve %x_channel : channel<tile<16384xbf16>> -> (write<tile<16384xbf16>>, view<16384xbf16>)
+    %x_copy = kernel.async.copy %x_external to %x_payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<16384xbf16> to view<16384xbf16> -> kernel.async.token
+    %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
+    kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
+    channel.publish %x_write : write<tile<16384xbf16>>
+    scf.for %record = [%c0 to %records step %c1] {
+      %global = index.add %first_record, %record : index
+      %byte_index = index.mul %global, %record_bytes : index
+      %offset = index.cast %byte_index : index to offset
+      %external = buffer.view %w_buf[%offset] : buffer -> view<9216xi8>
+      %write, %payload = channel.reserve %w_channel : channel<tile<9216xi8>> -> (write<tile<9216xi8>>, view<9216xi8>)
+      %copy = kernel.async.copy %external to %payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<9216xi8> to view<9216xi8> -> kernel.async.token
+      %group = kernel.async.group %copy : kernel.async.token -> kernel.async.group
+      kernel.async.wait %group {newer_groups = 0} : kernel.async.group
+      channel.publish %write : write<tile<9216xi8>>
+    }
+  }
+
+  pipeline.strand workers([%column, 4], [1, 1], [1, 1]) {
+    scf.for %g = [%c0 to %groups step %c1] {
+      %read, %payload = channel.acquire %y_channel : channel<tile<8x8xf32>> -> (read<tile<8x8xf32>>, view<8x8xf32>)
+      %global = index.add %first_group, %g : index
+      %out_index = index.mul %global, %c32 : index
+      %out_offset = index.cast %out_index : index to offset
+      %y_external = buffer.view %y_buf[%out_offset] : buffer -> view<8x8xf32>
+      %y_copy = kernel.async.copy %payload to %y_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<8x8xf32> to view<8x8xf32> -> kernel.async.token
+      %y_group = kernel.async.group %y_copy : kernel.async.token -> kernel.async.group
+      kernel.async.wait %y_group {newer_groups = 0} : kernel.async.group
+      channel.release %read : read<tile<8x8xf32>>
+    }
+  }
+
+  pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {
+    %base = index.constant 0 : offset
+    %c8 = index.constant 8 : index
+    %half = index.constant 128 : index
+    %x_read, %x_values = channel.acquire %x_channel : channel<tile<16384xbf16>> -> (read<tile<16384xbf16>>, view<16384xbf16>)
+    scf.for %g = [%c0 to %groups step %c1] {
+      %zero = vector.splatf 0.0 : vector<64xf32>
+      %init = vector.fragment<init> %zero shape [%c8, %c8] : vector<64xf32>
+      %r0, %w0 = channel.acquire %w_channel : channel<tile<9216xi8>> -> (read<tile<9216xi8>>, view<9216xi8>)
+      %acc0 = func.call @record_dot_batch(%x_values, %w0, %c0, %init) : (view<16384xbf16>, view<9216xi8>, index, vector<64xf32>) -> (vector<64xf32>)
+      channel.release %r0 : read<tile<9216xi8>>
+      %r1, %w1 = channel.acquire %w_channel : channel<tile<9216xi8>> -> (read<tile<9216xi8>>, view<9216xi8>)
+      %acc1 = func.call @record_dot_batch(%x_values, %w1, %half, %acc0) : (view<16384xbf16>, view<9216xi8>, index, vector<64xf32>) -> (vector<64xf32>)
+      channel.release %r1 : read<tile<9216xi8>>
+      %y_write, %y_values = channel.reserve %y_channel : channel<tile<8x8xf32>> -> (write<tile<8x8xf32>>, view<8x8xf32>)
+      vector.fragment.store<result> %acc1, %y_values[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>
+      channel.publish %y_write : write<tile<8x8xf32>>
+    }
+    channel.release %x_read : read<tile<16384xbf16>>
+  }
+}
+
+pipeline.def<kernel> public retain target(@npu) @bfp_b_m512() run(%x: buffer, %w: buffer, %y: buffer) {
+  %groups = index.constant 8 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  pipeline.compose @bfp_b_col[%groups, %c0](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c1](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c2](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c3](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c4](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c5](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c6](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c7](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+}
+
+pipeline.def<kernel> public retain target(@npu) @bfp_b_m8192() run(%x: buffer, %w: buffer, %y: buffer) {
+  %groups = index.constant 128 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  pipeline.compose @bfp_b_col[%groups, %c0](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c1](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c2](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c3](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c4](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c5](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c6](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+  pipeline.compose @bfp_b_col[%groups, %c7](%x, %w, %y) : [index, index](buffer, buffer, buffer)
+}
+
 // Scalar oracle over the blocked BF16 layout: y[8g + r] = sum_j,c Wb[g][j][r][c] x[8j + c].
 func.def inline @reference(%x: buffer, %w: buffer, %y: buffer, %groups: index) {
   %origin = index.constant 0 : offset
@@ -740,3 +989,94 @@ check.scenario public @bfp_q_m512_check {
   }
   check.return
 }
+
+// Batch of 8: x blocked Xb[j][b][c] = x_b[8j + c]; y blocked Yb[g][b][n] =
+// y_b[8g + n]; weights in the single-group packed layout (record R = 2g + h,
+// 128 tiles of 8 rows [exponent][8 mantissas]).
+func.def @set_exponents_b(%w: buffer) {
+  %origin = index.constant 0 : offset
+  %bytes = buffer.view %w[%origin] : buffer -> view<1179648xi8>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c9 = index.constant 9 : index
+  %count = index.constant 131072 : index
+  %e = scalar.constant -123 : i8
+  scf.for %r = [%c0 to %count step %c1] {
+    %at = index.mul %r, %c9 : index
+    view.store %e, %bytes[%at] : i8, view<1179648xi8>
+  }
+  func.return
+}
+
+func.def @reference_b_m512(%x: buffer, %w: buffer, %y: buffer) {
+  %origin = index.constant 0 : offset
+  %xv = buffer.view %x[%origin] : buffer -> view<256x8x8xbf16>
+  %bytes = buffer.view %w[%origin] : buffer -> view<1179648xi8>
+  %yv = buffer.view %y[%origin] : buffer -> view<64x8x8xf32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c9 = index.constant 9 : index
+  %c72 = index.constant 72 : index
+  %tiles = index.constant 256 : index
+  %group_bytes = index.constant 18432 : index
+  %groups = index.constant 64 : index
+  %fzero = scalar.constant 0.0 : f32
+  %bias = scalar.constant 133 : i32
+  scf.for %g = [%c0 to %groups step %c1] {
+    scf.for %b = [%c0 to %c8 step %c1] {
+      scf.for %n = [%c0 to %c8 step %c1] {
+        %sum = scf.for %j = [%c0 to %tiles step %c1](%acc = %fzero : f32) -> (f32) {
+          %g_at = index.mul %g, %group_bytes : index
+          %j_at = index.mul %j, %c72 : index
+          %tile_at = index.add %g_at, %j_at : index
+          %row_at = index.mul %n, %c9 : index
+          %exp_at = index.add %tile_at, %row_at : index
+          %exp_byte = view.load %bytes[%exp_at] : view<1179648xi8> -> i8
+          %exponent = scalar.extui %exp_byte : i8 to i32
+          %shift = scalar.subi %exponent, %bias : i32
+          %inner = scf.for %c = [%c0 to %c8 step %c1](%a = %acc : f32) -> (f32) {
+            %m_at1 = index.add %exp_at, %c1 : index
+            %m_at = index.add %m_at1, %c : index
+            %m_byte = view.load %bytes[%m_at] : view<1179648xi8> -> i8
+            %m = scalar.extsi %m_byte : i8 to i32
+            %integer = scalar.shli %m, %shift : i32
+            %wf = scalar.sitofp %integer : i32 to f32
+            %xb = view.load %xv[%j, %b, %c] : view<256x8x8xbf16> -> bf16
+            %xf = scalar.extf %xb : bf16 to f32
+            %next = scalar.fmaf %xf, %wf, %a : f32
+            scf.yield %next : f32
+          }
+          scf.yield %inner : f32
+        }
+        view.store %sum, %yv[%g, %b, %n] : f32, view<64x8x8xf32>
+      }
+    }
+  }
+  func.return
+}
+
+check.scenario public @bfp_b_m512_check {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[%trial] : check.entropy -> i64
+    %x = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<16384xbf16>
+    %w = check.generate.random.uniform seed(%seed) range(-16 to 16) : tensor<1179648xi8>
+    check.generate<@set_exponents_b>(%w) : (tensor<1179648xi8>) -> ()
+    %y = check.generate.fill value(0.0) : tensor<4096xf32>
+    check.compare<@bfp_b_m512, @reference_b_m512>(%x, %w, %y) : (tensor<16384xbf16>, tensor<1179648xi8>, tensor<4096xf32>) -> () {
+      check.expect.approximate actual(%y) expected(%y) atol(4.0) rtol(0.02) nan(same) : tensor<4096xf32>, tensor<4096xf32>
+    }
+  }
+  check.return
+}
+
+check.case public @bfp_b_m8192_case {
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<16384xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(0 to 100) : tensor<18874368xi8>
+  %y = check.generate.fill value(0.0) : tensor<65536xf32>
+  kernel.launch @bfp_b_m8192(%x, %w, %y) : (tensor<16384xbf16>, tensor<18874368xi8>, tensor<65536xf32>)
+  check.return
+}
+check.benchmark<@bfp_b_m8192_case> @bfp_b_m8192_time

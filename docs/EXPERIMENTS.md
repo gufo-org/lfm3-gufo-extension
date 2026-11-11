@@ -419,10 +419,45 @@ Loom limitations found on the way (noted for upstream in gufo-org/gufo#1144):
 `vector.slice` of a raw `vector<1152xi8>` has no register mapping (only a block
 fragment slices); `scalar.constant 133 : i8` is rejected (write -123).
 
-Next: the fused gate/up SwiGLU block on the NPU (two pre-encoded matrices into
-one pass, the SwiGLU epilogue on the core), then batch decode: `vector.mma`'s
-left operand has 8 rows, so up to 8 sequences share each weight tile for the
-same bytes.
+### Batch decode: eight sequences per weight tile
+
+`vector.mma`'s left operand has 8 rows, so eight sequences can share every
+weight tile. With `x` blocked as `Xb[j][b][c] = x_b[8j + c]` (32 KiB, resident
+on each compute tile), a tile's left operand is one contiguous 64-value load,
+and the 8 x 8 result is eight sequences' outputs for 8 rows. Checked against
+the scalar decoder (all 4,096 outputs at M = 512, same tolerance as above).
+
+| Variant | Sequences | Time | Weight-MACs per second | Socket power (idle) |
+| --- | ---: | ---: | ---: | ---: |
+| Pre-encoded, single group (one sequence) | 1 | 0.525 ms | 32 G/s | |
+| Pre-encoded, `x` blocked for eight sequences | 8 | 0.506 ms | 265 G/s | 26.5 W (10.9 W) |
+
+Eight sequences cost the same time as one: the NPU is DMA-bound, and encoding
+one 64-value block of `x` is no dearer than encoding the zero-padded 8-value
+one.
+
+The GPU at the same concurrency, `gufo serve llm --sessions 8` on stock HIP,
+eight concurrent 256-token greedy streams, 20 s
+([`lfm3batch.sh`](artifacts/hrx/lfm3batch.sh),
+[`httppower_batch.py`](artifacts/hrx/httppower_batch.py)):
+
+| Engine | Streams | Decode (tok/s) | Socket power (idle) | Energy per token | Above idle |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| GPU, HIP | 1 | 110.5 | 94.4 W (15.6 W) | 854 mJ | 713 mJ |
+| GPU, HIP | 8 | 565.5 | 121.1 W (13.4 W) | 214 mJ | 191 mJ |
+| NPU projection, weights only | 8 | about 157 | 26.5 W (10.9 W) | about 169 mJ | about 99 mJ |
+
+The NPU row scales the measured GEMV to LFM3-1.7B's about 1.69 G weights per
+step (about 51 ms per step for eight tokens); attention, convolutions and the
+head would add to it, and the BFP rounding is lossy. At batch eight the NPU
+would use about 20% less energy per token than the GPU on the whole socket and
+about half above idle, at about 3.6x lower throughput. At batch one it does
+not win (about 1.2 J against 0.85 J). So the NPU's efficiency case for LFM3 is
+batched background decode; its latency case does not exist.
+
+Next: the fused gate/up SwiGLU block (two pre-encoded matrices, SwiGLU on the
+core) at batch eight, then a whole LFM3 layer, to replace the weights-only
+projection with a measured one.
 
 ### Why HRX decodes LFM3 14% slower
 

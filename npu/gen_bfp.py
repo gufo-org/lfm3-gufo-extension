@@ -59,7 +59,7 @@ func.def inline @{name}(%x: view<{K}xbf16>, %row: view<64xbf16>, %w: {wtype}, %t
 '''
 
 
-def record_dot_grouped(name, per=4):
+def record_dot_grouped(name, per=8):
     """Pre-encoded record: one aligned load of `per` tiles, then slices."""
     body = []
     for i in range(per):
@@ -496,9 +496,173 @@ check.scenario public @bfp_q_m512_check {{
 """
 
 
+def record_dot_batch(name, per=8):
+    """Eight sequences: x blocked as Xb[j][b][c] = x_b[8j + c], so tile j's
+    left operand is one 64-value load; one weight tile serves all eight."""
+    body = []
+    for i in range(per):
+        body.append(f"""    %x_at{i} = index.add %x_base, %c{i * 64}_x : index
+    %x_values{i} = vector.load %x[%x_at{i}] : view<{TILES * 64}xbf16> -> vector<64xbf16>
+    %x_bytes{i} = vector.encode %x_values{i} using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+    %lhs{i} = vector.fragment<lhs> %x_bytes{i} shape [%c8, %c8] using {{schema = %schema : encoding<schema>}} : vector<72xi8>
+    %w_bytes{i} = vector.slice %w_blocks[{i * 72}] : vector<{per * 72}xi8> -> vector<72xi8>
+    %rhs{i} = vector.fragment<rhs> %w_bytes{i} shape [%c8, %c8] using {{schema = %schema : encoding<schema>}} : vector<72xi8>
+    %a{i + 1} = vector.mma %lhs{i}, %rhs{i}, %a{i} : vector<72xi8>, vector<72xi8>, vector<64xf32>""")
+    consts = '\n'.join(f'  %c{i * 64}_x = index.constant {i * 64} : index' for i in range(per))
+    nl = '\n'
+    return f"""
+func.def inline @{name}(%x: view<{TILES * 64}xbf16>, %w: view<{HALF * 72}xi8>, %tile0: index, %acc: vector<64xf32>) -> (vector<64xf32>) {{
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c64 = index.constant 64 : index
+  %cper = index.constant {per} : index
+  %cbytes = index.constant {per * 72} : index
+  %chunks = index.constant {HALF // per} : index
+{consts}
+  {SCHEMA}
+  %result = scf.for %chunk = [%c0 to %chunks step %c1](%a0 = %acc : vector<64xf32>) -> (vector<64xf32>) {{
+    %w_at = index.mul %chunk, %cbytes : index
+    %w_group = vector.load %w[%w_at] : view<{HALF * 72}xi8> -> vector<{per * 72}xi8>
+    %w_blocks = vector.fragment<rhs> %w_group shape [blocks(%cper), %c8, %c8] using {{schema = %schema : encoding<schema>}} : vector<{per * 72}xi8>
+    %tile_in = index.mul %chunk, %cper : index
+    %tile = index.add %tile0, %tile_in : index
+    %x_base = index.mul %tile, %c64 : index
+{nl.join(body)}
+    scf.yield %a{per} : vector<64xf32>
+  }}
+  func.return %result : vector<64xf32>
+}}
+"""
+
+
+def pipeline_batch(name):
+    text = pipeline(name, True)
+    xb = f'{TILES * 64}xbf16'
+    text = text.replace(f'{K}xbf16', xb)
+    text = text.replace(f'%x_size = index.constant {K * 2} : offset', f'%x_size = index.constant {TILES * 128} : offset')
+    text = text.replace('%y_size = index.constant 64 : offset', '%y_size = index.constant 512 : offset')
+    text = text.replace('8xf32', '8x8xf32').replace('%c32 = index.constant 32 : index', '%c32 = index.constant 256 : index')
+    s = text.index('    %row_size = index.constant 128')
+    e = text.index('    channel.release %x_read')
+    rec = f'{HALF * 72}xi8'
+    text = text[:s] + f"""    %x_read, %x_values = channel.acquire %x_channel : channel<tile<{xb}>> -> (read<tile<{xb}>>, view<{xb}>)
+    scf.for %g = [%c0 to %groups step %c1] {{
+      %zero = vector.splatf 0.0 : vector<64xf32>
+      %init = vector.fragment<init> %zero shape [%c8, %c8] : vector<64xf32>
+      %r0, %w0 = channel.acquire %w_channel : channel<tile<{rec}>> -> (read<tile<{rec}>>, view<{rec}>)
+      %acc0 = func.call @record_dot_batch(%x_values, %w0, %c0, %init) : (view<{xb}>, view<{rec}>, index, vector<64xf32>) -> (vector<64xf32>)
+      channel.release %r0 : read<tile<{rec}>>
+      %r1, %w1 = channel.acquire %w_channel : channel<tile<{rec}>> -> (read<tile<{rec}>>, view<{rec}>)
+      %acc1 = func.call @record_dot_batch(%x_values, %w1, %half, %acc0) : (view<{xb}>, view<{rec}>, index, vector<64xf32>) -> (vector<64xf32>)
+      channel.release %r1 : read<tile<{rec}>>
+      %y_write, %y_values = channel.reserve %y_channel : channel<tile<8x8xf32>> -> (write<tile<8x8xf32>>, view<8x8xf32>)
+      vector.fragment.store<result> %acc1, %y_values[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>
+      channel.publish %y_write : write<tile<8x8xf32>>
+    }}
+""" + text[e:]
+    return text
+
+
+BREF = f"""
+// Batch of 8: x blocked Xb[j][b][c] = x_b[8j + c]; y blocked Yb[g][b][n] =
+// y_b[8g + n]; weights in the single-group packed layout (record R = 2g + h,
+// {HALF} tiles of 8 rows [exponent][8 mantissas]).
+func.def @set_exponents_b(%w: buffer) {{
+  %origin = index.constant 0 : offset
+  %bytes = buffer.view %w[%origin] : buffer -> view<{512 * TILES * 9}xi8>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c9 = index.constant 9 : index
+  %count = index.constant {512 * TILES} : index
+  %e = scalar.constant -123 : i8
+  scf.for %r = [%c0 to %count step %c1] {{
+    %at = index.mul %r, %c9 : index
+    view.store %e, %bytes[%at] : i8, view<{512 * TILES * 9}xi8>
+  }}
+  func.return
+}}
+
+func.def @reference_b_m512(%x: buffer, %w: buffer, %y: buffer) {{
+  %origin = index.constant 0 : offset
+  %xv = buffer.view %x[%origin] : buffer -> view<{TILES}x8x8xbf16>
+  %bytes = buffer.view %w[%origin] : buffer -> view<{512 * TILES * 9}xi8>
+  %yv = buffer.view %y[%origin] : buffer -> view<64x8x8xf32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c9 = index.constant 9 : index
+  %c72 = index.constant 72 : index
+  %tiles = index.constant {TILES} : index
+  %group_bytes = index.constant {TILES * 72} : index
+  %groups = index.constant 64 : index
+  %fzero = scalar.constant 0.0 : f32
+  %bias = scalar.constant 133 : i32
+  scf.for %g = [%c0 to %groups step %c1] {{
+    scf.for %b = [%c0 to %c8 step %c1] {{
+      scf.for %n = [%c0 to %c8 step %c1] {{
+        %sum = scf.for %j = [%c0 to %tiles step %c1](%acc = %fzero : f32) -> (f32) {{
+          %g_at = index.mul %g, %group_bytes : index
+          %j_at = index.mul %j, %c72 : index
+          %tile_at = index.add %g_at, %j_at : index
+          %row_at = index.mul %n, %c9 : index
+          %exp_at = index.add %tile_at, %row_at : index
+          %exp_byte = view.load %bytes[%exp_at] : view<{512 * TILES * 9}xi8> -> i8
+          %exponent = scalar.extui %exp_byte : i8 to i32
+          %shift = scalar.subi %exponent, %bias : i32
+          %inner = scf.for %c = [%c0 to %c8 step %c1](%a = %acc : f32) -> (f32) {{
+            %m_at1 = index.add %exp_at, %c1 : index
+            %m_at = index.add %m_at1, %c : index
+            %m_byte = view.load %bytes[%m_at] : view<{512 * TILES * 9}xi8> -> i8
+            %m = scalar.extsi %m_byte : i8 to i32
+            %integer = scalar.shli %m, %shift : i32
+            %wf = scalar.sitofp %integer : i32 to f32
+            %xb = view.load %xv[%j, %b, %c] : view<{TILES}x8x8xbf16> -> bf16
+            %xf = scalar.extf %xb : bf16 to f32
+            %next = scalar.fmaf %xf, %wf, %a : f32
+            scf.yield %next : f32
+          }}
+          scf.yield %inner : f32
+        }}
+        view.store %sum, %yv[%g, %b, %n] : f32, view<64x8x8xf32>
+      }}
+    }}
+  }}
+  func.return
+}}
+
+check.scenario public @bfp_b_m512_check {{
+  check.trial[1](%trial: index, %entropy: check.entropy) {{
+    %seed = check.entropy.read %entropy[%trial] : check.entropy -> i64
+    %x = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<{TILES * 64}xbf16>
+    %w = check.generate.random.uniform seed(%seed) range(-16 to 16) : tensor<{512 * TILES * 9}xi8>
+    check.generate<@set_exponents_b>(%w) : (tensor<{512 * TILES * 9}xi8>) -> ()
+    %y = check.generate.fill value(0.0) : tensor<4096xf32>
+    check.compare<@bfp_b_m512, @reference_b_m512>(%x, %w, %y) : (tensor<{TILES * 64}xbf16>, tensor<{512 * TILES * 9}xi8>, tensor<4096xf32>) -> () {{
+      check.expect.approximate actual(%y) expected(%y) atol(4.0) rtol(0.02) nan(same) : tensor<4096xf32>, tensor<4096xf32>
+    }}
+  }}
+  check.return
+}}
+
+check.case public @bfp_b_m8192_case {{
+  %s7 = check.literal value(7) : i64
+  %s8 = check.literal value(8) : i64
+  %x = check.generate.random.uniform seed(%s7) range(-1.0 to 1.0) : tensor<{TILES * 64}xbf16>
+  %w = check.generate.random.uniform seed(%s8) range(0 to 100) : tensor<{8192 * TILES * 9}xi8>
+  %y = check.generate.fill value(0.0) : tensor<65536xf32>
+  kernel.launch @bfp_b_m8192(%x, %w, %y) : (tensor<{TILES * 64}xbf16>, tensor<{8192 * TILES * 9}xi8>, tensor<65536xf32>)
+  check.return
+}}
+check.benchmark<@bfp_b_m8192_case> @bfp_b_m8192_time
+"""
+
+
 out = HEADER + record_dot('record_dot_e', False) + record_dot_grouped('record_dot_p')
 out += record_dot_pair('record_dot_pair')
 out += pipeline('bfp_e_col', False) + pipeline('bfp_p_col', True) + pipeline_pair('bfp_q_col')
 out += wrappers('bfp_e', 'bfp_e_col', 512) + wrappers('bfp_e', 'bfp_e_col', 8192) + wrappers('bfp_p', 'bfp_p_col', 8192) + wrappers('bfp_q', 'bfp_q_col', 8192) + wrappers('bfp_q', 'bfp_q_col', 512)
-out += REFERENCE + checks() + QREF
+out += record_dot_batch('record_dot_batch') + pipeline_batch('bfp_b_col')
+out += wrappers('bfp_b', 'bfp_b_col', 512) + wrappers('bfp_b', 'bfp_b_col', 8192)
+out += REFERENCE + checks() + QREF + BREF
 open('npu_bfp_gemv.loom', 'w').write(out)
