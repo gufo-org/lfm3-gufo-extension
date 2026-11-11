@@ -134,3 +134,22 @@ The error comes from quantizing activations to Q8_0, as llama.cpp's CPU path
 also does. The block takes 1,242 µs per run, including the host's wait: 41 GB/s
 over its 51 MB of weights. With the dot products stubbed out it takes 1,168 µs,
 so the streaming side, not the arithmetic, sets the time.
+
+### Convolution layer
+
+`iron/decode.py` and `iron/decode.cc` run a whole LFM3 convolution layer
+(operator norm, B/C/x projection, causal short convolution, out projection,
+then the FFN block) in one XRT run, in four dependent phases. The convolution
+state goes to and from DDR each token. The kernels use vector arithmetic
+only (SiLU through the hardware tanh, `aie::invsqrt`, `aie::inv`), so no
+soft-float routines are linked.
+
+`iron/decode_host.py` checks two consecutive tokens of layer 0 against
+float64 model math on the Q8_0 GGUF:
+
+| Token | Convolution output | Residual | FFN output |
+| ---: | ---: | ---: | ---: |
+| 0 | 4.5e-3 | 3.7e-3 | 9.5e-3 |
+| 1 | 7.8e-3 | 4.9e-3 | 1.3e-2 |
+
+A layer takes 1,617 µs per run over 73.5 MB of records (45.5 GB/s).
