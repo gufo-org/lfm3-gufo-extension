@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <regex>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -291,6 +292,15 @@ std::string QkPrepProgram(const AttentionShape& s, const std::string& name) {
     t += Publish(n, sh);
   t += "  }\n}\n";
   (void)gstride;
+  if (s.kv_bf16) {
+    // BF16 rings: native truncation instead of @tof16 (outside the math library).
+    const auto lib_end = t.find("\npipeline.def<kernel> @" + name + "_col");
+    std::string tail = t.substr(lib_end);
+    tail = Fill(tail, {{"func.call @tof16(%kv) : (vector<16xf32>) -> (vector<16xf16>)", "vector.fptrunc %kv : vector<16xf32> to vector<16xbf16>"},
+                       {"func.call @tof16(%vv) : (vector<16xf32>) -> (vector<16xf16>)", "vector.fptrunc %vv : vector<16xf32> to vector<16xbf16>"}});
+    tail = std::regex_replace(tail, std::regex("([^b])f16\\b"), "$1bf16");
+    t = t.substr(0, lib_end) + tail;
+  }
   return t + Compose(name, args, names, types);
 }
 
@@ -680,6 +690,7 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
                      {"@SS", S(hpc * D + 16)}, {"@SX", S(hpc * D + 48)}, {"@KCBYTES", S(32 * D * 2)},
                      {"@PABYTES", S(pa * 4)}, {"@PAxf32", S(pa) + "xf32"}, {"@OTBYTES", S(hpc * D * 2)},
                      {"@OG", S(hpc * D / 8)}, {"@SLOTM", S(s.slots - 1)}, {"@SCALE", scale}, {"@D", S(D)}});
+  if (s.kv_bf16) text = std::regex_replace(text, std::regex("([^b])f16\\b"), "$1bf16");
   std::string head = "aie2p.target<array> @npu\n";
   head += kMathLibrary;
   return head + text +
@@ -708,7 +719,7 @@ std::string AttendMmaProgram(const AttentionShape& s, const std::string& name, s
   const std::uint32_t D = s.dim, Q = s.heads * D, KV = s.kv_heads * D, group = s.heads / s.kv_heads;
   const std::uint32_t hpc = s.heads / 8, JD = D / 8;
   if (s.heads % 8 || hpc * rpb > 8 || (rpb != 1 && rpb != 2 && rpb != 4) || D % 8 || D > 128 || group % hpc ||
-      hpc * 8 != 16 || s.groups || (s.capacity & (s.capacity - 1)) || s.capacity < 32 || (s.slots & (s.slots - 1)))
+      hpc * 8 != 16 || s.groups || !s.kv_bf16 || (s.capacity & (s.capacity - 1)) || s.capacity < 32 || (s.slots & (s.slots - 1)))
     throw std::invalid_argument("unsupported NPU MMA attention shape");
   const std::string common = R"(  %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
@@ -889,8 +900,8 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
         %ho = index.mul %kvh, %dim : index
         %ke = index.add %re, %ho : index
 @OFF_K
-        %k_dense = buffer.view %kpool[%k_at] : buffer -> view<@JDx32x8xf16>
-        %k_src = view.refine %k_dense : view<@JDx32x8xf16> -> view<@JDx32x8xf16, #encoding.layout.strided<strides=[8, @KV, 1]>>
+        %k_dense = buffer.view %kpool[%k_at] : buffer -> view<@JDx32x8xbf16>
+        %k_src = view.refine %k_dense : view<@JDx32x8xbf16> -> view<@JDx32x8xbf16, #encoding.layout.strided<strides=[8, @KV, 1]>>
 @COPY_K
         // S^T tiles [kt][key][q].
         scf.for %kt = [%c0 to %c4 step %c1] {
@@ -900,10 +911,8 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
             %qe = vector.encode %qv using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
             %rhs = vector.fragment<rhs> %qe shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
             %kt8 = index.mul %kt, %c8 : index
-            %km = vector.load %ks[%j, %kt8, %c0] : view<@JDx32x8xf16> -> vector<8x8xf16>
-            %kh = vector.bitcast %km : vector<8x8xf16> to vector<64xf16>
-            %kf = vector.extf %kh : vector<64xf16> to vector<64xf32>
-            %kv = vector.fptrunc %kf : vector<64xf32> to vector<64xbf16>
+            %km = vector.load %ks[%j, %kt8, %c0] : view<@JDx32x8xbf16> -> vector<8x8xbf16>
+            %kv = vector.bitcast %km : vector<8x8xbf16> to vector<64xbf16>
             %ke2 = vector.encode %kv using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
             %lhs = vector.fragment<lhs> %ke2 shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
             %init = vector.fragment<init> %acc shape [%c8, %c8] : vector<64xf32>
@@ -1047,8 +1056,8 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
         %ho = index.mul %kvh, %dim : index
         %ke = index.add %re, %ho : index
 @OFF_K
-        %v_dense = buffer.view %vpool[%k_at] : buffer -> view<@JDx32x8xf16>
-        %v_src = view.refine %v_dense : view<@JDx32x8xf16> -> view<@JDx32x8xf16, #encoding.layout.strided<strides=[8, @KV, 1]>>
+        %v_dense = buffer.view %vpool[%k_at] : buffer -> view<@JDx32x8xbf16>
+        %v_src = view.refine %v_dense : view<@JDx32x8xbf16> -> view<@JDx32x8xbf16, #encoding.layout.strided<strides=[8, @KV, 1]>>
 @COPY_V
         %pr_r, %pr = channel.acquire %pc_ch : channel<tile<192xf32>> -> (read<tile<192xf32>>, view<192xf32>)
         %prp0 = view.subview %pr[0] : view<192xf32> -> view<128xf32>
@@ -1078,10 +1087,8 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
             %pe = vector.encode %ptf using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
             %rhs = vector.fragment<rhs> %pe shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
             %vt8 = index.mul %kt, %c8 : index
-            %vm = vector.load %vs[%j, %vt8, %c0] : view<@JDx32x8xf16> -> vector<8x8xf16>
-            %vh = vector.bitcast %vm : vector<8x8xf16> to vector<64xf16>
-            %vf = vector.extf %vh : vector<64xf16> to vector<64xf32>
-            %vb = vector.fptrunc %vf : vector<64xf32> to vector<64xbf16>
+            %vm = vector.load %vs[%j, %vt8, %c0] : view<@JDx32x8xbf16> -> vector<8x8xbf16>
+            %vb = vector.bitcast %vm : vector<8x8xbf16> to vector<64xbf16>
             %vbm = vector.bitcast %vb : vector<64xbf16> to vector<8x8xbf16>
             %vt = vector.transpose<[1, 0]> %vbm : vector<8x8xbf16> -> vector<8x8xbf16>
             %vtf = vector.bitcast %vt : vector<8x8xbf16> to vector<64xbf16>
@@ -1162,9 +1169,9 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
   const std::vector<Rec> recs = {
       {"qf", S(rpb) + "x" + S(JD) + "x" + S(hpc) + "x8xf32", std::uint64_t(rpb) * JD * hpc * 8 * 4, true},
       {"qs", S(QS) + "xbf16", QS * 2, true},
-      {"ks", S(JD) + "x32x8xf16", JD * 32 * 8 * 2, true},
+      {"ks", S(JD) + "x32x8xbf16", JD * 32 * 8 * 2, true},
       {"ss", "352xf32", 352 * 4, true},
-      {"vs", S(JD) + "x32x8xf16", JD * 32 * 8 * 2, false},
+      {"vs", S(JD) + "x32x8xbf16", JD * 32 * 8 * 2, false},
       {"os", S(OF) + "xf32", OF * 4, false},
       {"st", S(ST) + "xbf16", ST * 2, false},
       {"tb", "64xbf16", 128, false}};
@@ -1177,8 +1184,8 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
     (r.scorer ? publish_a : publish_b) += Publish(r.name, r.shape);
   }
   const std::string qf_t = "view<" + S(JD) + "x" + S(hpc) + "x8xf32>";
-  const std::string kv_t = "view<" + S(JD) + "x32x8xf16>";
-  const std::string kv_src_t = "view<" + S(JD) + "x32x8xf16, #encoding.layout.strided<strides=[8, " + S(KV) + ", 1]>>";
+  const std::string kv_t = "view<" + S(JD) + "x32x8xbf16>";
+  const std::string kv_src_t = "view<" + S(JD) + "x32x8xbf16, #encoding.layout.strided<strides=[8, " + S(KV) + ", 1]>>";
   std::string text = Fill(body, {
       {"@COMMON", common}, {"@SCRATCH", scratch}, {"@RESERVE_A", reserve_a}, {"@PUBLISH_A", publish_a},
       {"@RESERVE_B", reserve_b}, {"@PUBLISH_B", publish_b},

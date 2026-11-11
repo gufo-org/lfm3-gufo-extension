@@ -23,6 +23,7 @@ struct AttentionShape {
   std::uint32_t table_rows{};   // rotary table rows (power of two)
   std::uint32_t rows{};         // rows per dispatch
   bool groups{};                // d1 group masks
+  bool kv_bf16{};               // K/V rings in BF16 instead of F16
 };
 
 // prep(qkvg Yb, q_norm, k_norm, cos, sin, meta, q out, gate out, k pool, v pool)

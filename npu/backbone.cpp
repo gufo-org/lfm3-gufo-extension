@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -48,6 +49,14 @@ std::uint32_t Pow2(std::uint32_t v) {
   while (p < v) p *= 2;
   return p;
 }
+
+float FromBf16(std::uint16_t h) {
+  const std::uint32_t u = std::uint32_t(h) << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+std::uint16_t ToBf16(float f) { return ::lfm3::npu::ToBF16(f); }
 
 // The forward with activations, K/V and convolution state on the NPU.
 struct Device {
@@ -285,8 +294,18 @@ void Backbone::SyncToHost(State& s) {
         const std::uint32_t dev = tpos % cap, host = tpos % l.capacity;
         const std::uint32_t run = std::min({s.position - tpos, cap - dev, l.capacity - host});
         const std::uint64_t at = (std::uint64_t(s.slot) * cap + dev) * row;
-        d->npu->Read(d->kpool[i], at, l.k.data() + std::size_t(host) * e, std::uint64_t(run) * row);
-        d->npu->Read(d->vpool[i], at, l.v.data() + std::size_t(host) * e, std::uint64_t(run) * row);
+        if (d->mma) {  // BF16 device rings, F16 host rings
+          std::vector<std::uint16_t> tk(std::size_t(run) * e), tv(tk.size());
+          d->npu->Read(d->kpool[i], at, tk.data(), std::uint64_t(run) * row);
+          d->npu->Read(d->vpool[i], at, tv.data(), std::uint64_t(run) * row);
+          for (std::size_t j = 0; j < tk.size(); ++j) {
+            l.k[std::size_t(host) * e + j] = _Float16(FromBf16(tk[j]));
+            l.v[std::size_t(host) * e + j] = _Float16(FromBf16(tv[j]));
+          }
+        } else {
+          d->npu->Read(d->kpool[i], at, l.k.data() + std::size_t(host) * e, std::uint64_t(run) * row);
+          d->npu->Read(d->vpool[i], at, l.v.data() + std::size_t(host) * e, std::uint64_t(run) * row);
+        }
         tpos += run;
       }
     }
@@ -318,7 +337,12 @@ void Backbone::SyncToDevice(State& s) {
         std::copy_n(l.k.begin() + std::size_t(tpos % l.capacity) * e, e, dk.begin() + std::size_t(tpos % cap) * e);
         std::copy_n(l.v.begin() + std::size_t(tpos % l.capacity) * e, e, dv.begin() + std::size_t(tpos % cap) * e);
       }
-      if (s.position) {
+      if (s.position && d->mma) {
+        std::vector<std::uint16_t> bk(dk.size()), bv(dv.size());
+        for (std::size_t j = 0; j < dk.size(); ++j) bk[j] = ToBf16(float(dk[j])), bv[j] = ToBf16(float(dv[j]));
+        d->npu->Write(d->kpool[i], std::uint64_t(s.slot) * cap * row, bk.data(), cap * row);
+        d->npu->Write(d->vpool[i], std::uint64_t(s.slot) * cap * row, bv.data(), cap * row);
+      } else if (s.position) {
         d->npu->Write(d->kpool[i], std::uint64_t(s.slot) * cap * row, dk.data(), cap * row);
         d->npu->Write(d->vpool[i], std::uint64_t(s.slot) * cap * row, dv.data(), cap * row);
       }
@@ -610,7 +634,7 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
         const std::uint32_t cap = swa ? d.cap_sliding : d.cap_global;
         timed("proj qkvg", [&] { dense->Enqueue(p.qkvg, d.xb2048, d.y_proj, blocks); });
         AttentionShape s{c.heads, c.kv_heads[il], D, p.qkvg.shape.m / 8, true, cap, Device::kSlots, d.table_rows, R,
-                         decision && !swa};
+                         decision && !swa, d.mma};
         const std::string tag = std::string(swa ? "s" : "g") + std::to_string(c.kv_heads[il]) + (s.groups ? "x" : "");
         AttentionShape s8 = s;
         s8.rows = R8;

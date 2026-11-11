@@ -97,11 +97,20 @@ int main(int argc, char** argv) {
   {  // Attention over random rings: causal, sliding (first > 0), several slots.
     AttentionShape a = s;
     a.capacity = 128;
+    a.kv_bf16 = mma;
     const int attend = npu.Compile(mma ? AttendMmaProgram(a, "attend", rpb) : AttendProgram(a, "attend"), "attend.loom", "@attend");
     std::uniform_real_distribution<float> uk(-1, 1);
     std::vector<_Float16> kpool(std::size_t(a.slots) * a.capacity * KV), vpool(kpool.size());
-    for (auto& v : kpool) v = _Float16(uk(rng));
-    for (auto& v : vpool) v = _Float16(uk(rng));
+    // Multiples of 1/64 are exact in F16 and BF16.
+    for (auto& v : kpool) v = _Float16(std::round(uk(rng) * 64) / 64);
+    for (auto& v : vpool) v = _Float16(std::round(uk(rng) * 64) / 64);
+    auto device_pool = [&](const std::vector<_Float16>& p) {
+      std::vector<std::uint16_t> out(p.size());
+      for (std::size_t i = 0; i < p.size(); ++i)
+        out[i] = mma ? lfm3::npu::ToBF16(float(p[i])) : *reinterpret_cast<const std::uint16_t*>(&p[i]);
+      return out;
+    };
+    const auto kdev = device_pool(kpool), vdev = device_pool(vpool);
     std::vector<float> q(R * H), gate(R * 16);
     for (auto& v : q) v = uk(rng);
     for (auto& v : gate) v = uk(rng) * 3;
@@ -129,8 +138,8 @@ int main(int argc, char** argv) {
     if (mma)
       for (auto& v : qin) v *= float(MmaQueryScale(D));
     const int bq2 = npu.Upload(std::span<const float>(qin)), bg2 = npu.Upload(std::span<const float>(gate_pad)),
-              bk2 = npu.Upload(std::span<const std::uint16_t>(reinterpret_cast<const std::uint16_t*>(kpool.data()), kpool.size())),
-              bv2 = npu.Upload(std::span<const std::uint16_t>(reinterpret_cast<const std::uint16_t*>(vpool.data()), vpool.size())),
+              bk2 = npu.Upload(std::span<const std::uint16_t>(kdev)),
+              bv2 = npu.Upload(std::span<const std::uint16_t>(vdev)),
               bm2 = npu.Upload(std::span<const std::int32_t>(am_pad)), bgr = npu.Upload(std::span<const std::int32_t>(groups));
     const std::uint32_t OG = H / 8, OB = (R + 7) / 8;
     const int bo = npu.Alloc((std::size_t(32) * OG * 64 + 64) * 2);
