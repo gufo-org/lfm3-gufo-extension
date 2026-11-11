@@ -176,7 +176,7 @@ RowKernel SwiGluPackKernel(std::uint32_t I, std::uint32_t rows, bool partial) {
 )",
                 {{"@LOAD", load}, {"@P", S(piece)},
                  {"@SIG", std::getenv("GUFO_LFM3_NPU_EXP_NOSIG") ? "        %sg = vector.addf %gv, %gv : vector<16xf32>\n"  // experiment only
-                                                                 : "        %sg = func.call @sigmoid(%gv) : (vector<16xf32>) -> (vector<16xf32>)\n"}});
+                                                                 : "        %sg = func.call @sigmoid_fast(%gv) : (vector<16xf32>) -> (vector<16xf32>)\n"}});
   return k;
 }
 
