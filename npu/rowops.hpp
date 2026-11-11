@@ -44,6 +44,9 @@ struct RowKernel {
   // %piece (index of the piece within the row), %row (absolute row).
   std::string body;
   std::uint32_t rows{8}, segments{1};
+  // Runtime row count: one more buffer binding (after the operands) holds
+  // the count as i32 element 0; `rows` is then the maximum.
+  bool dynamic_rows{};
 };
 
 std::string RowKernelProgram(const RowKernel& kernel);

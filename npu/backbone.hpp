@@ -31,6 +31,7 @@ struct State {
   // the host copy above is older than the device's.
   int slot{-1};
   bool host_stale{};
+  std::uint32_t synced{};  // host layers hold K/V rows below this position
   void Reset();
 };
 

@@ -203,7 +203,8 @@ std::string RowKernelProgram(const RowKernel& k) {
           (o.layout != Layout::kRows && (o.floats % 8 || !o.groups)))
         throw std::invalid_argument("unsupported NPU row operand");
   std::string args, assume_in, assume_out, types;
-  for (std::uint32_t b = 0; b < k.bindings; ++b) {
+  const std::uint32_t nb = k.bindings + (k.dynamic_rows ? 1 : 0);
+  for (std::uint32_t b = 0; b < nb; ++b) {
     args += (b ? ", " : "") + std::string("%a") + S(b) + ": buffer";
     assume_in += (b ? ", " : "") + std::string("%a") + S(b);
     assume_out += (b ? ", " : "") + std::string("%b") + S(b);
@@ -323,12 +324,55 @@ std::string RowKernelProgram(const RowKernel& k) {
     egress += copy(tag, src, src_type, tag + "_global", gtype, false) +
               "      channel.release %" + tag + "_rd : read<" + chan(o) + ">\n";
   }
+  // Each strand reads the runtime row count into its own tile.
+  // The compute tile has no DMA of its own: ingress delivers its count.
+  auto count = [&](const std::string& tile) {
+    if (!k.dynamic_rows) return std::string();
+    const std::string b = "%b" + S(k.bindings);
+    auto load = [&](const std::string& ch, const std::string& v) {
+      return "    %" + v + "_w, %" + v + " = channel.reserve %" + ch + " : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)\n"
+             "    %" + v + "_src = buffer.view " + b + "[%origin] : buffer -> view<16xi32>\n"
+             "    %" + v + "_cp = kernel.async.copy %" + v + "_src to %" + v + " {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<16xi32> to view<16xi32> -> kernel.async.token\n"
+             "    %" + v + "_g = kernel.async.group %" + v + "_cp : kernel.async.token -> kernel.async.group\n"
+             "    kernel.async.wait %" + v + "_g {newer_groups = 0} : kernel.async.group\n";
+    };
+    std::string s;
+    if (tile == "i")
+      s = load("cnt_c_ch", "cntc") + "    channel.publish %cntc_w : write<tile<16xi32>>\n" + load("cnt_o_ch", "cnto") +
+          "    channel.publish %cnto_w : write<tile<16xi32>>\n" + load("cnt_i_ch", "cnt");
+    else
+      s = "    %cnt_r, %cnt = channel.acquire %cnt_" + tile + "_ch : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)\n";
+    return s +
+           "    %cnt_raw = view.load %cnt[%c0] : view<16xi32> -> i32\n"
+           "    %cnt_mask = scalar.constant 255 : i32\n"
+           "    %cnt_b = scalar.andi %cnt_raw, %cnt_mask : i32\n"
+           "    %col_i = index.cast %column : index to i32\n"
+           "    %seven_i = scalar.constant 7 : i32\n"
+           "    %three_i = scalar.constant 3 : i32\n"
+           "    %seg_i = scalar.constant " + S(k.segments) + " : i32\n"
+           "    %items_i = scalar.muli %cnt_b, %seg_i : i32\n"
+           "    %cr0 = scalar.addi %items_i, %seven_i : i32\n"
+           "    %cr1 = scalar.subi %cr0, %col_i : i32\n"
+           "    %cr2 = scalar.shrui %cr1, %three_i : i32\n"
+           "    %item_mask = scalar.constant 16383 : i32\n"
+           "    %cr3 = scalar.andi %cr2, %item_mask : i32\n"
+           "    %my_rows_d = index.cast %cr3 : i32 to index\n";
+  };
+  auto count_end = [&](const std::string& tile) {
+    if (!k.dynamic_rows) return std::string();
+    return tile != "i" ? std::string("    channel.release %cnt_r : read<tile<16xi32>>\n")
+                       : std::string("    channel.publish %cnt_w : write<tile<16xi32>>\n");
+  };
+  const std::string bound = k.dynamic_rows ? "%my_rows_d" : "%my_rows";
+  // Work items (row, piece) spread over the columns, so a single row's
+  // pieces still use the whole array.
   const std::string loops_open =
-      "    scf.for %local = [%c0 to %my_rows step %c1] {\n"
-      "      %stride_rows = index.mul %local, %c8 : index\n"
-      "      %row = index.add %stride_rows, %column : index\n"
-      "    scf.for %piece = [%c0 to %segments step %c1] {\n";
-  const std::string loops_close = "    }\n    }\n";
+      "    scf.for %local = [%c0 to " + bound + " step %c1] {\n"
+      "      %stride_items = index.mul %local, %c8 : index\n"
+      "      %item = index.add %stride_items, %column : index\n"
+      "      %row = index.div %item, %segments : index\n"
+      "      %piece = index.rem %item, %segments : index\n";
+  const std::string loops_close = "    }\n";
   std::string text;
   text += "aie2p.target<array> @npu\n";
   text += kMathLibrary;
@@ -340,14 +384,23 @@ std::string RowKernelProgram(const RowKernel& k) {
           "  %rows = index.constant " + S(k.rows) + " : index\n"
           // rows of this column: ceil((rows - column) / 8)
           "  %c7 = index.constant 7 : index\n"
-          "  %rest = index.sub %rows, %column : index\n  %rest7 = index.add %rest, %c7 : index\n"
+          "  %items = index.mul %rows, %segments : index\n"
+          "  %rest = index.sub %items, %column : index\n  %rest7 = index.add %rest, %c7 : index\n"
           "  %my_rows = index.div %rest7, %c8 : index\n";
   text += "  %memory = pipeline.memory<workgroup>[%column, 3] : pool\n";
+  if (k.dynamic_rows) {
+    text += "  %pool_in = pipeline.memory<workgroup>[%column, 2] : pool\n  %pool_out = pipeline.memory<workgroup>[%column, 4] : pool\n";
+    for (auto [tile, pool] : std::vector<std::pair<std::string, std::string>>{{"i", "pool_in"}, {"c", "memory"}, {"o", "memory"}})
+      text += "  %cnt_" + tile + "_size = index.constant 64 : offset\n"
+              "  %cnt_" + tile + "_storage = buffer.alloca<workgroup> pool(%" + pool + ") align(64) %cnt_" + tile + "_size : buffer\n"
+              "  %cnt_" + tile + "_slots = buffer.view %cnt_" + tile + "_storage[%origin] : buffer -> view<1x16xi32>\n"
+              "  %cnt_" + tile + "_ch = channel.bind<fifo> %cnt_" + tile + "_slots, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>\n";
+  }
   text += decl;
-  text += "  pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {\n" + loops_open + ingress + loops_close + "  }\n";
-  text += "  pipeline.strand workers([%column, 4], [1, 1], [1, 1]) {\n" + loops_open + egress + loops_close + "  }\n";
-  text += "  pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {\n" +
-          loops_open + acquire + k.body + publish + release + loops_close + "  }\n}\n";
+  text += "  pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {\n" + count("i") + loops_open + ingress + loops_close + count_end("i") + "  }\n";
+  text += "  pipeline.strand workers([%column, 4], [1, 1], [1, 1]) {\n" + count("o") + loops_open + egress + loops_close + count_end("o") + "  }\n";
+  text += "  pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {\n" + count("c") +
+          loops_open + acquire + k.body + publish + release + loops_close + count_end("c") + "  }\n}\n";
   text += "\npipeline.def<kernel> public retain target(@npu) @" + k.name + "() run(" + args + ") {\n";
   for (std::uint32_t c = 0; c < 8; ++c) text += "  %k" + S(c) + " = index.constant " + S(c) + " : index\n";
   for (std::uint32_t c = 0; c < 8; ++c)

@@ -55,7 +55,8 @@ RowKernel NormPackKernel(std::uint32_t H, std::uint32_t rows, Residual residual,
   if (residual == Residual::kRows) k.inputs.push_back({"y", b++, H, 0, H});
   const std::uint32_t wfloats = (residual != Residual::kNone && post) ? 2 * H : H;
   k.inputs.push_back({"w", b++, 0, 0, wfloats});
-  if (residual != Residual::kNone) k.outputs.push_back({"x2", b++, H, 0, H});
+  // The last layer's variant (rows_out) skips the residual nobody reads.
+  if (residual != Residual::kNone && !rows_out) k.outputs.push_back({"x2", b++, H, 0, H});
   k.outputs.push_back({"xb", b++, 0, 0, H, true, Layout::kBlocked, H / 8});
   if (rows_out) k.outputs.push_back({"z", b++, H, 0, H});
   k.bindings = b;
@@ -79,7 +80,7 @@ RowKernel NormPackKernel(std::uint32_t H, std::uint32_t rows, Residual residual,
         %ys = func.call @fmul(%yv, %scale_post) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         %yw = func.call @fmul(%ys, %wv) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         %s = vector.addf %xv, %yw : vector<16xf32>
-        vector.store %s, %x2[%i] : vector<16xf32>, view<@Nxf32>
+        vector.store %s, %@RES[%i] : vector<16xf32>, view<@Nxf32>
       }
 )";
     } else {
@@ -87,11 +88,11 @@ RowKernel NormPackKernel(std::uint32_t H, std::uint32_t rows, Residual residual,
         %xv = vector.load %x[%i] : view<@Nxf32> -> vector<16xf32>
         %yv = vector.load %y[%i] : view<@Nxf32> -> vector<16xf32>
         %s = vector.addf %xv, %yv : vector<16xf32>
-        vector.store %s, %x2[%i] : vector<16xf32>, view<@Nxf32>
+        vector.store %s, %@RES[%i] : vector<16xf32>, view<@Nxf32>
       }
 )";
     }
-    src = "x2";
+    src = rows_out ? "x" : "x2";
   }
   body += Scale(src, "norm");
   body += Fill(R"(      scf.for %i = [%c0 to %n step %c16] {
@@ -105,7 +106,8 @@ RowKernel NormPackKernel(std::uint32_t H, std::uint32_t rows, Residual residual,
 @Z      }
 )",
                {{"@SRC", src}, {"@Z", rows_out ? "        vector.store %u, %z[%i] : vector<16xf32>, view<@Nxf32>\n" : ""}});
-  k.body = Fill(body, {{"@N", S(H)}, {"@WF", S(wfloats)}});
+  // Without x2 the sum overwrites x in the tile (x is not written back).
+  k.body = Fill(body, {{"@N", S(H)}, {"@WF", S(wfloats)}, {"@RES", rows_out ? "x" : "x2"}});
   return k;
 }
 
