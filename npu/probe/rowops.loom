@@ -1,0 +1,204 @@
+// Primitive check for NPU row kernels: RMSNorm of 8 rows of 2048 F32 with a
+// weight vector, one row per column.
+aie2p.target<array> @npu
+
+// a * b per lane to about f32 precision: AIE2P multiplies BF16 pairs into
+// F32 (vector.dot2f), so each operand splits into three BF16 parts and the
+// six leading cross products accumulate, smallest first.
+func.def inline @fmul(%a: vector<16xf32>, %b: vector<16xf32>) -> (vector<16xf32>) {
+  %a1 = vector.fptrunc %a : vector<16xf32> to vector<16xbf16>
+  %a1f = vector.extf %a1 : vector<16xbf16> to vector<16xf32>
+  %ar = vector.subf %a, %a1f : vector<16xf32>
+  %a2 = vector.fptrunc %ar : vector<16xf32> to vector<16xbf16>
+  %a2f = vector.extf %a2 : vector<16xbf16> to vector<16xf32>
+  %ar2 = vector.subf %ar, %a2f : vector<16xf32>
+  %a3 = vector.fptrunc %ar2 : vector<16xf32> to vector<16xbf16>
+  %b1 = vector.fptrunc %b : vector<16xf32> to vector<16xbf16>
+  %b1f = vector.extf %b1 : vector<16xbf16> to vector<16xf32>
+  %br = vector.subf %b, %b1f : vector<16xf32>
+  %b2 = vector.fptrunc %br : vector<16xf32> to vector<16xbf16>
+  %b2f = vector.extf %b2 : vector<16xbf16> to vector<16xf32>
+  %br2 = vector.subf %br, %b2f : vector<16xf32>
+  %b3 = vector.fptrunc %br2 : vector<16xf32> to vector<16xbf16>
+  %zero = vector.splatf 0.0 : vector<16xf32>
+  %l0 = vector.interleave<0> %a1, %a2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %r0 = vector.interleave<0> %b3, %b2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %s0 = vector.dot2f %l0, %r0, %zero : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+  %l1 = vector.interleave<0> %a3, %a1 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %r1 = vector.interleave<0> %b1, %b2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %s1 = vector.dot2f %l1, %r1, %s0 : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+  %l2 = vector.interleave<0> %a2, %a1 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %r2 = vector.interleave<0> %b1, %b1 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %s2 = vector.dot2f %l2, %r2, %s1 : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+  func.return %s2 : vector<16xf32>
+}
+
+// 1 / sqrt(x) per lane for x > 0 without division or scalar float math
+// (AIE2P cores emulate scalar f32): the bit estimate and three Newton steps.
+func.def inline @rsqrt(%x: vector<16xf32>) -> (vector<16xf32>) {
+  %magic = vector.splati 1597463007 : vector<16xi32>
+  %one_i = vector.splati 1 : vector<16xi32>
+  %half = vector.splatf 0.5 : vector<16xf32>
+  %three_halves = vector.splatf 1.5 : vector<16xf32>
+  %bits = vector.bitcast %x : vector<16xf32> to vector<16xi32>
+  %shifted = vector.shrui %bits, %one_i : vector<16xi32>
+  %guess_bits = vector.subi %magic, %shifted : vector<16xi32>
+  %y0 = vector.bitcast %guess_bits : vector<16xi32> to vector<16xf32>
+  %hx = func.call @fmul(%x, %half) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %a0 = func.call @fmul(%y0, %y0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %b0 = func.call @fmul(%hx, %a0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %c0 = vector.subf %three_halves, %b0 : vector<16xf32>
+  %y1 = func.call @fmul(%y0, %c0) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %a1 = func.call @fmul(%y1, %y1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %b1 = func.call @fmul(%hx, %a1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %c1 = vector.subf %three_halves, %b1 : vector<16xf32>
+  %y2 = func.call @fmul(%y1, %c1) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %a2 = func.call @fmul(%y2, %y2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %b2 = func.call @fmul(%hx, %a2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  %c2 = vector.subf %three_halves, %b2 : vector<16xf32>
+  %y3 = func.call @fmul(%y2, %c2) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+  func.return %y3 : vector<16xf32>
+}
+
+pipeline.def<kernel> @norm_col(%column: index) run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {
+  %x_buf, %w_buf, %y_buf = buffer.assume.alignment %x_arg, %w_arg, %y_arg {minimum_alignment = 64} : buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %row_bytes = index.constant 8192 : index
+  %memory = pipeline.memory<workgroup>[%column, 3] : pool
+  %size = index.constant 8192 : offset
+  %x_storage = buffer.alloca<workgroup> pool(%memory) align(64) %size : buffer
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<1x2048xf32>
+  %x_channel = channel.bind<fifo> %x_slots, %c1 : view<1x2048xf32>, index -> channel<tile<2048xf32>>
+  %w_storage = buffer.alloca<workgroup> pool(%memory) align(64) %size : buffer
+  %w_slots = buffer.view %w_storage[%origin] : buffer -> view<1x2048xf32>
+  %w_channel = channel.bind<fifo> %w_slots, %c1 : view<1x2048xf32>, index -> channel<tile<2048xf32>>
+  %y_storage = buffer.alloca<workgroup> pool(%memory) align(64) %size : buffer
+  %y_slots = buffer.view %y_storage[%origin] : buffer -> view<1x2048xf32>
+  %y_channel = channel.bind<fifo> %y_slots, %c1 : view<1x2048xf32>, index -> channel<tile<2048xf32>>
+  pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {
+    %wx = buffer.view %w_buf[%origin] : buffer -> view<2048xf32>
+    %ww, %wp = channel.reserve %w_channel : channel<tile<2048xf32>> -> (write<tile<2048xf32>>, view<2048xf32>)
+    %wc = kernel.async.copy %wx to %wp {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<2048xf32> to view<2048xf32> -> kernel.async.token
+    %wg = kernel.async.group %wc : kernel.async.token -> kernel.async.group
+    kernel.async.wait %wg {newer_groups = 0} : kernel.async.group
+    channel.publish %ww : write<tile<2048xf32>>
+    %b = index.mul %column, %row_bytes : index
+    %o = index.cast %b : index to offset
+    %xe = buffer.view %x_buf[%o] : buffer -> view<2048xf32>
+    %xw, %xp = channel.reserve %x_channel : channel<tile<2048xf32>> -> (write<tile<2048xf32>>, view<2048xf32>)
+    %xc = kernel.async.copy %xe to %xp {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<2048xf32> to view<2048xf32> -> kernel.async.token
+    %xg = kernel.async.group %xc : kernel.async.token -> kernel.async.group
+    kernel.async.wait %xg {newer_groups = 0} : kernel.async.group
+    channel.publish %xw : write<tile<2048xf32>>
+  }
+  pipeline.strand workers([%column, 4], [1, 1], [1, 1]) {
+    %b = index.mul %column, %row_bytes : index
+    %o = index.cast %b : index to offset
+    %ye = buffer.view %y_buf[%o] : buffer -> view<2048xf32>
+    %yr, %yp = channel.acquire %y_channel : channel<tile<2048xf32>> -> (read<tile<2048xf32>>, view<2048xf32>)
+    %yc = kernel.async.copy %yp to %ye {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<2048xf32> to view<2048xf32> -> kernel.async.token
+    %yg = kernel.async.group %yc : kernel.async.token -> kernel.async.group
+    kernel.async.wait %yg {newer_groups = 0} : kernel.async.group
+    channel.release %yr : read<tile<2048xf32>>
+  }
+  pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {
+    %step = index.constant 16 : index
+    %n = index.constant 2048 : index
+    %zero = vector.splatf 0.0 : vector<16xf32>
+    %fzero = scalar.constant 0.0 : f32
+    %wr, %wv = channel.acquire %w_channel : channel<tile<2048xf32>> -> (read<tile<2048xf32>>, view<2048xf32>)
+    %xr, %xv = channel.acquire %x_channel : channel<tile<2048xf32>> -> (read<tile<2048xf32>>, view<2048xf32>)
+    %yw, %yv = channel.reserve %y_channel : channel<tile<2048xf32>> -> (write<tile<2048xf32>>, view<2048xf32>)
+    %sq = scf.for %i = [%c0 to %n step %step](%a = %zero : vector<16xf32>) -> (vector<16xf32>) {
+      %v = vector.load %xv[%i] : view<2048xf32> -> vector<16xf32>
+      %p = func.call @fmul(%v, %v) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+      %s = vector.addf %a, %p : vector<16xf32>
+      scf.yield %s : vector<16xf32>
+    }
+    %total = vector.reduce<addf> %sq, %fzero : vector<16xf32>, f32
+    %totalv = vector.splat %total : vector<16xf32>
+    %inv_dim = vector.splatf 4.8828125e-4 : vector<16xf32>
+    %eps = vector.splatf 1.0e-5 : vector<16xf32>
+    %mean = func.call @fmul(%totalv, %inv_dim) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+    %me = vector.addf %mean, %eps : vector<16xf32>
+    %invv = func.call @rsqrt(%me) : (vector<16xf32>) -> (vector<16xf32>)
+    scf.for %i = [%c0 to %n step %step] {
+      %v = vector.load %xv[%i] : view<2048xf32> -> vector<16xf32>
+      %g = vector.load %wv[%i] : view<2048xf32> -> vector<16xf32>
+      %t = func.call @fmul(%v, %invv) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+      %u = func.call @fmul(%t, %g) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+      vector.store %u, %yv[%i] : vector<16xf32>, view<2048xf32>
+    }
+    channel.publish %yw : write<tile<2048xf32>>
+    channel.release %xr : read<tile<2048xf32>>
+    channel.release %wr : read<tile<2048xf32>>
+  }
+}
+
+pipeline.def<kernel> public retain target(@npu) @norm8() run(%x: buffer, %w: buffer, %y: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  pipeline.compose @norm_col[%c0](%x, %w, %y) : [index](buffer, buffer, buffer)
+  pipeline.compose @norm_col[%c1](%x, %w, %y) : [index](buffer, buffer, buffer)
+  pipeline.compose @norm_col[%c2](%x, %w, %y) : [index](buffer, buffer, buffer)
+  pipeline.compose @norm_col[%c3](%x, %w, %y) : [index](buffer, buffer, buffer)
+  pipeline.compose @norm_col[%c4](%x, %w, %y) : [index](buffer, buffer, buffer)
+  pipeline.compose @norm_col[%c5](%x, %w, %y) : [index](buffer, buffer, buffer)
+  pipeline.compose @norm_col[%c6](%x, %w, %y) : [index](buffer, buffer, buffer)
+  pipeline.compose @norm_col[%c7](%x, %w, %y) : [index](buffer, buffer, buffer)
+}
+
+func.def @norm8_reference(%x: buffer, %w: buffer, %y: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %n = index.constant 2048 : index
+  %fzero = scalar.constant 0.0 : f32
+  %xv = buffer.view %x[%origin] : buffer -> view<8x2048xf32>
+  %wv = buffer.view %w[%origin] : buffer -> view<2048xf32>
+  %yv = buffer.view %y[%origin] : buffer -> view<8x2048xf32>
+  scf.for %r = [%c0 to %c8 step %c1] {
+    %sum = scf.for %i = [%c0 to %n step %c1](%a = %fzero : f32) -> (f32) {
+      %v = view.load %xv[%r, %i] : view<8x2048xf32> -> f32
+      %s = scalar.fmaf %v, %v, %a : f32
+      scf.yield %s : f32
+    }
+    %dim = scalar.constant 2048.0 : f32
+    %eps = scalar.constant 1.0e-5 : f32
+    %mean = scalar.divf %sum, %dim : f32
+    %me = scalar.addf %mean, %eps : f32
+    %root = scalar.sqrtf %me : f32
+    %one = scalar.constant 1.0 : f32
+    %inv = scalar.divf %one, %root : f32
+    scf.for %i = [%c0 to %n step %c1] {
+      %v = view.load %xv[%r, %i] : view<8x2048xf32> -> f32
+      %g = view.load %wv[%i] : view<2048xf32> -> f32
+      %t = scalar.mulf %v, %inv : f32
+      %u = scalar.mulf %t, %g : f32
+      view.store %u, %yv[%r, %i] : f32, view<8x2048xf32>
+    }
+  }
+  func.return
+}
+
+check.scenario public @norm8_check {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[%trial] : check.entropy -> i64
+    %x = check.generate.random.uniform seed(%seed) range(-2.0 to 2.0) : tensor<16384xf32>
+    %w = check.generate.random.uniform seed(%seed) range(0.5 to 1.5) : tensor<2048xf32>
+    %y = check.generate.fill value(0.0) : tensor<16384xf32>
+    check.compare<@norm8, @norm8_reference>(%x, %w, %y) : (tensor<16384xf32>, tensor<2048xf32>, tensor<16384xf32>) -> () {
+      check.expect.approximate actual(%y) expected(%y) atol(1e-4) rtol(1e-4) nan(same) : tensor<16384xf32>, tensor<16384xf32>
+    }
+  }
+  check.return
+}
