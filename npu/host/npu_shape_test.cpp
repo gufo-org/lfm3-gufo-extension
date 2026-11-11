@@ -40,12 +40,13 @@ int main(int argc, char** argv) {
     int kernel;
     try {
       const bool kmulti = (chain || (std::getenv("KMULTI") && c.blocks > 1)) && shape.split == g::Split::kColumns;
-      std::string program = kmulti ? g::ProjectionKMultiProgram(shape, chain) : std::string();
+      const bool dual = chain && std::getenv("DUAL") && g::DualBlocksPerCore(shape) > 0;
+      std::string program = dual ? g::ProjectionDualProgram(shape) : kmulti ? g::ProjectionKMultiProgram(shape, chain) : std::string();
       if (const char* f = std::getenv("KM_FILE")) {  // experiment: a hand-edited program
         std::ifstream in(f);
         program.assign(std::istreambuf_iterator<char>(in), {});
       }
-      kernel = kmulti ? npu.Compile(program, "projection.loom", g::ProjectionRoot(shape) + (chain ? "_kchain" : "_kmulti"))
+      kernel = kmulti ? npu.Compile(program, "projection.loom", g::ProjectionRoot(shape) + (dual ? "_kdual" : chain ? "_kchain" : "_kmulti"))
                       : npu.Compile(g::ProjectionProgram(shape), "projection.loom", g::ProjectionRoot(shape));
     } catch (const std::exception& e) {
       std::printf("%s: %s\n", g::ProjectionRoot(shape).c_str(), e.what());

@@ -734,4 +734,281 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
          compose + "}\n";
 }
 
+std::uint32_t DualBlocksPerCore(const ProjectionShape& s) {
+  // Blocks per core and pass: 2 * bp must divide the dispatch's blocks, and
+  // core A's tile holds the staging chunks, its weight ring, its encoded
+  // activations and its chain records.
+  if (s.split != Split::kColumns || s.blocks < 2) return 0;
+  const std::uint32_t x_tiles = s.k / 8 / kColumns;
+  const std::uint64_t rec = std::uint64_t(x_tiles) * 72, stage = 2ull * StageTiles(x_tiles) * 128;
+  std::uint32_t bp = 0;
+  for (std::uint32_t b = 1; 2 * b <= s.blocks; ++b)
+    if (s.blocks % (2 * b) == 0 && stage + 2 * rec + b * rec + 2ull * b * 256 + 2048 <= 60 * 1024) bp = b;
+  return bp;
+}
+
+std::string ProjectionDualProgram(const ProjectionShape& s) {
+  // K split with two matrix cores per column. Column c holds K / 8 of every
+  // block. Per pass of 2 bp blocks:
+  //   [c,2] loader: BF16 activation chunks into core A's tile, weight
+  //         records into a memory-tile ring;
+  //   DMA:  each weight record fans out to rings in tiles 3 and 4;
+  //   [c,3] core A: encodes all 2 bp blocks (B's half straight into tile 4)
+  //         and multiplies blocks [0, bp);
+  //   [c,4] core B: multiplies blocks [bp, 2 bp).
+  // Each core seeds its accumulators with its west neighbour's sums (one
+  // chain per row); column 7 writes y (one part, ProjectionProgram's row
+  // layout) through [7,5].
+  const std::uint32_t bp = DualBlocksPerCore(s);
+  if (!bp) throw std::invalid_argument("dual-core projection needs two blocks per pass");
+  const std::uint32_t tiles = s.k / 8, x_tiles = tiles / kColumns, record_tiles = x_tiles, groups = s.m / 8;
+  if (record_tiles % kPer || s.m % 8) throw std::invalid_argument("unsupported NPU projection shape");
+  const std::uint32_t ct = StageTiles(x_tiles), nq = x_tiles / ct, passes = s.blocks / (2 * bp);
+  const std::uint32_t per_call = BlocksPerCall(bp);
+  const std::string rec = S(record_tiles * 72) + "xi8", rt = "tile<" + rec + ">";
+  const std::string xr = S(ct * 64) + "xbf16", xt = "tile<" + xr + ">";
+  const std::string xen = S(std::uint64_t(bp) * x_tiles * 72) + "xi8", xet = "tile<" + xen + ">";
+  const std::string yr = S(bp) + "x64xf32", ytt = "tile<" + yr + ">";
+  const std::string dot = "dot_x" + S(x_tiles) + "_r" + S(record_tiles) + "_b" + S(per_call);
+  const std::string name = ProjectionRoot(s).substr(1) + "_kdual";
+  auto dot_calls = [&](const std::string& xe, bool west) {
+    std::string t;
+    if (!west) t += "            %zv = vector.splatf 0.0 : vector<64xf32>\n            %zi = vector.fragment<init> %zv shape [%c8, %c8] : vector<64xf32>\n";
+    for (std::uint32_t b0 = 0; b0 < bp; b0 += per_call) {
+      std::string res, types, stores, inits, init_types;
+      for (std::uint32_t b = b0; b < b0 + per_call; ++b) {
+        const std::string B = S(b);
+        res += (b > b0 ? ", %acc" : "%acc") + B;
+        types += b > b0 ? ", vector<64xf32>" : "vector<64xf32>";
+        stores += "            %ys" + B + " = view.subview %y_rec[" + B + ", 0] : view<" + yr + "> -> view<1x64xf32>\n" +
+                  "            %yv" + B + " = view.bitcast %ys" + B + " : view<1x64xf32> -> view<8x8xf32>\n" +
+                  "            vector.fragment.store<result> %acc" + B + ", %yv" + B + "[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>\n";
+        if (west)
+          t += "            %ws" + B + " = view.subview %west_rec[" + B + ", 0] : view<" + yr + "> -> view<1x64xf32>\n" +
+               "            %wv" + B + " = view.bitcast %ws" + B + " : view<1x64xf32> -> view<64xf32>\n" +
+               "            %wl" + B + " = vector.load %wv" + B + "[%c0] : view<64xf32> -> vector<64xf32>\n" +
+               "            %wi" + B + " = vector.fragment<init> %wl" + B + " shape [%c8, %c8] : vector<64xf32>\n";
+        inits += west ? ", %wi" + B : std::string(", %zi");
+        init_types += ", vector<64xf32>";
+      }
+      t += "            %xb" + S(b0) + " = index.constant " + S(std::uint64_t(b0) * x_tiles * 72) + " : index\n            " + res +
+           " = func.call @" + dot + "(" + xe + ", %w_values, %c0, %xb" + S(b0) + inits + ") : (view<" + xen + ">, view<" + rec +
+           ">, index, index" + init_types + ") -> (" + types + ")\n" + stores;
+    }
+    return t;
+  };
+  // One matrix core's group loop: weights from `wch`, encoded activations
+  // `xe`, chain records out through `ych`.
+  auto group_loop = [&](const std::string& wch, const std::string& xe, const std::string& ych, bool west, const std::string& west_ch) {
+    return "      scf.for %g = [%c0 to %groups step %c1] {\n"
+           "        %w_read, %w_values = channel.acquire " + wch + " : channel<" + rt + "> -> (read<" + rt + ">, view<" + rec + ">)\n" +
+           (west ? "        %west_read, %west_rec = channel.acquire " + west_ch + " : channel<" + ytt + "> -> (read<" + ytt + ">, view<" + yr + ">)\n" : "") +
+           "        %y_write, %y_rec = channel.reserve " + ych + " : channel<" + ytt + "> -> (write<" + ytt + ">, view<" + yr + ">)\n" +
+           dot_calls(xe, west) +
+           "        channel.publish %y_write : write<" + ytt + ">\n" +
+           (west ? "        channel.release %west_read : read<" + ytt + ">\n" : "") +
+           "        channel.release %w_read : read<" + rt + ">\n"
+           "      }\n";
+  };
+  std::string flat;
+  for (std::uint32_t c = 0; c < kColumns; ++c) {
+    const bool west = c > 0, last = c + 1 == kColumns;
+    std::string t = Replace(R"(  %column = index.constant @C : index
+  %x_unique, %w_unique, %y_unique = buffer.assume.noalias %x_arg, %w_arg, %y_arg : buffer, buffer, buffer
+  %x_buf, %w_buf, %y_buf = buffer.assume.alignment %x_unique, %w_unique, %y_unique {minimum_alignment = 64} : buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c8 = index.constant 8 : index
+  %c64e = index.constant 64 : index
+  %c72e = index.constant 72 : index
+  %passes = index.constant @PASSES : index
+  %bp = index.constant @BP : index
+  %bp2 = index.constant @BP2 : index
+  %groups = index.constant @GROUPS : index
+  %nq = index.constant @NQ : index
+  %ct = index.constant @CT : index
+  %record_bytes = index.constant @RECBYTES : index
+  %tile_bytes = index.constant 128 : index
+  %out_bytes = index.constant 256 : index
+  %block_tiles = index.constant @TILES : index
+  %column_tiles = index.constant @XTILES : index
+  %x_column = index.mul %column, %column_tiles : index
+  %first_record = index.mul %column, %groups : index
+  %memA = pipeline.memory<workgroup>[%column, 3] : pool
+  %memB = pipeline.memory<workgroup>[%column, 4] : pool
+  %memT = pipeline.memory<workgroup>[%column, 1] : pool
+  %x_size = index.constant @XBYTES : offset
+  %x_storage = buffer.alloca<workgroup> pool(%memA) align(64) %x_size : buffer
+  %x_slots = buffer.view %x_storage[%origin] : buffer -> view<2x@XR>
+  %x_channel = channel.bind<fifo> %x_slots, %c2 : view<2x@XR>, index -> channel<@XT>
+  %ring_size = index.constant @RINGBYTES : offset
+  %wm_storage = buffer.alloca<workgroup> pool(%memT) align(64) %ring_size : buffer
+  %wm_slots = buffer.view %wm_storage[%origin] : buffer -> view<2x@REC>
+  %wm_ch = channel.bind<fifo> %wm_slots, %c2 : view<2x@REC>, index -> channel<@RT>
+  %wa_storage = buffer.alloca<workgroup> pool(%memA) align(64) %ring_size : buffer
+  %wa_slots = buffer.view %wa_storage[%origin] : buffer -> view<2x@REC>
+  %wa_ch = channel.bind<fifo> %wa_slots, %c2 : view<2x@REC>, index -> channel<@RT>
+  %wb_storage = buffer.alloca<workgroup> pool(%memB) align(64) %ring_size : buffer
+  %wb_slots = buffer.view %wb_storage[%origin] : buffer -> view<2x@REC>
+  %wb_ch = channel.bind<fifo> %wb_slots, %c2 : view<2x@REC>, index -> channel<@RT>
+  %xe_size = index.constant @XEBYTES : offset
+  %xea_storage = buffer.alloca<workgroup> pool(%memA) align(64) %xe_size : buffer
+  %xea_slots = buffer.view %xea_storage[%origin] : buffer -> view<1x@XEN>
+  %xea_ch = channel.bind<fifo> %xea_slots, %c1 : view<1x@XEN>, index -> channel<@XET>
+  %xeb_storage = buffer.alloca<workgroup> pool(%memB) align(64) %xe_size : buffer
+  %xeb_slots = buffer.view %xeb_storage[%origin] : buffer -> view<1x@XEN>
+  %xeb_ch = channel.bind<fifo> %xeb_slots, %c1 : view<1x@XEN>, index -> channel<@XET>
+  %y_size = index.constant @YBYTES : offset
+  %ya_storage = buffer.alloca<workgroup> pool(@YAPOOL) align(64) %y_size : buffer
+  %ya_slots = buffer.view %ya_storage[%origin] : buffer -> view<2x@YR>
+  %ya_ch = channel.bind<fifo> %ya_slots, %c2 : view<2x@YR>, index -> channel<@YT>
+  %yb_storage = buffer.alloca<workgroup> pool(%memB) align(64) %y_size : buffer
+  %yb_slots = buffer.view %yb_storage[%origin] : buffer -> view<2x@YR>
+  %yb_ch = channel.bind<fifo> %yb_slots, %c2 : view<2x@YR>, index -> channel<@YT>
+
+  pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {
+    scf.for %pass = [%c0 to %passes step %c1] {
+      %blk0 = index.mul %pass, %bp2 : index
+      scf.for %b = [%c0 to %bp2 step %c1] {
+        %blk = index.add %blk0, %b : index
+        %x_block = index.mul %blk, %block_tiles : index
+        %x_first = index.add %x_block, %x_column : index
+        scf.for %q = [%c0 to %nq step %c1] {
+          %x_q = index.mul %q, %ct : index
+          %x_tile = index.add %x_first, %x_q : index
+          %x_byte = index.mul %x_tile, %tile_bytes : index
+          %x_offset = index.cast %x_byte : index to offset
+          %x_dense = buffer.view %x_buf[%x_offset] : buffer -> view<@CTx64xbf16>
+          %x_write, %x_payload = channel.reserve %x_channel : channel<@XT> -> (write<@XT>, view<@XR>)
+          %x_local = view.bitcast %x_payload : view<@XR> -> view<@CTx64xbf16>
+          %x_copy = kernel.async.copy %x_dense to %x_local {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<@CTx64xbf16> to view<@CTx64xbf16> -> kernel.async.token
+          %x_group = kernel.async.group %x_copy : kernel.async.token -> kernel.async.group
+          kernel.async.wait %x_group {newer_groups = 0} : kernel.async.group
+          channel.publish %x_write : write<@XT>
+        }
+      }
+      scf.for %g = [%c0 to %groups step %c1] {
+        %global = index.add %g, %first_record : index
+        %byte_index = index.mul %global, %record_bytes : index
+        %offset = index.cast %byte_index : index to offset
+        %external = buffer.view %w_buf[%offset] : buffer -> view<@REC>
+        %write, %payload = channel.reserve %wm_ch : channel<@RT> -> (write<@RT>, view<@REC>)
+        %copy = kernel.async.copy %external to %payload {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<@REC> to view<@REC> -> kernel.async.token
+        %group = kernel.async.group %copy : kernel.async.token -> kernel.async.group
+        kernel.async.wait %group {newer_groups = 0} : kernel.async.group
+        channel.publish %write : write<@RT>
+      }
+    }
+  }
+
+  pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {
+    scf.for %pass = [%c0 to %passes step %c1] {
+      scf.for %g = [%c0 to %groups step %c1] {
+        %read, %payload = channel.acquire %wm_ch : channel<@RT> -> (read<@RT>, view<@REC>)
+        %ra, %rb = channel.fanout %read : read<@RT> -> (read<@RT>, read<@RT>)
+        %wa_w, %wa_p = channel.reserve %wa_ch : channel<@RT> -> (write<@RT>, view<@REC>)
+        %wb_w, %wb_p = channel.reserve %wb_ch : channel<@RT> -> (write<@RT>, view<@REC>)
+        channel.copy %ra -> %wa_w : read<@RT>, write<@RT>
+        channel.copy %rb -> %wb_w : read<@RT>, write<@RT>
+      }
+    }
+  }
+
+  pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {
+    %xea_w, %xea = channel.reserve %xea_ch : channel<@XET> -> (write<@XET>, view<@XEN>)
+    @SCHEMA
+    scf.for %pass = [%c0 to %passes step %c1] {
+      %xeb_w, %xeb = channel.reserve %xeb_ch : channel<@XET> -> (write<@XET>, view<@XEN>)
+#ENCODE_A#
+#ENCODE_B#
+      channel.publish %xeb_w : write<@XET>
+#GROUPS_A#
+    }
+    channel.publish %xea_w : write<@XET>
+  }
+
+  pipeline.strand workers([%column, 4], [1, 1], [1, 1]) {
+    scf.for %pass = [%c0 to %passes step %c1] {
+      %xeb_r, %xeb = channel.acquire %xeb_ch : channel<@XET> -> (read<@XET>, view<@XEN>)
+#GROUPS_B#
+      channel.release %xeb_r : read<@XET>
+    }
+  }
+#STORER#)", {});
+    auto encode = [&](const std::string& dst, std::uint32_t) {
+      return Replace(R"(      scf.for %eb = [%c0 to %bp step %c1] {
+        %eb_tiles = index.mul %eb, %column_tiles : index
+        scf.for %q = [%c0 to %nq step %c1] {
+          %x_read, %x_bf = channel.acquire %x_channel : channel<@XT> -> (read<@XT>, view<@XR>)
+          %eq = index.mul %q, %ct : index
+          %e0 = index.add %eb_tiles, %eq : index
+          scf.for %et = [%c0 to %ct step %c1] {
+            %eo = index.mul %et, %c64e : index
+            %ev = vector.load %x_bf[%eo] : view<@XR> -> vector<64xbf16>
+            %ee = vector.encode %ev using %schema : vector<64xbf16>, encoding<schema> -> vector<72xi8>
+            %ei = index.add %e0, %et : index
+            %ed = index.mul %ei, %c72e : index
+            vector.store %ee, @DST[%ed] : vector<72xi8>, view<@XEN>
+          }
+          channel.release %x_read : read<@XT>
+        }
+      }
+)", {{"@DST", dst}});
+    };
+    std::string storer;
+    if (last) {
+      storer = R"(
+  pipeline.strand workers([%column, 5], [1, 1], [1, 1]) {
+    %bst = index.constant @BST : index
+    scf.for %pass = [%c0 to %passes step %c1] {
+      %blk0 = index.mul %pass, %bp2 : index
+      %blkb = index.add %blk0, %bp : index
+      scf.for %g = [%c0 to %groups step %c1] {
+#STORE_A#
+#STORE_B#
+      }
+    }
+  }
+)";
+      auto store = [&](const std::string& ch, const std::string& blk, const std::string& tag) {
+        return Replace(R"(        %@T_read, %@T_payload = channel.acquire @CH : channel<@YT> -> (read<@YT>, view<@YR>)
+        %@T_bo = index.mul @BLK, %groups : index
+        %@T_o = index.add %@T_bo, %g : index
+        %@T_oi = index.mul %@T_o, %out_bytes : index
+        %@T_off = index.cast %@T_oi : index to offset
+        %@T_dense = buffer.view %y_buf[%@T_off] : buffer -> view<@BPx@BSTVx64xf32>
+        %@T_str = view.refine %@T_dense : view<@BPx@BSTVx64xf32> -> view<@BPx@BSTVx64xf32, #encoding.layout.strided<strides=[@BSF, 64, 1]>>
+        %@T_ext = view.subview %@T_str[0, 0, 0] : view<@BPx@BSTVx64xf32, #encoding.layout.strided<strides=[@BSF, 64, 1]>> -> view<@BPx1x64xf32, #encoding.layout.strided<strides=[@BSF, 64, 1]>>
+        %@T_loc = view.bitcast %@T_payload : view<@YR> -> view<@BPx1x64xf32>
+        %@T_cp = kernel.async.copy %@T_loc to %@T_ext {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<@BPx1x64xf32> to view<@BPx1x64xf32, #encoding.layout.strided<strides=[@BSF, 64, 1]>> -> kernel.async.token
+        %@T_grp = kernel.async.group %@T_cp : kernel.async.token -> kernel.async.group
+        kernel.async.wait %@T_grp {newer_groups = 0} : kernel.async.group
+        channel.release %@T_read : read<@YT>
+)", {{"@T", tag}, {"@CH", ch}, {"@BLK", blk}});
+      };
+      storer = Replace(storer, {{"#STORE_A#", store("%ya_ch", "%blk0", "sa")}, {"#STORE_B#", store("%yb_ch", "%blkb", "sb")}});
+    }
+    t = Replace(t, {{"#ENCODE_A#", encode("%xea", 0)}, {"#ENCODE_B#", encode("%xeb", 1)},
+                    {"#GROUPS_A#", group_loop("%wa_ch", "%xea", "%ya_ch", west, "#WEST_A#")},
+                    {"#GROUPS_B#", group_loop("%wb_ch", "%xeb", "%yb_ch", west, "#WEST_B#")},
+                    {"#STORER#", storer}});
+    t = Replace(t, {{"@YAPOOL", last ? "%memB" : "%memA"}, {"@PASSES", S(passes)}, {"@BP2", S(2 * bp)},
+                    {"@BPx@BSTVx64xf32", S(bp) + "x" + S(groups) + "x64xf32"}, {"@BPx1x64xf32", S(bp) + "x1x64xf32"},
+                    {"@BP", S(bp)}, {"@GROUPS", S(groups)}, {"@NQ", S(nq)}, {"@CTx64xbf16", S(ct) + "x64xbf16"}, {"@CT", S(ct)},
+                    {"@RECBYTES", S(record_tiles * 72)}, {"@TILES", S(tiles)}, {"@XTILES", S(x_tiles)},
+                    {"@XBYTES", S(2ull * ct * 128)}, {"@RINGBYTES", S(2ull * record_tiles * 72)},
+                    {"@XEBYTES", S((std::uint64_t(bp) * x_tiles * 72 + 63) / 64 * 64)}, {"@YBYTES", S(2ull * bp * 256)},
+                    {"@BSF", S(std::uint64_t(groups) * 64)}, {"@BST", S(groups)},
+                    {"@XR", xr}, {"@XT", xt}, {"@XEN", xen}, {"@XET", xet}, {"@REC", rec}, {"@RT", rt}, {"@YR", yr}, {"@YT", ytt},
+                    {"@SCHEMA", kSchema}});
+    t = Replace(t, {{"@C ", S(c) + " "}});
+    t = SuffixNames(t, "_k" + S(c), {"%x_arg", "%w_arg", "%y_arg"});
+    flat += Replace(t, {{"#WEST_A#", "%ya_ch_k" + S(c ? c - 1 : 0)}, {"#WEST_B#", "%yb_ch_k" + S(c ? c - 1 : 0)}});
+  }
+  return "aie2p.target<array> @npu\n" + TileLoopBlocks(dot, record_tiles, x_tiles, per_call, bp, true) +
+         "\npipeline.def<kernel> public retain target(@npu) @" + name + "() run(%x_arg: buffer, %w_arg: buffer, %y_arg: buffer) {\n" + flat + "}\n";
+}
+
 }  // namespace gufo::models::lfm3::npu

@@ -36,6 +36,11 @@ std::uint32_t KSplitBlocksPerPass(const ProjectionShape& shape);
 // With `chain`, the eight column partial sums are added on chip and y holds
 // one part (ProjectionProgram's row-split layout); root suffix "_kchain".
 std::string ProjectionKMultiProgram(const ProjectionShape& shape, bool chain = false);
+// K split with two matrix cores per column (on-chip column sums, one output
+// part as with `chain`); root ProjectionRoot + "_kdual". Needs
+// DualBlocksPerCore(shape) > 0.
+std::uint32_t DualBlocksPerCore(const ProjectionShape& shape);
+std::string ProjectionDualProgram(const ProjectionShape& shape);
 
 constexpr std::uint32_t kColumns = 8;
 // func.def inline @<name>(x view, record view, first x tile, acc) -> acc:

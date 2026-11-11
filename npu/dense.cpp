@@ -37,8 +37,12 @@ struct Dense::Impl {
     // K split: each weight record serves every block held at once, and the
     // columns add their partial sums on chip (one output part).
     const bool chain = s.split == Split::kColumns;
-    const int id = chain ? npu.Compile(ProjectionKMultiProgram(s, true), "projection.loom", ProjectionRoot(s) + "_kchain")
-                         : npu.Compile(ProjectionProgram(s), "projection.loom", ProjectionRoot(s));
+    // Long prompt passes use two matrix cores per column (faster from about
+    // 12 blocks; below that the single-core chain wins).
+    const bool dual = chain && s.blocks >= 12 && DualBlocksPerCore(s) > 0;
+    const int id = dual    ? npu.Compile(ProjectionDualProgram(s), "projection.loom", ProjectionRoot(s) + "_kdual")
+                   : chain ? npu.Compile(ProjectionKMultiProgram(s, true), "projection.loom", ProjectionRoot(s) + "_kchain")
+                           : npu.Compile(ProjectionProgram(s), "projection.loom", ProjectionRoot(s));
     kernels.emplace(key, id);
     return id;
   }

@@ -668,6 +668,8 @@ int lfm3_npu_read(lfm3_npu* npu, int id, uint64_t offset, void* data,
   return lfm3_npu_fail(npu, status);
 }
 
+#define LFM3_NPU_IN_FLIGHT 32
+
 int lfm3_npu_enqueue(lfm3_npu* npu, int kernel_id, const int* buffers, int count) {
   if (kernel_id < 0 || kernel_id >= npu->kernel_count || count > 64) return 1;
   lfm3_npu_kernel_t* kernel = npu->kernels[kernel_id];
@@ -680,6 +682,14 @@ int lfm3_npu_enqueue(lfm3_npu* npu, int kernel_id, const int* buffers, int count
     refs[i] = iree_hal_make_buffer_ref(buffer, 0, iree_hal_buffer_byte_length(buffer));
   }
   const iree_hal_buffer_ref_list_t bindings = {.count = (iree_host_size_t)count, .values = refs};
+  // Every queued dispatch holds firmware-heap command memory (64 MiB per
+  // process) until it retires; a prompt pass queues about 200. Keep at most
+  // LFM3_NPU_IN_FLIGHT queued.
+  if (npu->submitted >= LFM3_NPU_IN_FLIGHT) {
+    iree_status_t wait = loom_run_hal_semaphore_wait(npu->timeline, npu->submitted - LFM3_NPU_IN_FLIGHT + 1,
+                                                     iree_infinite_timeout(), IREE_ASYNC_WAIT_FLAG_NONE);
+    if (!iree_status_is_ok(wait)) return lfm3_npu_fail(npu, wait);
+  }
   uint64_t wait_value = npu->submitted, signal_value = npu->submitted + 1;
   const iree_hal_semaphore_list_t waits = {
       .count = wait_value ? 1 : 0, .semaphores = &npu->timeline, .payload_values = &wait_value};
