@@ -70,3 +70,26 @@ Q4NX weights.
 
 `out/flm_lfm3_bench <model-dir> <assets> <ids.txt> [tokens]` times the engine
 alone on a file of token ids.
+
+## Own kernels (mlir-aie)
+
+`iron/gemv.py` is a Q8_0 matrix-vector product for decode, written with
+mlir-aie's IRON API and compiled by Peano. It uses llama.cpp's Q8_0 semantics:
+int8 weights and activations in 32-element blocks with per-block scales, and
+F32 accumulation. All 32 cores take part. Each column streams its four cores'
+weight records through one shim channel into the memory tile, which splits
+them.
+
+| 8192 × 2048 Q8_0 GEMV | Time | Weight bandwidth |
+| --- | ---: | ---: |
+| One run, waited | 389 µs | 45.8 GB/s |
+| Eight runs queued | 349 µs | 51.1 GB/s |
+
+The results match a double-precision reference to within 1.1e-3 relative.
+51 GB/s is the NPU's DRAM ceiling. At that rate LFM3-1.7B's Q8 weights
+(about 1.83 GB per token) take about 36 ms, which is Halogen's 27.3 tok/s.
+
+```sh
+python iron/gemv.py -M 8192 -K 2048 --xclbin-path gemv.xclbin --insts-path gemv.bin
+host/gemv_bench $PWD/gemv.xclbin $PWD/gemv.bin 8192 2048 8
+```
