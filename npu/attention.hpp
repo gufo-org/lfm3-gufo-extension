@@ -29,6 +29,12 @@ struct AttentionShape {
 std::string QkPrepProgram(const AttentionShape& s, const std::string& name);
 // attend(q, gate, k pool, v pool, meta, key groups, out Xb)
 std::string AttendProgram(const AttentionShape& s, const std::string& name);
+// The same bindings with BFP16 matrix units, `rows_per_block` rows (1, or
+// 4 consecutive rows of one session in order) per block of eight query
+// vectors; no d1 group masks. Throws std::invalid_argument otherwise.
+// Its queries must arrive multiplied by MmaQueryScale(dim) = log2(e) / sqrt(dim).
+std::string AttendMmaProgram(const AttentionShape& s, const std::string& name, std::uint32_t rows_per_block);
+double MmaQueryScale(std::uint32_t dim);
 
 }  // namespace gufo::models::lfm3::npu
 

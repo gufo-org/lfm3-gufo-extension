@@ -123,8 +123,11 @@ func.def @recip(%x: vector<16xf32>) -> (vector<16xf32>) {
 func.def @exp(%x: vector<16xf32>) -> (vector<16xf32>) {
   %low = vector.splatf -87.0 : vector<16xf32>
   %high = vector.splatf 88.0 : vector<16xf32>
-  %xc0 = vector.maxnumf %x, %low : vector<16xf32>
-  %xc = vector.minnumf %xc0, %high : vector<16xf32>
+  // Compare and select: AIE2P lowers F32 maxnumf/minnumf one lane at a time.
+  %is_low = vector.cmpf olt, %x, %low : vector<16xf32> -> vector<16xi1>
+  %xc0 = vector.select %is_low, %low, %x : vector<16xf32>
+  %is_high = vector.cmpf ogt, %xc0, %high : vector<16xf32> -> vector<16xi1>
+  %xc = vector.select %is_high, %high, %xc0 : vector<16xf32>
   %log2e = vector.splatf 1.44269504088896341 : vector<16xf32>
   %t = func.call @fmul(%xc, %log2e) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
   %magic = vector.splatf 12582912.0 : vector<16xf32>
@@ -169,7 +172,8 @@ func.def @exp(%x: vector<16xf32>) -> (vector<16xf32>) {
 // below -87 give 0.
 func.def @exp_fast(%x: vector<16xf32>) -> (vector<16xf32>) {
   %low = vector.splatf -87.0 : vector<16xf32>
-  %xc = vector.maxnumf %x, %low : vector<16xf32>
+  %is_low = vector.cmpf olt, %x, %low : vector<16xf32> -> vector<16xi1>
+  %xc = vector.select %is_low, %low, %x : vector<16xf32>
   %log2e = vector.splatf 1.44269504088896341 : vector<16xf32>
   %t = func.call @fmul(%xc, %log2e) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
   %r = vector.exp2f<afn> %t : vector<16xf32>

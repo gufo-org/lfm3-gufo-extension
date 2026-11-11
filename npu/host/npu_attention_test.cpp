@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <string>
 
 #include "../attention.hpp"
 #include "../host_ops.hpp"
@@ -11,13 +12,18 @@
 
 using namespace gufo::models::lfm3::npu;
 
-int main() {
+// Usage: npu_attention_test [mma [rows_per_block]]  (mma: the matrix-unit kernel)
+int main(int argc, char** argv) {
   lfm3::npu::Runtime npu;
+  const bool mma = argc > 1 && std::string(argv[1]) == "mma";
+  const std::uint32_t rpb = argc > 2 ? std::uint32_t(std::atoi(argv[2])) : 1;
   AttentionShape s{16, 4, 128, 392, true, 64, 4, 64, 9, false};
   const std::uint32_t D = s.dim, H = s.heads * D, KV = s.kv_heads * D, half = D / 2, R = s.rows;
   const std::uint32_t G = s.qkvg_groups, B = (R + 7) / 8;
-  const int prep = npu.Compile(QkPrepProgram(s, "prep"), "prep.loom", "@prep");
   std::mt19937 rng(9);
+  bool ok = true;
+  if (!mma) {
+  const int prep = npu.Compile(QkPrepProgram(s, "prep"), "prep.loom", "@prep");
   std::uniform_real_distribution<float> u(-2, 2);
   std::vector<float> yb(std::size_t(B) * G * 64 + 64), qn(D), kn(D), cosv(s.table_rows * half), sinv(cosv.size());
   for (auto& v : yb) v = u(rng);
@@ -86,11 +92,12 @@ int main() {
       wg = std::max(wg, double(std::abs(go[r * 16 + h] - row[H + 2 * KV + h])));
   }
   std::printf("prep q err %.3g  k err %.3g  v err %.3g  gate err %.3g\n", wq, wk, wv, wg);
-  bool ok = wq < 2e-4 && wk < 4e-3 && wv < 4e-3 && wg < 1e-5;
+  ok = wq < 2e-4 && wk < 4e-3 && wv < 4e-3 && wg < 1e-5;
+  }
   {  // Attention over random rings: causal, sliding (first > 0), several slots.
     AttentionShape a = s;
     a.capacity = 128;
-    const int attend = npu.Compile(AttendProgram(a, "attend"), "attend.loom", "@attend");
+    const int attend = npu.Compile(mma ? AttendMmaProgram(a, "attend", rpb) : AttendProgram(a, "attend"), "attend.loom", "@attend");
     std::uniform_real_distribution<float> uk(-1, 1);
     std::vector<_Float16> kpool(std::size_t(a.slots) * a.capacity * KV), vpool(kpool.size());
     for (auto& v : kpool) v = _Float16(uk(rng));
@@ -101,18 +108,32 @@ int main() {
     std::vector<std::int32_t> am(R * 16, 0), groups(64, 0);
     const int lasts[] = {0, 5, 31, 32, 77, 100, 127, 40, 63};
     const int firsts[] = {0, 0, 0, 0, 22, 60, 0, 9, 32};
+    // Multi-row blocks need one session's rows in position order.
+    int lasts_v[9], firsts_v[9], slots_v[9];
     for (std::uint32_t r = 0; r < R; ++r) {
-      am[r * 16 + 0] = int(r % 4);
-      am[r * 16 + 2] = firsts[r];
-      am[r * 16 + 3] = lasts[r];
+      slots_v[r] = rpb > 1 ? 2 : int(r % 4);
+      lasts_v[r] = rpb > 1 ? 70 + int(r) : lasts[r];
+      firsts_v[r] = rpb > 1 ? (r >= 5 ? 30 + int(r) : 0) : firsts[r];
+      am[r * 16 + 0] = slots_v[r];
+      am[r * 16 + 2] = firsts_v[r];
+      am[r * 16 + 3] = lasts_v[r];
       am[r * 16 + 4] = -1;
     }
-    const int bq2 = npu.Upload(std::span<const float>(q)), bg2 = npu.Upload(std::span<const float>(gate)),
+    // Bindings cover the kernel's 256-row bound (the backbone allocates the same).
+    std::vector<float> qin = q;
+    qin.resize(std::size_t(256) * H, 0.0f);
+    std::vector<float> gate_pad = gate;
+    gate_pad.resize(256 * 16, 0.0f);
+    std::vector<std::int32_t> am_pad = am;
+    am_pad.resize(256 * 16, 0);
+    if (mma)
+      for (auto& v : qin) v *= float(MmaQueryScale(D));
+    const int bq2 = npu.Upload(std::span<const float>(qin)), bg2 = npu.Upload(std::span<const float>(gate_pad)),
               bk2 = npu.Upload(std::span<const std::uint16_t>(reinterpret_cast<const std::uint16_t*>(kpool.data()), kpool.size())),
               bv2 = npu.Upload(std::span<const std::uint16_t>(reinterpret_cast<const std::uint16_t*>(vpool.data()), vpool.size())),
-              bm2 = npu.Upload(std::span<const std::int32_t>(am)), bgr = npu.Upload(std::span<const std::int32_t>(groups));
+              bm2 = npu.Upload(std::span<const std::int32_t>(am_pad)), bgr = npu.Upload(std::span<const std::int32_t>(groups));
     const std::uint32_t OG = H / 8, OB = (R + 7) / 8;
-    const int bo = npu.Alloc((std::size_t(OB) * OG * 64 + 64) * 2);
+    const int bo = npu.Alloc((std::size_t(32) * OG * 64 + 64) * 2);
     const std::int32_t cn[16] = {std::int32_t(R)};
     const int bcn = npu.Upload(std::span<const std::int32_t>(cn, 16));
     const int b2[] = {bq2, bg2, bk2, bv2, bm2, bgr, bo, bcn};
@@ -125,8 +146,8 @@ int main() {
         const std::uint32_t kh = h / (a.heads / a.kv_heads);
         std::vector<float> sc;
         float mx = -1e30f;
-        for (int t2 = firsts[r]; t2 <= lasts[r]; ++t2) {
-          const std::size_t at = (std::size_t(r % 4) * a.capacity + t2 % a.capacity) * KV + kh * D;
+        for (int t2 = firsts_v[r]; t2 <= lasts_v[r]; ++t2) {
+          const std::size_t at = (std::size_t(slots_v[r]) * a.capacity + t2 % a.capacity) * KV + kh * D;
           float d = 0;
           for (std::uint32_t i = 0; i < D; ++i) d += q[r * H + h * D + i] * float(kpool[at + i]);
           sc.push_back(d / std::sqrt(float(D)));
@@ -136,9 +157,9 @@ int main() {
         for (auto& v : sc) { v = std::exp(v - mx); den += v; }
         for (std::uint32_t i = 0; i < D; ++i) {
           float o = 0;
-          for (int t2 = firsts[r]; t2 <= lasts[r]; ++t2) {
-            const std::size_t at = (std::size_t(r % 4) * a.capacity + t2 % a.capacity) * KV + kh * D;
-            o += sc[t2 - firsts[r]] / den * float(vpool[at + i]);
+          for (int t2 = firsts_v[r]; t2 <= lasts_v[r]; ++t2) {
+            const std::size_t at = (std::size_t(slots_v[r]) * a.capacity + t2 % a.capacity) * KV + kh * D;
+            o += sc[t2 - firsts_v[r]] / den * float(vpool[at + i]);
           }
           o *= Sigmoid(gate[r * 16 + h]);
           const std::uint32_t e = h * D + i;
