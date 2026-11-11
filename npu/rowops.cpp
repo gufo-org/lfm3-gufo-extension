@@ -494,7 +494,7 @@ std::string RowKernelProgram(const RowKernel& k) {
                        : std::string("    channel.publish %cnt_w : write<tile<16xi32>>\n");
   };
   const char* cores_env = std::getenv("GUFO_LFM3_NPU_ROW_CORES");
-  const bool dual = !(cores_env && std::string(cores_env) == "1");
+  const bool dual = k.cores == 2 && !(cores_env && std::string(cores_env) == "1");
   if (dual) {
     // Two halves per column: ingress [c,2] -> compute [c,3], ingress [c,5] ->
     // compute [c,4]. Each compute core writes its own outputs (one DMA path

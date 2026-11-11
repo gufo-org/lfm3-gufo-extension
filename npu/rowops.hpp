@@ -47,6 +47,9 @@ struct RowKernel {
   // Runtime row count: one more buffer binding (after the operands) holds
   // the count as i32 element 0; `rows` is then the maximum.
   bool dynamic_rows{};
+  // Compute cores per column: 2 halves the work per core on long passes; 1
+  // dispatches faster (each used core costs about 5 us per dispatch).
+  std::uint32_t cores{2};
 };
 
 std::string RowKernelProgram(const RowKernel& kernel);

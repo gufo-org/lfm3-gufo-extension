@@ -656,6 +656,12 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
       k.rows = Device::kMaxRows;
       k.dynamic_rows = true;
       k.name = k.name.substr(0, k.name.find("_r")) + k.name.substr(k.name.find("_r") + 2 + std::to_string(R8).size()) + "_dyn";
+      // Short passes (decode, audio towers) take the single-core variant:
+      // each used core costs dispatch time.
+      if (R <= 16) {
+        k.cores = 1;
+        k.name += "_c1";
+      }
       return d.Row(k);
     };
     {
