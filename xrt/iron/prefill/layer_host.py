@@ -1,6 +1,6 @@
 """Prefill layer FFN half on LFM3 Q8_0 weights vs float64:
 norm(post_attention | ffn_norm), gate/up GEMM + SwiGLU, down GEMM into the
-records' o slot, norm(post_ffw | next attn_norm).
+records' o slot, norm(post_ffw), with the pre-norm weights folded into the GEMMs that consume xn.
 Records per token: [xn | x | o | pad] bf16, 8192 elements.
 Usage: layer_host.py <xclbin> <insts> <gguf> [layer]"""
 import sys, time
@@ -18,7 +18,7 @@ deq = lambda cs: (cs[0].astype(np.float32).reshape(cs[0].shape[0], -1, 32) * cs[
 F = lambda n: f32(d, info, base, n)
 Wg, Wu, Wd = [deq(q8_rows(d, info, base, f"blk.{L}.ffn_{n}.weight")) for n in ("gate", "up", "down")]
 w_post, w_ffn = F(f"blk.{L}.post_attention_norm.weight"), F(f"blk.{L}.ffn_norm.weight")
-w_post_ffw, w_next = F(f"blk.{L}.post_ffw_norm.weight"), F(f"blk.{L + 1}.attn_norm.weight")
+w_post_ffw = F(f"blk.{L}.post_ffw_norm.weight")
 emb = deq(q8_rows(d, info, base, "token_embd.weight"))
 rng = np.random.default_rng(2)
 x0 = emb[rng.integers(0, emb.shape[0], M)]
@@ -30,15 +30,19 @@ R[:, 2 * H:3 * H] = bf16(o0).reshape(M, H)
 
 B1 = np.zeros((H, 15360), np.float32)
 for t in range(120):
-    B1[:, 128 * t:128 * t + 64] = Wg[64 * t:64 * t + 64].T
-    B1[:, 128 * t + 64:128 * t + 128] = Wu[64 * t:64 * t + 64].T
+    B1[:, 128 * t:128 * t + 64] = (Wg[64 * t:64 * t + 64] * w_ffn).T
+    B1[:, 128 * t + 64:128 * t + 128] = (Wu[64 * t:64 * t + 64] * w_ffn).T
 E1, _ = to_bfp16(shuffle_b(B1))
 E2, _ = to_bfp16(shuffle_b(Wd.T.copy()))
-def normw(wp, wq):
-    z = np.zeros(9216, np.uint8)
-    z[:8192] = np.concatenate([bf16(wp), bf16(wq)]).view(np.uint8)
-    return z
-E = np.concatenate([E1, E2, normw(w_post, w_ffn), normw(w_post_ffw, w_next)])
+def normw(wp):
+    """One 128 x 512 A block whose first L1 object (rows 0..31 of the first 64 columns,
+    blocked [m/r][k/s][r][s] with r = s = 8) holds wp linearly."""
+    z = np.zeros((128, 512), np.uint16)
+    p = np.arange(2048)
+    z[(p // 512) * 8 + (p // 8) % 8, ((p // 64) % 8) * 8 + p % 8] = bf16(wp)
+    return z.reshape(-1)
+E = np.concatenate([E1, E2])
+CW = np.concatenate([np.zeros(M * 15360, np.uint16), normw(w_post), normw(w_post_ffw)])
 
 dev = pyxrt.device(0); xb = pyxrt.xclbin(xclbin); dev.register_xclbin(xb)
 ctx = pyxrt.hw_context(dev, xb.get_uuid())
@@ -48,8 +52,8 @@ td, fd = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE, pyxrt.xclBOSyncDirec
 bo_i = pyxrt.bo(dev, ins.nbytes, pyxrt.bo.cacheable, kern.group_id(1))
 bo_a = pyxrt.bo(dev, R.nbytes, pyxrt.bo.host_only, kern.group_id(3))
 bo_b = pyxrt.bo(dev, E.nbytes, pyxrt.bo.host_only, kern.group_id(4))
-bo_c = pyxrt.bo(dev, M * 15360 * 2, pyxrt.bo.host_only, kern.group_id(5))
-for bo, arr in ((bo_i, ins), (bo_a, R), (bo_b, E)):
+bo_c = pyxrt.bo(dev, CW.nbytes, pyxrt.bo.host_only, kern.group_id(5))
+for bo, arr in ((bo_i, ins), (bo_a, R), (bo_b, E), (bo_c, CW)):
     bo.write(arr.tobytes(), 0); bo.sync(td)
 kern(3, bo_i, ins.size, bo_a, bo_b, bo_c).wait()
 bo_a.sync(fd)
@@ -71,13 +75,8 @@ xn = rms(x1, w_ffn)
 g, u = xn @ Wg.T, xn @ Wu.T
 down = (g / (1 + np.exp(-g)) * u) @ Wd.T
 x2 = x1 + rms(down, w_post_ffw)
-xn2 = rms(x2, w_next)
+# The device leaves each pre-norm weight to the next GEMM, so its xn is the unweighted norm.
+xn2 = rms(x2, np.ones(H))
 rel = lambda p, q: np.linalg.norm(p - q) / np.linalg.norm(q)
 print(f"layer {L} FFN half, {M} tokens: {dt * 1e3:.2f} ms (median {np.median(dts) * 1e3:.2f})")
 print(f"  down rel err {rel(G[:, 2 * H:3 * H], down):.2e}, x rel err {rel(G[:, H:2 * H], x2):.2e}, xn rel err {rel(G[:, :H], xn2):.2e}")
-print(f"  stage1: xn vs xn1 {rel(G[:, :H], xn):.2e}, x vs x1 {rel(G[:, H:2 * H], x1):.2e}, o vs down {rel(G[:, 2 * H:3 * H], down):.2e}")
-gx = G[:, :H].astype(np.float64)
-gg, gu = gx @ Wg.T, gx @ Wu.T
-print(f"  down from device xn: {rel(G[:, 2 * H:3 * H], (gg / (1 + np.exp(-gg)) * gu) @ Wd.T):.2e}")
-print("  row0 xn dev", G[0, :6], "ref", xn[0, :6]); print("  row0 x dev", G[0, H:H + 6], "ref", x1[0, :6])
-print("  row5 x dev", G[5, H:H + 6], "ref", x1[5, :6], "in", x[5, :6])

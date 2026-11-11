@@ -148,15 +148,18 @@ def chain_gemm(
                                      compile_flags=kernel_flags, object_file_name="mm_prefill.o")
 
     norm_kernel = ExternalFunction("prefill_norm_row", source_file=str(_KERNEL_SRC),
-                                   arg_types=[B_l1_ty, B_l1_ty, C_l1_ty, np.int32],
+                                   arg_types=[A_l1_ty, B_l1_ty, C_l1_ty, np.int32],
                                    compile_flags=kernel_flags, object_file_name="mm_prefill.o")
 
     def make_core(r):
       def core_fn(in_a, in_b, out_c, zero, matmul, swiglu, norm):
         for shape in shapes:
             if shape[0] == "norm":
-                # The column's 128 rows in groups of 16; core r takes rows 4r..4r+3 of each.
-                w = in_b.acquire(1)
+                # The post-norm weight is the first A object of one L2 block; the pre-norm weight
+                # is folded into the next GEMM's weights. The column's 128 rows arrive on B in
+                # groups of 16; core r takes rows 4r..4r+3 of each. Acquire counts are totals,
+                # so the weight must not sit on the same FIFO as the rows.
+                w = in_a.acquire(1)
                 for _ in range_(M // 8 // 16):
                     for q in range(4):
                         if q == r:
@@ -170,7 +173,10 @@ def chain_gemm(
                             for s_ in range(4):
                                 in_b.acquire(1)
                                 in_b.release(1)
-                in_b.release(1)
+                in_a.release(1)
+                for _ in range_(mtk // k * 4 - 1):
+                    in_a.acquire(1)
+                    in_a.release(1)
                 continue
             K, N, mode = shape
             tiles_per_core = (M // m) * (N // n) // (n_aie_cols * n_aie_rows)
@@ -210,8 +216,9 @@ def chain_gemm(
     gemms = [sh for sh in shapes if sh[0] != "norm"]
     n_norms = len(shapes) - len(gemms)
     a_size = M * 8192                      # token records: [xn | x | o | pad] bf16
-    b_size = sum(K * N // 8 for K, N, _ in gemms) + n_norms * 1024  # + norm weights, one B object each
-    c_size = sum(M * N for _, N, mode in gemms if mode == "swiglu")
+    b_size = sum(K * N // 8 for K, N, _ in gemms)
+    c_swiglu = sum(M * N for _, N, mode in gemms if mode == "swiglu")
+    c_size = c_swiglu + n_norms * m * mtk  # + one A block of norm weights per norm phase
     A_ty = np.ndarray[(a_size,), np.dtype[bfloat16]]
     B_ty = np.ndarray[(b_size,), np.dtype[v8bfp16ebs8]]
     C_ty = np.ndarray[(c_size,), np.dtype[bfloat16]]
@@ -220,13 +227,13 @@ def chain_gemm(
     def sequence(a, b, c, A_prods, B_prods, C_conses):
         a_off = b_off = c_off = 0
         prev_c, prev_n = 0, 0
-        norm_w = sum(K * N // 8 for K, N, _ in gemms)
         for shape in shapes:
             if shape[0] == "norm":
                 tg = TaskGroup()
-                for col in range(n_aie_cols):
-                    B_prods[col].fill(b, tap=TensorAccessPattern((b_size,), norm_w + shape[1] * 1024, [1, 1, 1, 1024], [0, 0, 0, 1]),
+                for row in range(n_aie_rows):
+                    A_prods[row].fill(c, tap=TensorAccessPattern((c_size,), c_swiglu + shape[1] * m * mtk, [1, 1, 1, m * mtk], [0, 0, 0, 1]),
                                       group=tg, wait=False)
+                for col in range(n_aie_cols):
                     # rows of column col: [x | o | 1 KB] of each record, as bf16 elements
                     B_prods[col].fill(a, tap=TensorAccessPattern((a_size,), col * (M // 8) * 8192 + 2048,
                                                                 [1, M // 8, 9, 512], [0, 8192, 512, 1]),

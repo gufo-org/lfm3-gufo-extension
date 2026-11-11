@@ -191,16 +191,12 @@ void prefill_swiglu(bfloat16 *__restrict c) {
 
 // ---- Prefill residual/norm phase. A token row's DDR record is
 // [xn bf16 2048 | x bf16 2048 | o bf16 2048 | pad] (16 KB). The phase gets
-// [w_post | w_pre] (bf16) once, then each row's [x | o] as one B object,
-// computes x += rmsnorm(o) * w_post and xn = rmsnorm(x) * w_pre, and writes
-// [xn | x] for four rows into a C tile. The C tile drains through the
-// GEMM's 8x8-tile transform, so flat element i goes to tiled position T(i).
+// w_post (bf16) once as an A object, then each row's [x | o] as one B object,
+// computes x += rmsnorm(o) * w_post and xn = rmsnorm(x), and writes [xn | x]
+// for four rows into a C tile in the matmul's 8x8-tiled layout. The pre-norm
+// weight is folded into the next GEMM's weights.
 
 namespace {
-inline int Tiled(int i) {
-  const int r = i >> 7, c = i & 127;
-  return (((r >> 3) << 4) + (c >> 3)) * 64 + ((r & 7) << 3) + (c & 7);
-}
 inline aie::vector<float, 16> Wide(const bfloat16 *p) {
   aie::accum<accfloat, 16> a;
   a.from_vector(aie::load_v<16>(p));
@@ -215,32 +211,48 @@ inline float SumSqBf16(const bfloat16 *v) {
   for (int i = 0; i < 2048; i += 16) { aie::vector<float, 16> x = Wide(v + i); acc = aie::mac(acc, x, x); }
   return aie::reduce_add(acc.to_vector<float>());
 }
-inline void Put16(bfloat16 *tile, int at, aie::vector<bfloat16, 16> v) {
-  aie::store_v(tile + Tiled(at), v.extract<8>(0));
-  aie::store_v(tile + Tiled(at + 8), v.extract<8>(1));
-}
 }  // namespace
 
 extern "C" {
 
-// w: [w_post | w_pre]; row: [x | o] (updated in place); slot 0..3 of the tile.
-void prefill_norm_row(const bfloat16 *__restrict w, bfloat16 *__restrict row, bfloat16 *__restrict tile, int32_t slot) {
+// Tile rows of the C object in the matmul layout [m/r][n/t][r][t] with r = t = 8:
+// element (R, c) sits at ((R >> 3) * 16 + (c >> 3)) * 64 + (R & 7) * 8 + (c & 7).
+inline bfloat16 *TileRow(bfloat16 *tile, int R) { return tile + ((R >> 3) << 10) + ((R & 7) << 3); }
+// Stores 16 consecutive columns starting at column block cb (8 columns each).
+inline void Store16(bfloat16 *d, int cb, aie::vector<bfloat16, 16> v) {
+  aie::store_v(d + (cb << 6), v.extract<8>(0));
+  aie::store_v(d + (cb << 6) + 64, v.extract<8>(1));
+}
+
+// wp: post-norm weight (2048, one A object); row: [x | o] (x updated in place).
+// Writes [norm(x1) | x1] into slot 0..3 of the tile, with x1 = x + norm(o) * wp. The
+// pre-norm weight is folded into the weights of the GEMM that consumes norm(x1).
+void prefill_norm_row(const bfloat16 *__restrict wp, bfloat16 *__restrict row,
+                      bfloat16 *__restrict tile, int32_t slot) {
   bfloat16 *x = row;
   const bfloat16 *o = row + 2048;
   const aie::vector<float, 16> so = aie::broadcast<float, 16>(InvRms(SumSqBf16(o)));
-  const int base = slot * 4096;
-  for (int i = 0; i < 2048; i += 16) {
-    aie::vector<float, 16> t = aie::mul(aie::mul(Wide(o + i), so).to_vector<float>(), Wide(w + i)).to_vector<float>();
-    aie::accum<accfloat, 16> nx;
-    nx.from_vector(aie::add(Wide(x + i), t));
-    const aie::vector<bfloat16, 16> v = nx.to_vector<bfloat16>();
-    aie::store_v(x + i, v);
-    Put16(tile, base + 2048 + i, v);
+  for (int j = 0; j < 16; ++j) {
+    bfloat16 *d = TileRow(tile, slot * 32 + 16 + j);
+    for (int c = 0; c < 128; c += 16) {
+      const int i = j * 128 + c;
+      aie::vector<float, 16> t = aie::mul(aie::mul(Wide(o + i), so).to_vector<float>(), Wide(wp + i)).to_vector<float>();
+      aie::accum<accfloat, 16> nx;
+      nx.from_vector(aie::add(Wide(x + i), t));
+      const aie::vector<bfloat16, 16> v = nx.to_vector<bfloat16>();
+      aie::store_v(x + i, v);
+      Store16(d, c >> 3, v);
+    }
   }
   const aie::vector<float, 16> sh = aie::broadcast<float, 16>(InvRms(SumSqBf16(x)));
-  for (int i = 0; i < 2048; i += 16) {
-    aie::accum<accfloat, 16> t = aie::mul(aie::mul(Wide(x + i), sh).to_vector<float>(), Wide(w + 2048 + i));
-    Put16(tile, base + i, t.to_vector<bfloat16>());
+  for (int j = 0; j < 16; ++j) {
+    bfloat16 *d = TileRow(tile, slot * 32 + j);
+    for (int c = 0; c < 128; c += 16) {
+      const int i = j * 128 + c;
+      aie::accum<accfloat, 16> t;
+      t.from_vector(aie::mul(Wide(x + i), sh).to_vector<float>());
+      Store16(d, c >> 3, t.to_vector<bfloat16>());
+    }
   }
 }
 
