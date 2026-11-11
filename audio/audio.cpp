@@ -1,11 +1,13 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
-#include <gufo/ext/wav.hpp>
+#include <gufo/ext/audio.hpp>
 #include <limits>
 #include <numbers>
 #include <numeric>
+#include <string_view>
 #include <thread>
+#include <utility>
 
 #include "model.hpp"
 namespace gufo::models::lfm3_audio {
@@ -14,23 +16,40 @@ namespace core = gufo::core;
 
 // Accepts PCM16/24/32 and float32 up to 8 channels and 192 kHz; 300 seconds
 // matches the d1-Omni input contract, and the ASR runner windows longer
-// input regardless. The shared decoder rejects non-finite float samples
-// and clamps the rest to [-1, 1].
-constexpr core::WavLimits kWavLimits{
+// input regardless. The shared decoder rejects non-finite float samples,
+// clamps the rest to [-1, 1] and mixes the channels down to their mean.
+constexpr core::AudioLimits kWavLimits{
+    .formats = core::AudioFormats::kPcmWav,
     .max_channels = 8,
     .max_sample_rate = 192000,
     .max_seconds = 300,
     .max_pcm_bits = 32,
+    .downmix_mono = true,
 };
-constexpr core::WavMessages kWavMessages{
-    .not_riff = "audio must be a RIFF/WAVE file",
-    .truncated = "truncated WAV chunk",
-    .invalid_fmt = "WAV fmt chunk is invalid",
-    .unsupported_format = "WAV format is unsupported",
-    .unsupported_layout = "WAV must be PCM16/24/32 or float32 interleaved",
-    .too_long = "audio must contain at most 300 seconds",
-    .non_finite = "WAV contains non-finite samples",
-};
+
+std::string_view WavMessage(core::AudioStatus status) {
+  switch (status) {
+    case core::AudioStatus::kUnrecognized:
+      return "audio must be a RIFF/WAVE file";
+    case core::AudioStatus::kMalformedHeader:
+      return "WAV fmt chunk is invalid";
+    case core::AudioStatus::kUnsupportedCodec:
+    case core::AudioStatus::kOutOfBounds:
+    case core::AudioStatus::kNoAudio:
+      return "WAV format is unsupported";
+    case core::AudioStatus::kUnsupportedLayout:
+      return "WAV must be PCM16/24/32 or float32 interleaved";
+    case core::AudioStatus::kTooLong:
+      return "audio must contain at most 300 seconds";
+    case core::AudioStatus::kTruncated:
+      return "truncated WAV chunk";
+    case core::AudioStatus::kNonFinite:
+      return "WAV contains non-finite samples";
+    case core::AudioStatus::kStopped:
+      break;
+  }
+  return "WAV could not be decoded";
+}
 
 void Write32(std::vector<std::byte>& out, std::uint32_t v) {
   for (int i = 0; i < 4; ++i)
@@ -44,18 +63,14 @@ void Write16(std::vector<std::byte>& out, std::uint16_t v) {
 bool DecodeWav(std::span<const std::byte> wav, std::vector<float>* samples,
                std::uint32_t* rate, std::string* error) {
   try {
-    const core::WavAudio decoded =
-        core::DecodeWav(wav, kWavLimits, kWavMessages);
-    const std::size_t channels = decoded.channels;
-    samples->assign(decoded.samples.size() / channels, 0.0F);
-    for (std::size_t frame = 0; frame < samples->size(); ++frame) {
-      float sum = 0.0F;
-      for (std::size_t c = 0; c < channels; ++c)
-        sum += decoded.samples[frame * channels + c];
-      (*samples)[frame] = sum / float(channels);
-    }
+    core::DecodedAudio decoded = core::DecodeAudio(wav, kWavLimits);
+    *samples = std::move(decoded.samples);
     *rate = decoded.sample_rate;
     return true;
+  } catch (const core::AudioError& e) {
+    if (error)
+      *error = WavMessage(e.status());
+    return false;
   } catch (const std::exception& e) {
     if (error)
       *error = e.what();
