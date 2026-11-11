@@ -27,6 +27,8 @@ struct AttentionShape {
 };
 
 // prep(qkvg Yb, q_norm, k_norm, cos, sin, meta, q out, gate out, k pool, v pool)
+// Gate floats per row in QkPrepProgram's gate output (at least 16).
+std::uint32_t GateStride(std::uint32_t heads);
 std::string QkPrepProgram(const AttentionShape& s, const std::string& name);
 // attend(q, gate, k pool, v pool, meta, key groups, out Xb)
 std::string AttendProgram(const AttentionShape& s, const std::string& name);

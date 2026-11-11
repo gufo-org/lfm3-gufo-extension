@@ -139,11 +139,13 @@ std::string NormRope(const AttentionShape& s, const std::string& view, const std
 
 }  // namespace
 
+std::uint32_t GateStride(std::uint32_t heads) { return std::max<std::uint32_t>(16, (heads + 15) / 16 * 16); }
+
 std::string QkPrepProgram(const AttentionShape& s, const std::string& name) {
   const std::uint32_t D = s.dim, Q = s.heads * D, KV = s.kv_heads * D, half = D / 2;
   const std::uint32_t row = s.qkvg_groups * 8, G = s.qkvg_groups;
-  const std::uint32_t gstride = 16;  // gate floats per row in the gate output
-  if (D % 32 || s.heads > 16 || (s.capacity & (s.capacity - 1)) || (s.slots & (s.slots - 1)) ||
+  const std::uint32_t gstride = GateStride(s.heads);  // gate floats per row in the gate output
+  if (D % 32 || s.heads > 64 || (s.capacity & (s.capacity - 1)) || (s.slots & (s.slots - 1)) ||
       (s.table_rows & (s.table_rows - 1)))
     throw std::invalid_argument("unsupported NPU attention shape");
   const std::string args =
@@ -169,17 +171,17 @@ std::string QkPrepProgram(const AttentionShape& s, const std::string& name) {
   %allheads = index.constant @ALLH : index
   %qfloats = index.constant @Q : index
   %kvfloats = index.constant @KV : index
-  %gfloats = index.constant 16 : index
+  %gfloats = index.constant @GS : index
   %block = index.constant @BLOCK : index
   %cap = index.constant @CAP : index
   %memory = pipeline.memory<workgroup>[%column, 2] : pool
 )",
-            {{"@ROWS", S(s.rows)}, {"@D", S(D)}, {"@HALF", S(half)}, {"@H", S(s.heads)}, {"@KVH", S(s.kv_heads)}, {"@ALLH", S(s.heads + s.kv_heads)},
+            {{"@ROWS", S(s.rows)}, {"@GS", S(gstride)}, {"@D", S(D)}, {"@HALF", S(half)}, {"@H", S(s.heads)}, {"@KVH", S(s.kv_heads)}, {"@ALLH", S(s.heads + s.kv_heads)},
              {"@Q", S(Q)}, {"@KV", S(KV)}, {"@BLOCK", S(std::uint64_t(G) * 64)}, {"@CAP", S(s.capacity)}});
   const std::string prow = S(G) + "x8xf32";
   // Few channels per tile (hardware semaphores): small operands share aux
-  // [qnw D | knw D | cos half | sin half | gate 16], K and V share kvh.
-  const std::uint32_t aux = 3 * D + 16;
+  // [qnw D | knw D | cos half | sin half | gates GS], K and V share kvh.
+  const std::uint32_t aux = 3 * D + gstride;
   const std::string auxs = S(aux) + "xf32", kvs = S(2 * KV) + "xf16";
   t += Scratch("p", S(row) + "xf32", row * 4) + Scratch("aux", auxs, aux * 4) + Scratch("mt", "16xi32", 64) +
        Scratch("kvh", kvs, 4 * KV);
@@ -191,11 +193,11 @@ std::string QkPrepProgram(const AttentionShape& s, const std::string& name) {
     %knw = view.subview %aux[@D] : view<@AUX> -> view<@Dxf32>
     %cos = view.subview %aux[@D2] : view<@AUX> -> view<@HALFxf32>
     %sin = view.subview %aux[@D25] : view<@AUX> -> view<@HALFxf32>
-    %gt = view.subview %aux[@D3] : view<@AUX> -> view<16xf32>
+    %gt = view.subview %aux[@D3] : view<@AUX> -> view<@GSxf32>
     %kh = view.subview %kvh[0] : view<@KVS> -> view<@KVxf16>
     %vh = view.subview %kvh[@KV] : view<@KVS> -> view<@KVxf16>
 )",
-            {{"@AUX", auxs}, {"@D25", S(2 * D + half)}, {"@D2", S(2 * D)}, {"@D3", S(3 * D)}, {"@D", S(D)},
+            {{"@AUX", auxs}, {"@GSxf32", S(gstride) + "xf32"}, {"@D25", S(2 * D + half)}, {"@D2", S(2 * D)}, {"@D3", S(3 * D)}, {"@D", S(D)},
              {"@HALF", S(half)}, {"@KVS", kvs}, {"@KV", S(KV)}});
   t += Fill(R"(    %vzero = vector.splatf 0.0 : vector<16xf32>
     %fzero = scalar.constant 0.0 : f32
@@ -259,13 +261,17 @@ std::string QkPrepProgram(const AttentionShape& s, const std::string& name) {
   if (s.gate) {
     t += Fill(R"(      %g_at0 = index.add %qfloats, %kvfloats : index
       %g_at = index.add %g_at0, %kvfloats : index
-      %graw = vector.load %p[%g_at] : view<@ROWxf32> -> vector<16xf32>
-      vector.store %graw, %gt[%c0] : vector<16xf32>, view<16xf32>
+      scf.for %gi = [%c0 to %gfloats step %c16] {
+        %g_ati = index.add %g_at, %gi : index
+        %graw = vector.load %p[%g_ati] : view<@ROWxf32> -> vector<16xf32>
+        vector.store %graw, %gt[%gi] : vector<16xf32>, view<@GSxf32>
+      }
 )",
-              {{"@ROW", S(row)}});
+              {{"@ROW", S(row)}, {"@GS", S(gstride)}});
   } else {
     t += "      %gone = vector.splatf 1.0e30 : vector<16xf32>\n"
-         "      vector.store %gone, %gt[%c0] : vector<16xf32>, view<16xf32>\n";
+         "      scf.for %gi = [%c0 to %gfloats step %c16] {\n"
+         "        vector.store %gone, %gt[%gi] : vector<16xf32>, view<" + S(gstride) + "xf32>\n      }\n";
   }
   // Store q rows, gates and the K/V ring row.
   t += Fill(R"(      %q_e = index.mul %row, %qfloats : index
@@ -275,8 +281,8 @@ std::string QkPrepProgram(const AttentionShape& s, const std::string& name) {
 )" + Copy("qo", "q_src", "view<@Qxf32>", "q_dst", "view<@Qxf32>", false) +
                 R"(      %g_e = index.mul %row, %gfloats : index
 )" + Offset("go", "%g_e", 4) +
-                R"(      %g_dst = buffer.view %gout[%go_at] : buffer -> view<16xf32>
-)" + Copy("gw", "gt", "view<16xf32>", "g_dst", "view<16xf32>", false) +
+                R"(      %g_dst = buffer.view %gout[%go_at] : buffer -> view<@GSxf32>
+)" + Copy("gw", "gt", "view<@GSxf32>", "g_dst", "view<@GSxf32>", false) +
                 R"(      %r0 = index.mul %slot, %cap : index
       %r1 = index.add %r0, %ring : index
       %r2 = index.mul %r1, %kvfloats : index
@@ -285,7 +291,7 @@ std::string QkPrepProgram(const AttentionShape& s, const std::string& name) {
       %v_dst = buffer.view %vpool[%kv_at] : buffer -> view<@KVxf16>
 )" + Copy("kw", "kh", "view<@KVxf16>", "k_dst", "view<@KVxf16>", false) +
                 Copy("vw", "vh", "view<@KVxf16>", "v_dst", "view<@KVxf16>", false),
-            {{"@Q", S(Q)}, {"@ROW", S(row)}, {"@KV", S(KV)}});
+            {{"@Q", S(Q)}, {"@ROW", S(row)}, {"@KV", S(KV)}, {"@GS", S(gstride)}});
   t += "    }\n";
   for (auto [n, sh] : std::vector<std::pair<std::string, std::string>>{
            {"p", S(row) + "xf32"}, {"aux", auxs}, {"mt", "16xi32"}, {"kvh", kvs}})
@@ -377,7 +383,7 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
     %kc_w, %kc = channel.reserve %kc_ch : channel<tile<32x@Dxf16>> -> (write<tile<32x@Dxf16>>, view<32x@Dxf16>)
     %m2_w, %m2 = channel.reserve %m2_ch : channel<tile<48xi32>> -> (write<tile<48xi32>>, view<48xi32>)
     %qv = view.subview %sa[0] : view<@SAxf32> -> view<@QCxf32>
-    %gv = view.subview %sa[@QC] : view<@SAxf32> -> view<16xf32>
+    %gv = view.subview %sa[@QC] : view<@SAxf32> -> view<@GSxf32>
     %scores = view.subview %sa[@SS] : view<@SAxf32> -> view<32xf32>
     %ex = view.subview %sa[@SX] : view<@SAxf32> -> view<48xf32>
     %mrow = view.subview %m2[0] : view<48xi32> -> view<16xi32>
@@ -414,15 +420,18 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
         %w = func.call @fmul2(%v, %scale) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         vector.store %w, %qv[%i] : vector<16xf32>, view<@QCxf32>
       }
-      %g_e = index.mul %row, %c16 : index
+      %gsn = index.constant @GS : index
+      %g_e = index.mul %row, %gsn : index
       %g_bytes = index.mul %g_e, %c4 : index
       %g_at = index.cast %g_bytes : index to offset
-      %g_src = buffer.view %gb[%g_at] : buffer -> view<16xf32>
+      %g_src = buffer.view %gb[%g_at] : buffer -> view<@GSxf32>
 @COPY_G
-      %gneg0 = vector.load %gv[%c0] : view<16xf32> -> vector<16xf32>
-      %gneg = vector.subf %vzero, %gneg0 : vector<16xf32>
-      %geg = func.call @exp_fast(%gneg) : (vector<16xf32>) -> (vector<16xf32>)
-      vector.store %geg, %gv[%c0] : vector<16xf32>, view<16xf32>
+      scf.for %gi = [%c0 to %gsn step %c16] {
+        %gneg0 = vector.load %gv[%gi] : view<@GSxf32> -> vector<16xf32>
+        %gneg = vector.subf %vzero, %gneg0 : vector<16xf32>
+        %geg = func.call @exp_fast(%gneg) : (vector<16xf32>) -> (vector<16xf32>)
+        vector.store %geg, %gv[%gi] : vector<16xf32>, view<@GSxf32>
+      }
 @CHUNKS
       %first_v = vector.splat %first_b : vector<16xi32>
       %last_v = vector.splat %last_b : vector<16xi32>
@@ -497,7 +506,7 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
           %den_n = vector.addf %den_a, %psv : vector<16xf32>
           scf.yield %m_new, %den_n : vector<16xf32>, vector<16xf32>
         }
-        %gh = view.load %gv[%h] : view<16xf32> -> f32
+        %gh = view.load %gv[%h] : view<@GSxf32> -> f32
         %ghv = vector.splat %gh : vector<16xf32>
         %fin_w, %fin = channel.reserve %pc_ch : channel<tile<64xf32>> -> (write<tile<64xf32>>, view<64xf32>)
         vector.store %d_f, %fin[%c0] : vector<16xf32>, view<64xf32>
@@ -669,10 +678,11 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
   const std::string copy_q = R"(      %qcp = kernel.async.copy %q_src to %qv {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<@QCxf32> to view<@QCxf32> -> kernel.async.token
       %qcg = kernel.async.group %qcp : kernel.async.token -> kernel.async.group
       kernel.async.wait %qcg {newer_groups = 0} : kernel.async.group)";
-  const std::string copy_g = R"(      %gcp = kernel.async.copy %g_src to %gv {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<16xf32> to view<16xf32> -> kernel.async.token
+  const std::string copy_g = R"(      %gcp = kernel.async.copy %g_src to %gv {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<@GSxf32> to view<@GSxf32> -> kernel.async.token
       %gcg = kernel.async.group %gcp : kernel.async.token -> kernel.async.group
       kernel.async.wait %gcg {newer_groups = 0} : kernel.async.group)";
-  const std::uint32_t sa = hpc * D + 16 + 32 + 48;  // q | gates | scores | ex
+  const std::uint32_t gs = GateStride(s.heads);
+  const std::uint32_t sa = hpc * D + gs + 32 + 48;  // q | gates | scores | ex
   const std::uint32_t pa = D + 16;                   // acc | meta
   std::string text = Fill(body, {{"@META", meta}, {"@CHUNKS", chunks}, {"@KADDR", kaddr}, {"@GROUPS", groups},
                                  {"@MASK", mask}, {"@COPY_Q", copy_q}, {"@COPY_G", copy_g}});
@@ -687,7 +697,7 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
                      {"@QCxbf16", S(hpc * D) + "xbf16"}, {"@QC", S(hpc * D)}, {"@Q", S(Q)}, {"@KVxf16", S(KV) + "xf16"},
                      {"@KV", S(KV)}, {"@CAPM", S(s.capacity - 1)}, {"@CAP", S(s.capacity)}, {"@GROUP", S(group)},
                      {"@OBLOCK", S(std::uint64_t(Q / 8) * 64)}, {"@SABYTES", S(sa * 4)}, {"@SAxf32", S(sa) + "xf32"},
-                     {"@SS", S(hpc * D + 16)}, {"@SX", S(hpc * D + 48)}, {"@KCBYTES", S(32 * D * 2)},
+                     {"@SS", S(hpc * D + gs)}, {"@SX", S(hpc * D + gs + 32)}, {"@GSxf32", S(gs) + "xf32"}, {"@GS", S(gs)}, {"@KCBYTES", S(32 * D * 2)},
                      {"@PABYTES", S(pa * 4)}, {"@PAxf32", S(pa) + "xf32"}, {"@OTBYTES", S(hpc * D * 2)},
                      {"@OG", S(hpc * D / 8)}, {"@SLOTM", S(s.slots - 1)}, {"@SCALE", scale}, {"@D", S(D)}});
   if (s.kv_bf16) text = std::regex_replace(text, std::regex("([^b])f16\\b"), "$1bf16");

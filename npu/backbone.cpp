@@ -145,11 +145,11 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       } else {
         const Tensor* qkvg[] = {&l.q, &l.k, &l.v, &l.attn_gate};
         const Tensor* out[] = {&l.attn_out};
-        if (c.heads < 16) {
-          // QK prep reads 16 gate floats per row: zero rows pad the gates.
+        if (c.heads < GateStride(c.heads)) {
+          // QK prep reads GateStride gate floats per row: zero rows pad the gates.
           std::uint32_t rows = 0;
           for (const auto* t : qkvg) rows += t->rows;
-          p.qkvg = m.dense->Upload(rows + 16 - c.heads, l.q.cols, [&](std::uint32_t r, std::span<float> out) {
+          p.qkvg = m.dense->Upload(rows + GateStride(c.heads) - c.heads, l.q.cols, [&](std::uint32_t r, std::span<float> out) {
             for (const auto* t : qkvg) {
               if (r < t->rows) return DecodeRow(*t, r, out);
               r -= t->rows;
@@ -202,10 +202,17 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       d->w_first = d->Upload(std::vector<float>(Floats(w.layers[0].norm), Floats(w.layers[0].norm) + H));
       for (std::size_t i = 0; i < n; ++i) {
         const auto& l = w.layers[i];
-        if (!l.post_norm.data || !l.post_ffn_norm.data)
-          throw std::runtime_error("the NPU forward expects LFM3 sandwich norms");
-        d->w_op[i] = pair(l.post_norm, l.ffn_norm);
-        d->w_ffn[i] = pair(l.post_ffn_norm, i + 1 < n ? w.layers[i + 1].norm : w.output_norm);
+        const Tensor& next = i + 1 < n ? w.layers[i + 1].norm : w.output_norm;
+        if (bool(l.post_norm.data) != bool(l.post_ffn_norm.data))
+          throw std::runtime_error("the NPU forward expects both sandwich norms or neither");
+        if (l.post_norm.data) {
+          d->w_op[i] = pair(l.post_norm, l.ffn_norm);
+          d->w_ffn[i] = pair(l.post_ffn_norm, next);
+        } else {
+          // Without sandwich norms the residual adds the raw projection.
+          d->w_op[i] = d->Upload(std::vector<float>(Floats(l.ffn_norm), Floats(l.ffn_norm) + H));
+          d->w_ffn[i] = d->Upload(std::vector<float>(Floats(next), Floats(next) + H));
+        }
         if (c.layers[i] == LayerType::kConvolution) {
           std::vector<float> tw(std::size_t(L) * H);
           for (std::uint32_t ch = 0; ch < H; ++ch)
@@ -236,7 +243,7 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
         d->y_rows = npu.Alloc(std::uint64_t(m.head.shape.m) * 8 * 4);
       }
       d->xb_head = npu.Alloc(std::uint64_t(H) * 8 * 2);
-      d->q = npu.Alloc(R * c.heads * D * 4), d->gates = npu.Alloc(R * 16 * 4);
+      d->q = npu.Alloc(R * c.heads * D * 4), d->gates = npu.Alloc(R * GateStride(c.heads) * 4);
       d->count = npu.Alloc(64);
       d->meta_g = npu.Alloc(R * 64), d->meta_s = npu.Alloc(R * 64), d->groups = npu.Alloc(R * 4 + 256);
       m.device = std::move(d);
@@ -704,7 +711,8 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
         continue;
       }
       {
-        const int k = row_kernel(NormPackKernel(H, R8, Residual::kBlocked, true, false, c.eps));
+        const bool post = w->layers[il].post_norm.data != nullptr;
+        const int k = row_kernel(NormPackKernel(H, R8, Residual::kBlocked, post, false, c.eps));
         const int b[] = {x, d.y_out, d.w_op[il], x2, d.xb2048, d.count};
         timed("norm (op)", [&] { npu.Enqueue(k, b); });
         std::swap(x, x2);
@@ -718,7 +726,7 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
       timed("proj down", [&] { dense->Enqueue(p.down, d.xb_ffn, d.y_down, blocks); });
       {
         const bool last = il + 1 == c.layers.size();
-        const int k = row_kernel(NormPackKernel(H, R8, Residual::kBlocked, true, last, c.eps));
+        const int k = row_kernel(NormPackKernel(H, R8, Residual::kBlocked, w->layers[il].post_ffn_norm.data != nullptr, last, c.eps));
         if (last) {
           const int b[] = {x, d.y_down, d.w_ffn[il], d.xb2048, d.z, d.count};
           timed("norm (ffn)", [&] { npu.Enqueue(k, b); });
