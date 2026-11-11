@@ -404,7 +404,7 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
 @COPY_G
       %gneg0 = vector.load %gv[%c0] : view<16xf32> -> vector<16xf32>
       %gneg = vector.subf %vzero, %gneg0 : vector<16xf32>
-      %geg = func.call @exp(%gneg) : (vector<16xf32>) -> (vector<16xf32>)
+      %geg = func.call @exp_fast(%gneg) : (vector<16xf32>) -> (vector<16xf32>)
       vector.store %geg, %gv[%c0] : vector<16xf32>, view<16xf32>
 @CHUNKS
       %first_v = vector.splat %first_b : vector<16xi32>
@@ -462,7 +462,7 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
           vector.store %da, %ex[%c32] : vector<16xf32>, view<48xf32>
           scf.for %ei = [%c0 to %c48 step %c16] {
             %ev = vector.load %ex[%ei] : view<48xf32> -> vector<16xf32>
-            %ee = func.call @exp(%ev) : (vector<16xf32>) -> (vector<16xf32>)
+            %ee = func.call @exp_fast(%ev) : (vector<16xf32>) -> (vector<16xf32>)
             vector.store %ee, %ex[%ei] : vector<16xf32>, view<48xf32>
           }
           %p_lo = vector.load %ex[%c0] : view<48xf32> -> vector<16xf32>
