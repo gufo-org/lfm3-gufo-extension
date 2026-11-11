@@ -254,7 +254,7 @@ def main():
         print(f"  y rel err {rel(Y, y):.3e}")
 
 
-if __name__ == "__main__" and sys.argv[1] != "debug-attn":
+if __name__ == "__main__" and sys.argv[1] not in ("debug-attn", "kl"):
     main()
 
 
@@ -286,4 +286,44 @@ def debug_attn(argv):
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "debug-attn":
     debug_attn(sys.argv[2:])
+    sys.exit(0)
+
+
+def kl_check(argv):
+    """host.py kl <xclbin> <insts> <gguf> <ids.json>: NPU vs float32 reference on real text,
+    full-vocabulary KL of the next-token distributions every 16 positions."""
+    xclbin, insts, gguf, ids_path = argv
+    import json
+    kinds = P.lfm3_kinds()
+    md = Model(gguf)
+    plan = P.Plan(kinds)
+    E, Cs = pack(plan, md)
+    ids = np.array(([1] + json.load(open(ids_path)))[:plan.M])
+    emb = md.deq("token_embd.weight")
+    x0 = from_bf16(bf16(emb[ids])).reshape(plan.M, H)
+    run = Runner(xclbin, insts, plan, E, Cs)
+    G, dt = run.run(x0)
+    print(f"NPU prefill {plan.M} tokens: {dt * 1e3:.1f} ms")
+    md.drop()
+    xs = reference(md, kinds, x0)
+    pos = np.arange(15, plan.M, 16)
+    wo = md.f("output_norm.weight")
+    head = emb
+    def dist(x):
+        lg = rms(x[pos], wo) @ head.T
+        lg -= lg.max(1, keepdims=True)
+        p = np.exp(lg)
+        return p / p.sum(1, keepdims=True)
+    pr, pn = dist(xs[-1]), dist(G[:, H:2 * H])
+    kl = (pr * (np.log(pr + 1e-30) - np.log(pn + 1e-30))).sum(1)
+    top = (pr.argmax(1) == pn.argmax(1)).mean()
+    nxt = np.arange(len(pos) - 1)  # positions whose next token is in the text
+    nll_r = -np.log(pr[nxt, ids[pos[nxt] + 1]] + 1e-30).mean()
+    nll_n = -np.log(pn[nxt, ids[pos[nxt] + 1]] + 1e-30).mean()
+    print(f"KL(ref || npu) mean {kl.mean():.3e} median {np.median(kl):.2e} max {kl.max():.2e}; top-1 agree {top * 100:.1f}% "
+          f"({len(pos)} positions); NLL ref {nll_r:.3f} npu {nll_n:.3f}")
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "kl":
+    kl_check(sys.argv[2:])
     sys.exit(0)
