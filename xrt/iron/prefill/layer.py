@@ -12,6 +12,7 @@ four A-subtiles per matmul cycle. B is bfp16ebs8; C is bf16. Strix-only.
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import aie.iron as iron
@@ -68,7 +69,7 @@ def chain_gemm(
     B_l1_ty = np.ndarray[(k, n // 8), np.dtype[v8bfp16ebs8]]
     C_l1_ty = np.ndarray[(m, n), np.dtype[bfloat16]]
 
-    kernel_flags = [f"-I{_AIE_KERNELS_INC}"]
+    kernel_flags = [f"-I{_AIE_KERNELS_INC}"] + os.environ.get("PREFILL_FLAGS", "").split()
 
     zero_kernel = kernels.zero((m, n), bfloat16)
     matmul_kernel = ExternalFunction(
@@ -148,7 +149,7 @@ def chain_gemm(
                                      compile_flags=kernel_flags, object_file_name="mm_prefill.o")
 
     norm_kernel = ExternalFunction("prefill_norm_row", source_file=str(_KERNEL_SRC),
-                                   arg_types=[A_l1_ty, B_l1_ty, C_l1_ty, np.int32],
+                                   arg_types=[A_l1_ty, B_l1_ty, C_l1_ty, np.int32, np.int32],
                                    compile_flags=kernel_flags, object_file_name="mm_prefill.o")
 
     def make_core(r):
@@ -156,23 +157,17 @@ def chain_gemm(
         for shape in shapes:
             if shape[0] == "norm":
                 # The post-norm weight is the first A object of one L2 block; the pre-norm weight
-                # is folded into the next GEMM's weights. The column's 128 rows arrive on B in
-                # groups of 16; core r takes rows 4r..4r+3 of each. Acquire counts are totals,
-                # so the weight must not sit on the same FIFO as the rows.
+                # is folded into the next GEMM's weights. (Acquire counts are totals, so the
+                # weight cannot share the rows' FIFO.) Every core of a column sees each of its
+                # 128 rows on B; core r writes quarter r of [xn | x1] for 16 rows per C object.
                 w = in_a.acquire(1)
                 for _ in range_(M // 8 // 16):
-                    for q in range(4):
-                        if q == r:
-                            o = out_c.acquire(1)
-                            for s_ in range(4):
-                                row = in_b.acquire(1)
-                                norm(w, row, o, s_)
-                                in_b.release(1)
-                            out_c.release(1)
-                        else:
-                            for s_ in range(4):
-                                in_b.acquire(1)
-                                in_b.release(1)
+                    o = out_c.acquire(1)
+                    for s_ in range(16):
+                        row = in_b.acquire(1)
+                        norm(w, row, o, s_, r)
+                        in_b.release(1)
+                    out_c.release(1)
                 in_a.release(1)
                 for _ in range_(mtk // k * 4 - 1):
                     in_a.acquire(1)
@@ -239,8 +234,9 @@ def chain_gemm(
                                                                 [1, M // 8, 9, 512], [0, 8192, 512, 1]),
                                       group=tg, wait=False)
                 for col in range(n_aie_cols):
+                    # per C object of 16 rows: core q's quarter q of [xn | x1] for each row
                     C_conses[col].drain(a, tap=TensorAccessPattern((a_size,), col * (M // 8) * 8192,
-                                                                  [1, M // 8, 8, 512], [0, 8192, 512, 1]),
+                                                                  [M // 8 // 16, 4, 16, 1024], [16 * 8192, 1024, 8192, 1]),
                                         group=tg, wait=True)
                 tg.finish()
                 continue

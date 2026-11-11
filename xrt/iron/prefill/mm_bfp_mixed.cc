@@ -191,10 +191,11 @@ void prefill_swiglu(bfloat16 *__restrict c) {
 
 // ---- Prefill residual/norm phase. A token row's DDR record is
 // [xn bf16 2048 | x bf16 2048 | o bf16 2048 | pad] (16 KB). The phase gets
-// w_post (bf16) once as an A object, then each row's [x | o] as one B object,
-// computes x += rmsnorm(o) * w_post and xn = rmsnorm(x), and writes [xn | x]
-// for four rows into a C tile in the matmul's 8x8-tiled layout. The pre-norm
-// weight is folded into the next GEMM's weights.
+// w_post (bf16) once as an A object, then each row's [x | o] as one B object
+// broadcast to the four cores of a column. With x1 = x + rmsnorm(o) * w_post
+// and xn = rmsnorm(x1), core q writes elements [1024 q, 1024 q + 1024) of
+// [xn | x1] for 16 rows into its C tile (matmul 8x8-tiled layout). The
+// pre-norm weight is folded into the next GEMM's weights.
 
 namespace {
 inline aie::vector<float, 16> Wide(const bfloat16 *p) {
@@ -202,19 +203,13 @@ inline aie::vector<float, 16> Wide(const bfloat16 *p) {
   a.from_vector(aie::load_v<16>(p));
   return a.to_vector<float>();
 }
-inline float InvRms(float sum) {
-  aie::vector<float, 16> v = aie::mul(aie::broadcast<float, 16>(sum), aie::broadcast<float, 16>(1.0f / 2048.0f)).to_vector<float>();
-  return aie::invsqrt(aie::add(v, aie::broadcast<float, 16>(1e-5f)))[0];
+inline aie::vector<float, 16> Rsqrt(aie::vector<float, 16> sum) {
+  return aie::invsqrt(aie::add(aie::mul(sum, aie::broadcast<float, 16>(1.0f / 2048.0f)).to_vector<float>(),
+                               aie::broadcast<float, 16>(1e-5f)));
 }
-inline float SumSqBf16(const bfloat16 *v) {
-  aie::accum<accfloat, 16> acc = aie::zeros<accfloat, 16>();
-  for (int i = 0; i < 2048; i += 16) { aie::vector<float, 16> x = Wide(v + i); acc = aie::mac(acc, x, x); }
-  return aie::reduce_add(acc.to_vector<float>());
+inline aie::vector<float, 16> Total(aie::accum<accfloat, 16> a) {
+  return aie::broadcast<float, 16>(aie::reduce_add(a.to_vector<float>()));
 }
-}  // namespace
-
-extern "C" {
-
 // Tile rows of the C object in the matmul layout [m/r][n/t][r][t] with r = t = 8:
 // element (R, c) sits at ((R >> 3) * 16 + (c >> 3)) * 64 + (R & 7) * 8 + (c & 7).
 inline bfloat16 *TileRow(bfloat16 *tile, int R) { return tile + ((R >> 3) << 10) + ((R & 7) << 3); }
@@ -223,35 +218,47 @@ inline void Store16(bfloat16 *d, int cb, aie::vector<bfloat16, 16> v) {
   aie::store_v(d + (cb << 6), v.extract<8>(0));
   aie::store_v(d + (cb << 6) + 64, v.extract<8>(1));
 }
+}  // namespace
 
-// wp: post-norm weight (2048, one A object); row: [x | o] (x updated in place).
-// Writes [norm(x1) | x1] into slot 0..3 of the tile, with x1 = x + norm(o) * wp. The
-// pre-norm weight is folded into the weights of the GEMM that consumes norm(x1).
-void prefill_norm_row(const bfloat16 *__restrict wp, bfloat16 *__restrict row,
-                      bfloat16 *__restrict tile, int32_t slot) {
-  bfloat16 *x = row;
+extern "C" {
+
+// wp: post-norm weight (2048, one A object); row: [x | o]; slot 0..15; part q = 0..3.
+void prefill_norm_row(const bfloat16 *__restrict wp, const bfloat16 *__restrict row, bfloat16 *__restrict tile,
+                      int32_t slot, int32_t part) {
+#ifdef NORM_STUB
+  return;
+#endif
+  const bfloat16 *x = row;
   const bfloat16 *o = row + 2048;
-  const aie::vector<float, 16> so = aie::broadcast<float, 16>(InvRms(SumSqBf16(o)));
-  for (int j = 0; j < 16; ++j) {
-    bfloat16 *d = TileRow(tile, slot * 32 + 16 + j);
-    for (int c = 0; c < 128; c += 16) {
-      const int i = j * 128 + c;
-      aie::vector<float, 16> t = aie::mul(aie::mul(Wide(o + i), so).to_vector<float>(), Wide(wp + i)).to_vector<float>();
-      aie::accum<accfloat, 16> nx;
-      nx.from_vector(aie::add(Wide(x + i), t));
-      const aie::vector<bfloat16, 16> v = nx.to_vector<bfloat16>();
-      aie::store_v(x + i, v);
-      Store16(d, c >> 3, v);
-    }
+  // One pass: sum(o^2), sum(x^2), sum(x wo), sum(wo^2) with wo = w o; then
+  // sum(x1^2) = sum(x^2) + 2 so sum(x wo) + so^2 sum(wo^2).
+  aie::accum<accfloat, 16> oo = aie::zeros<accfloat, 16>(), xx = oo, xw = oo, ww = oo;
+  for (int i = 0; i < 2048; i += 16) {
+    const aie::vector<bfloat16, 16> xv = aie::load_v<16>(x + i), ov = aie::load_v<16>(o + i);
+    const aie::vector<bfloat16, 16> wo = aie::mul(aie::load_v<16>(wp + i), ov).to_vector<bfloat16>();
+    oo = aie::mac(oo, ov, ov);
+    xx = aie::mac(xx, xv, xv);
+    xw = aie::mac(xw, xv, wo);
+    ww = aie::mac(ww, wo, wo);
   }
-  const aie::vector<float, 16> sh = aie::broadcast<float, 16>(InvRms(SumSqBf16(x)));
-  for (int j = 0; j < 16; ++j) {
-    bfloat16 *d = TileRow(tile, slot * 32 + j);
+  const aie::vector<float, 16> so = Rsqrt(Total(oo));
+  const aie::vector<float, 16> s2 = aie::mul(so, so).to_vector<float>();
+  const aie::vector<float, 16> sum1 =
+      aie::add(aie::add(Total(xx), aie::mul(aie::mul(so, Total(xw)).to_vector<float>(), aie::broadcast<float, 16>(2.0f)).to_vector<float>()),
+               aie::mul(s2, Total(ww)).to_vector<float>());
+  const aie::vector<float, 16> sh = Rsqrt(sum1);
+  const int at = (part & 1) * 1024;   // element offset within xn or x1
+  const bool norm = part < 2;
+  for (int j = 0; j < 8; ++j) {
+    bfloat16 *d = TileRow(tile, slot * 8 + j);
     for (int c = 0; c < 128; c += 16) {
-      const int i = j * 128 + c;
-      aie::accum<accfloat, 16> t;
-      t.from_vector(aie::mul(Wide(x + i), sh).to_vector<float>());
-      Store16(d, c >> 3, t.to_vector<bfloat16>());
+      const int i = at + j * 128 + c;
+      aie::vector<float, 16> t = aie::mul(aie::mul(aie::load_v<16>(o + i), aie::load_v<16>(wp + i)).to_vector<float>(), so).to_vector<float>();
+      aie::vector<float, 16> x1 = aie::add(Wide(x + i), t);
+      if (norm) x1 = aie::mul(x1, sh).to_vector<float>();
+      aie::accum<accfloat, 16> r;
+      r.from_vector(x1);
+      Store16(d, c >> 3, r.to_vector<bfloat16>());
     }
   }
 }
