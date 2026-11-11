@@ -559,7 +559,9 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
       }
       if (!w.codec.blocks.empty()) {
         impl.npu_codec = std::make_unique<lfm3::npu::Stack>(w.codec);
-        if (const char* e = std::getenv("GUFO_LFM3_CODEC_DEVICE"); e && std::string_view(e) != "0") {
+        // The codec runs on the NPU device path (GUFO_LFM3_CODEC_DEVICE=0: the
+        // host-glue stack; =check: both, with their largest difference).
+        if (const char* e = std::getenv("GUFO_LFM3_CODEC_DEVICE"); !(e && std::string_view(e) == "0")) {
           impl.codec_weights = std::make_unique<lfm3::Weights>(StackWeights(w.codec, w.codec_window));
           std::string error;
           impl.codec_device = lfm3::npu::Backbone::Load(*impl.codec_weights, &error);
@@ -1377,7 +1379,7 @@ struct Voice::Npu {
         // also runs the host-glue stack and reports the largest difference.
         std::vector<lfm3::npu::Row> rws(rows);
         for (int r = 0; r < rows; ++r) rws[r] = {&codec_device_state, codec_device_state.position + std::uint32_t(r), false};
-        static const bool check = std::string_view(std::getenv("GUFO_LFM3_CODEC_DEVICE")) == "check";
+        static const bool check = std::getenv("GUFO_LFM3_CODEC_DEVICE") && std::string_view(std::getenv("GUFO_LFM3_CODEC_DEVICE")) == "check";
         impl().codec_device->Forward(x, rws, z, {});
         if (check) {
           std::vector<float> zh(z.size());
