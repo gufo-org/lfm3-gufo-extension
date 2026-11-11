@@ -36,6 +36,9 @@ std::uint32_t KSplitBlocksPerPass(const ProjectionShape& shape);
 std::string ProjectionKMultiProgram(const ProjectionShape& shape);
 
 constexpr std::uint32_t kColumns = 8;
+// func.def inline @<name>(x view, record view, first x tile, acc) -> acc:
+// one weight record of `record_tiles` BFP16 tiles against resident x tiles.
+std::string ProjectionDot(const std::string& name, std::uint32_t record_tiles, std::uint32_t x_tiles);
 
 }  // namespace gufo::models::lfm3::npu
 

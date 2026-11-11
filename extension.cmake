@@ -43,6 +43,8 @@ gufo_extension_target(
     npu/stack.cpp
     npu/rowops.cpp
     npu/glue.cpp
+    npu/fuse.cpp
+    npu/resident.cpp
     npu/attention.cpp
     npu/host/npu_runtime.cpp
   LINK_LIBRARIES

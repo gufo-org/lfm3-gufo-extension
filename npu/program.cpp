@@ -68,6 +68,10 @@ func.def inline @@NAME(%x: view<@XTxbf16>, %w: view<@RBxi8>, %tile0: index, %acc
 
 }  // namespace
 
+std::string ProjectionDot(const std::string& name, std::uint32_t record_tiles, std::uint32_t x_tiles) {
+  return TileLoop(name, record_tiles, x_tiles);
+}
+
 ProjectionShape PlanProjection(std::uint32_t k, std::uint32_t m, std::uint32_t blocks) {
   ProjectionShape s;
   s.blocks = blocks ? blocks : 1;

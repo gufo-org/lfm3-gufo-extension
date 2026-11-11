@@ -16,6 +16,7 @@
 #include "attention.hpp"
 #include "dense.hpp"
 #include "glue.hpp"
+#include "resident.hpp"
 #include "host/npu_runtime.hpp"
 #include "host_ops.hpp"
 #include "host/bfp.hpp"
@@ -72,6 +73,8 @@ struct Device {
   // Matrix-unit attention (AttendMmaProgram) with its pre-scaled Q norms;
   // GUFO_LFM3_NPU_ATTN=scalar keeps the scalar kernel.
   bool mma{};
+  // Resident decode feed-forward blocks (npu/resident.cpp); GUFO_LFM3_NPU_RESIDENT=0 disables.
+  bool resident{};
   int w_first{-1}, cos_g{-1}, sin_g{-1}, cos_s{-1}, sin_s{-1};
   // Activations for up to kMaxRows rows.
   int x{-1}, x2{-1}, o{-1}, z{-1}, xb2048{-1}, xb_ffn{-1}, y_proj{-1}, y_out{-1}, y_down{-1}, y_head{-1},
@@ -174,6 +177,10 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
         const char* attn = std::getenv("GUFO_LFM3_NPU_ATTN");
         d->mma = !(attn && std::string_view(attn) == "scalar") && c.heads % 8 == 0 && c.heads / 8 == 2 &&
                  D % 8 == 0 && D <= 128;
+      }
+      {
+        const char* r = std::getenv("GUFO_LFM3_NPU_RESIDENT");
+        d->resident = !(r && std::string_view(r) == "0");
       }
       d->w_first = d->Upload(std::vector<float>(Floats(w.layers[0].norm), Floats(w.layers[0].norm) + H));
       for (std::size_t i = 0; i < n; ++i) {
@@ -654,6 +661,17 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
         timed("attend", [&] { npu.Enqueue(attend, b2); });
       }
       timed("proj out", [&] { dense->Enqueue(p.out, d.xb2048, d.y_out, blocks); });
+      // One decode row: the whole feed-forward block (both norms, gate/up,
+      // SwiGLU, down, reduce) as one resident dispatch; the residual stays in x.
+      if (R == 1 && il + 1 < c.layers.size() && d.resident && p.gateup.shape.split == Split::kColumns &&
+          p.down.shape.split == Split::kColumns) {
+        const int k = d.Kernel("ffn_resident", [&] { return ResidentFfnProgram(H, I, c.eps, "ffn_resident"); },
+                               "@ffn_resident");
+        const int b[] = {x, d.y_out, d.w_op[il], x2, d.xb2048, p.gateup.weights, d.y_proj, d.xb_ffn,
+                         p.down.weights, d.y_down, d.w_ffn[il]};
+        timed("ffn resident", [&] { npu.Enqueue(k, b); });
+        continue;
+      }
       {
         const int k = row_kernel(NormPackKernel(H, R8, Residual::kBlocked, true, false, c.eps));
         const int b[] = {x, d.y_out, d.w_op[il], x2, d.xb2048, d.count};
