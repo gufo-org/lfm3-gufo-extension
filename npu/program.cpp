@@ -147,6 +147,68 @@ func.def inline @@NAME(%x: view<@XEBxi8>, %w: view<@WSBxi8>, %wbase: index, %til
                   {"@GB", S(kPer * 72)}, {"@CHUNKS", S(record_tiles / kPer)}, {"@SCHEMA", kSchema}, {"@BODY", body},
                   {"@RESULTS", results}, {"@ITERS", iters}, {"@TYPES", types}, {"@YIELDS", yields}});
 }
+
+// One weight record against `blocks` resident encoded activation blocks:
+// each weight chunk loads once and feeds every block's accumulator (the
+// chains are independent, so consecutive matrix ops overlap).
+std::string TileLoopBlocks(const std::string& name, std::uint32_t record_tiles, std::uint32_t x_tiles,
+                           std::uint32_t blocks, std::uint32_t resident) {
+  std::string body, iters, yields, types, results, args;
+  for (std::uint32_t b = 0; b < blocks; ++b) {
+    const std::string B = S(b);
+    body += Replace(R"(    %xo@B0 = index.constant @XO : index
+    %xa@B0 = index.add %xo@B0, %w_at0 : index
+    %xa@B = index.add %xa@B0, %xbase : index
+    %xg@B = vector.load %x[%xa@B] : view<@XEBxi8> -> vector<@GBxi8>
+    %xb@B = vector.fragment<lhs> %xg@B shape [blocks(%cper), %c8, %c8] using {schema = %schema : encoding<schema>} : vector<@GBxi8>
+)",
+                    {{"@XO", S(std::uint64_t(b) * x_tiles * 72)}, {"@B", B}, {"@XEB", S(std::uint64_t(resident) * x_tiles * 72)},
+                     {"@GB", S(kPer * 72)}});
+    iters += (b ? ", %a" : "%a") + B + "_0 = %zinit : vector<64xf32>";
+    types += b ? ", vector<64xf32>" : "vector<64xf32>";
+    results += (b ? ", %r" : "%r") + B;
+    yields += (b ? ", %a" : "%a") + B + "_" + S(kPer);
+  }
+  // Tile-major across blocks: tile i of every block, then tile i + 1.
+  for (std::uint32_t i = 0; i < kPer; ++i) {
+    body += Replace(R"(    %w_bytes@I = vector.slice %w_blocks[@W] : vector<@GBxi8> -> vector<72xi8>
+    %rhs@I = vector.fragment<rhs> %w_bytes@I shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+)",
+                    {{"@I", S(i)}, {"@W", S(i * 72)}, {"@GB", S(kPer * 72)}});
+    for (std::uint32_t b = 0; b < blocks; ++b) {
+      const std::string B = S(b);
+      body += Replace(R"(    %x_bytes@B_@I = vector.slice %xb@B[@W] : vector<@GBxi8> -> vector<72xi8>
+    %lhs@B_@I = vector.fragment<lhs> %x_bytes@B_@I shape [%c8, %c8] using {schema = %schema : encoding<schema>} : vector<72xi8>
+    %a@B_@N = vector.mma %lhs@B_@I, %rhs@I, %a@B_@I : vector<72xi8>, vector<72xi8>, vector<64xf32>
+)",
+                      {{"@B", B}, {"@I", S(i)}, {"@N", S(i + 1)}, {"@W", S(i * 72)}, {"@GB", S(kPer * 72)}});
+    }
+  }
+  return Replace(R"(
+func.def inline @@NAME(%x: view<@XEBxi8>, %w: view<@WSBxi8>, %wbase: index, %xbase: index) -> (@TYPES) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %cper = index.constant @PER : index
+  %cbytes = index.constant @GB : index
+  %chunks = index.constant @CHUNKS : index
+  %zvec = vector.splatf 0.0 : vector<64xf32>
+  %zinit = vector.fragment<init> %zvec shape [%c8, %c8] : vector<64xf32>
+  @SCHEMA
+  @RESULTS = scf.for %chunk = [%c0 to %chunks step %c1](@ITERS) -> (@TYPES) {
+    %w_at0 = index.mul %chunk, %cbytes : index
+    %w_at = index.add %w_at0, %wbase : index
+    %w_group = vector.load %w[%w_at] : view<@WSBxi8> -> vector<@GBxi8>
+    %w_blocks = vector.fragment<rhs> %w_group shape [blocks(%cper), %c8, %c8] using {schema = %schema : encoding<schema>} : vector<@GBxi8>
+@BODY    scf.yield @YIELDS : @TYPES
+  }
+  func.return @RESULTS : @TYPES
+}
+)",
+                 {{"@NAME", name}, {"@XEB", S(std::uint64_t(resident) * x_tiles * 72)}, {"@WSB", S(record_tiles * 72)},
+                  {"@PER", S(kPer)}, {"@GB", S(kPer * 72)}, {"@CHUNKS", S(record_tiles / kPer)}, {"@SCHEMA", kSchema},
+                  {"@BODY", body}, {"@RESULTS", results}, {"@ITERS", iters}, {"@TYPES", types}, {"@YIELDS", yields}});
+}
 }  // namespace
 
 std::string ProjectionDot(const std::string& name, std::uint32_t record_tiles, std::uint32_t x_tiles) {
@@ -488,7 +550,7 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
         scf.for %r = [%c0 to %rper step %c1] {
           %wb = index.mul %r, %rtb : index
           %y_write, %y_rec = channel.reserve %y_channel : channel<tile<@BPx64xf32>> -> (write<tile<@BPx64xf32>>, view<@BPx64xf32>)
-          scf.for %b = [%c0 to %bp step %c1] {
+#BLOCKS#@PERBLOCK_BEGIN          scf.for %b = [%c0 to %bp step %c1] {
             %zero = vector.splatf 0.0 : vector<64xf32>
             %init = vector.fragment<init> %zero shape [%c8, %c8] : vector<64xf32>
             %xo = index.mul %b, %column_tiles : index
@@ -497,7 +559,7 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
             %y_values = view.bitcast %y_sub : view<1x64xf32> -> view<8x8xf32>
             vector.fragment.store<result> %acc, %y_values[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>
           }
-          channel.publish %y_write : write<tile<@BPx64xf32>>
+@PERBLOCK_END          channel.publish %y_write : write<tile<@BPx64xf32>>
         }
         channel.release %w_read : read<@RT>
       }
@@ -526,8 +588,30 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
     compose += "  pipeline.compose @" + name + "_col[%c" + S(c) + "](%x, %w, %y) : [index](buffer, buffer, buffer)\n";
   std::string body = column;
   {
+    {
+      const auto pa = body.find("@PERBLOCK_BEGIN"), pb = body.find("@PERBLOCK_END");
+      body = enc ? body.erase(pa, pb + 13 - pa) : body.erase(pb, 13).erase(pa, 15);
+    }
     const auto a = body.find("@ENCODE_BEGIN"), b = body.find("@ENCODE_END");
     body = enc ? body.erase(b, 11).erase(a, 13) : body.erase(a, b + 11 - a);
+    std::string blocks_call;
+    const std::uint32_t per_call = std::min<std::uint32_t>(bp, 4);  // accumulators: 4 registers each, 20 available
+    if (enc) {
+      for (std::uint32_t b0 = 0; b0 < bp; b0 += per_call) {
+        std::string res, types, stores;
+        for (std::uint32_t b = b0; b < b0 + per_call; ++b) {
+          res += (b > b0 ? ", %acc" : "%acc") + S(b);
+          types += b > b0 ? ", vector<64xf32>" : "vector<64xf32>";
+          stores += "            %ys" + S(b) + " = view.subview %y_rec[" + S(b) + ", 0] : view<" + S(bp) + "x64xf32> -> view<1x64xf32>\n" +
+                    "            %yv" + S(b) + " = view.bitcast %ys" + S(b) + " : view<1x64xf32> -> view<8x8xf32>\n" +
+                    "            vector.fragment.store<result> %acc" + S(b) + ", %yv" + S(b) + "[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>\n";
+        }
+        blocks_call += "            %xb" + S(b0) + " = index.constant " + S(std::uint64_t(b0) * x_tiles * 72) + " : index\n            " + res +
+                       " = func.call @" + dot + "(%xe, %w_values, %wb, %xb" + S(b0) + ") : (view<" +
+                       S(std::uint64_t(bp) * x_tiles * 72) + "xi8>, view<" + rec + ">, index, index) -> (" + types + ")\n" + stores;
+      }
+    }
+    body = Replace(body, {{"#BLOCKS#", blocks_call}});
     body = Replace(body, {{"#DOTCALL#", enc ? "            %acc = func.call @" + dot + "(%xe, %w_values, %wb, %xo, %init) : (view<" +
                                                 S(std::uint64_t(bp) * x_tiles * 72) + "xi8>, view<" + rec +
                                                 ">, index, index, vector<64xf32>) -> (vector<64xf32>)"
@@ -536,7 +620,7 @@ pipeline.def<kernel> @@COL(%column: index) run(%x_arg: buffer, %w_arg: buffer, %
                                                 ">, index, vector<64xf32>) -> (vector<64xf32>)"}});
   }
   if (!enc && R != 1) throw std::invalid_argument("K-multi without encoded activations needs one record per slot");
-  return "aie2p.target<array> @npu\n" + (enc ? TileLoopEncoded(dot, record_tiles, bp * x_tiles, R) : TileLoop(dot, record_tiles, bp * x_tiles)) + body +
+  return "aie2p.target<array> @npu\n" + (enc ? TileLoopBlocks(dot, record_tiles, x_tiles, std::min<std::uint32_t>(bp, 4), bp) : TileLoop(dot, record_tiles, bp * x_tiles)) + body +
          "\npipeline.def<kernel> public retain target(@npu) @" + name + "() run(%x: buffer, %w: buffer, %y: buffer) {\n" +
          compose + "}\n";
 }
