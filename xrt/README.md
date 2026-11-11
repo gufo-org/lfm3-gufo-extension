@@ -202,3 +202,11 @@ LFM3-1.7B's projections for a 1,024-token prompt are 3.54 TFLOP, about
 Switching between two xclbins (hardware contexts) costs about 2.4 ms, so a
 prefill keeps every operation in one xclbin. The model switches contexts
 once between prefill and decode.
+
+`iron/bfp_gemm_host.py` runs that GEMM (mlir-aie's
+`gemm_asymmetric_tile_buffering/config1`) on real LFM3 weights. B is layer
+0's gate and up rows, dequantized from Q8_0, encoded to bfp16ebs8
+(round-to-nearest, shared exponent per 8) and pre-shuffled into the design's
+1x2 8x8 L1 layout. At 1024 × 2048 × 16384 it takes 2.98 ms (23.1 TFLOPS).
+The relative error against the exact Q8_0 weights is 1.1e-2, from the bfp16
+weight encoding.
