@@ -91,7 +91,9 @@ int main() {
     const int bp = npu.Upload(std::span<const float>(pr)), bh = npu.Upload(std::span<const float>(hist)),
               bw = npu.Upload(std::span<const float>(w)), bm = npu.Upload(std::span<const std::int32_t>(meta)),
               bo = npu.Alloc((NB * H * 8 + 64) * 2);
-    const int bind[] = {bp, bh, bw, bm, bo};
+    const std::int32_t cn[16] = {std::int32_t(R)};
+    const int bcn = npu.Upload(std::span<const std::int32_t>(cn, 16));
+    const int bind[] = {bp, bh, bw, bm, bo, bcn};
     npu.Dispatch(id, bind);
     std::vector<std::uint16_t> ob(NB * H * 8 + 64);
     std::vector<float> gh(hist.size());

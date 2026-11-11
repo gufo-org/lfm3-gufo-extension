@@ -308,8 +308,8 @@ std::string AttendProgram(const AttentionShape& s, const std::string& name) {
   char scale[64];
   std::snprintf(scale, sizeof scale, "%.9e", 1.0 / std::sqrt(double(D)));
   const std::string body = R"(
-pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a2: buffer, %a3: buffer, %a4: buffer, %a5: buffer, %a6: buffer) {
-  %qb, %gb, %kpool, %vpool, %meta, %kgroups, %out = buffer.assume.alignment %a0, %a1, %a2, %a3, %a4, %a5, %a6 {minimum_alignment = 64} : buffer, buffer, buffer, buffer, buffer, buffer, buffer
+pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a2: buffer, %a3: buffer, %a4: buffer, %a5: buffer, %a6: buffer, %a7: buffer) {
+  %qb, %gb, %kpool, %vpool, %meta, %kgroups, %out, %cntb = buffer.assume.alignment %a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7 {minimum_alignment = 64} : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -320,7 +320,6 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
   %c16 = index.constant 16 : index
   %c32 = index.constant 32 : index
   %c48 = index.constant 48 : index
-  %rows = index.constant @ROWS : index
   %dim = index.constant @D : index
   %hpc = index.constant @HPC : index
   %qc = index.constant @QC : index
@@ -381,6 +380,14 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
     %c16i = vector.splati 16 : vector<16xi32>
     %lanes_hi = vector.addi %lanes, %c16i : vector<16xi32>
     %zero_i = vector.splati 0 : vector<16xi32>
+    %cn_src = buffer.view %cntb[%origin] : buffer -> view<16xi32>
+    %cnc = kernel.async.copy %cn_src to %mrow {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<16xi32> to view<16xi32> -> kernel.async.token
+    %cng = kernel.async.group %cnc : kernel.async.token -> kernel.async.group
+    kernel.async.wait %cng {newer_groups = 0} : kernel.async.group
+    %cn_raw = view.load %mrow[%c0] : view<16xi32> -> i32
+    %cn_mask = scalar.constant 255 : i32
+    %cn_b = scalar.andi %cn_raw, %cn_mask : i32
+    %rows = index.cast %cn_b : i32 to index
     scf.for %row = [%c0 to %rows step %c1] {
 @META
       %qgroup_raw = view.load %mrow[%c4] : view<16xi32> -> i32
@@ -503,6 +510,14 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
     %mrow = view.bitcast %mbits : view<16xf32> -> view<16xi32>
     %vzero = vector.splatf 0.0 : vector<16xf32>
     %onev = vector.splatf 1.0 : vector<16xf32>
+    %cn_src = buffer.view %cntb[%origin] : buffer -> view<16xi32>
+    %cnc = kernel.async.copy %cn_src to %mrow {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<16xi32> to view<16xi32> -> kernel.async.token
+    %cng = kernel.async.group %cnc : kernel.async.token -> kernel.async.group
+    kernel.async.wait %cng {newer_groups = 0} : kernel.async.group
+    %cn_raw = view.load %mrow[%c0] : view<16xi32> -> i32
+    %cn_mask = scalar.constant 255 : i32
+    %cn_b = scalar.andi %cn_raw, %cn_mask : i32
+    %rows = index.cast %cn_b : i32 to index
     scf.for %row = [%c0 to %rows step %c1] {
 @META
 @CHUNKS
@@ -668,8 +683,8 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%a0: buffer, %a1: buffer, %a
   std::string head = "aie2p.target<array> @npu\n";
   head += kMathLibrary;
   return head + text +
-         Compose(name, "%a0: buffer, %a1: buffer, %a2: buffer, %a3: buffer, %a4: buffer, %a5: buffer, %a6: buffer",
-                 "%a0, %a1, %a2, %a3, %a4, %a5, %a6", "buffer, buffer, buffer, buffer, buffer, buffer, buffer");
+         Compose(name, "%a0: buffer, %a1: buffer, %a2: buffer, %a3: buffer, %a4: buffer, %a5: buffer, %a6: buffer, %a7: buffer",
+                 "%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7", "buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer");
 }
 
 }  // namespace gufo::models::lfm3::npu

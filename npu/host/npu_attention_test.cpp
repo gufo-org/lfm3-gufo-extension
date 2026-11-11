@@ -113,7 +113,9 @@ int main() {
               bm2 = npu.Upload(std::span<const std::int32_t>(am)), bgr = npu.Upload(std::span<const std::int32_t>(groups));
     const std::uint32_t OG = H / 8, OB = (R + 7) / 8;
     const int bo = npu.Alloc((std::size_t(OB) * OG * 64 + 64) * 2);
-    const int b2[] = {bq2, bg2, bk2, bv2, bm2, bgr, bo};
+    const std::int32_t cn[16] = {std::int32_t(R)};
+    const int bcn = npu.Upload(std::span<const std::int32_t>(cn, 16));
+    const int b2[] = {bq2, bg2, bk2, bv2, bm2, bgr, bo, bcn};
     npu.Dispatch(attend, b2);
     std::vector<std::uint16_t> ob(std::size_t(OB) * OG * 64 + 64);
     npu.Read(bo, 0, ob.data(), ob.size() * 2);

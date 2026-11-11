@@ -583,9 +583,9 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
       const auto& p = layers[il];
       if (c.layers[il] == LayerType::kConvolution) {
         timed("proj in", [&] { dense->Enqueue(p.in, d.xb2048, d.y_proj, blocks); });
-        const int conv = d.Kernel(key("conv"), [&] { return ConvProgram(H, Lw, R, Device::kSlots, key("conv")); },
-                                  "@" + key("conv"));
-        const int b[] = {d.y_proj, d.hist[il], d.conv_w[il], d.meta_g, d.xb2048};
+        const int conv = d.Kernel("conv_dyn", [&] { return ConvProgram(H, Lw, Device::kMaxRows, Device::kSlots, "conv_dyn"); },
+                                  "@conv_dyn");
+        const int b[] = {d.y_proj, d.hist[il], d.conv_w[il], d.meta_g, d.xb2048, d.count};
         timed("conv", [&] { npu.Enqueue(conv, b); });
       } else {
         const bool swa = c.layers[il] == LayerType::kSlidingAttention;
@@ -598,12 +598,12 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
         s8.rows = R8;
         const std::string pk = "prep" + tag + "_r" + std::to_string(R8);
         const int prep = d.Kernel(pk, [&] { return QkPrepProgram(s8, pk); }, "@" + pk);
-        const int attend = d.Kernel(key("attend" + tag), [&] { return AttendProgram(s, key("attend" + tag)); },
-                                    "@" + key("attend" + tag));
+        const std::string ak = "attend" + tag + "_dyn";
+        const int attend = d.Kernel(ak, [&] { return AttendProgram(s, ak); }, "@" + ak);
         const int meta = swa ? d.meta_s : d.meta_g;
         const int b1[] = {d.y_proj, d.qn[il], d.kn[il], swa ? d.cos_s : d.cos_g, swa ? d.sin_s : d.sin_g, meta, d.q, d.gates, d.kpool[il], d.vpool[il]};
         timed("qk prep", [&] { npu.Enqueue(prep, b1); });
-        const int b2[] = {d.q, d.gates, d.kpool[il], d.vpool[il], meta, d.groups, d.xb2048};
+        const int b2[] = {d.q, d.gates, d.kpool[il], d.vpool[il], meta, d.groups, d.xb2048, d.count};
         timed("attend", [&] { npu.Enqueue(attend, b2); });
       }
       timed("proj out", [&] { dense->Enqueue(p.out, d.xb2048, d.y_out, blocks); });

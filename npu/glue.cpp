@@ -171,8 +171,8 @@ std::string ConvProgram(std::uint32_t H, std::uint32_t L, std::uint32_t rows, st
   std::string t = "aie2p.target<array> @npu\n";
   t += kMathLibrary;
   t += Fill(R"(
-pipeline.def<kernel> @@NAME_col(%column: index) run(%proj_arg: buffer, %hist_arg: buffer, %w_arg: buffer, %meta_arg: buffer, %out_arg: buffer) {
-  %proj, %hist, %wts, %meta, %out = buffer.assume.alignment %proj_arg, %hist_arg, %w_arg, %meta_arg, %out_arg {minimum_alignment = 64} : buffer, buffer, buffer, buffer, buffer
+pipeline.def<kernel> @@NAME_col(%column: index) run(%proj_arg: buffer, %hist_arg: buffer, %w_arg: buffer, %meta_arg: buffer, %out_arg: buffer, %cnt_arg: buffer) {
+  %proj, %hist, %wts, %meta, %out, %cntb = buffer.assume.alignment %proj_arg, %hist_arg, %w_arg, %meta_arg, %out_arg, %cnt_arg {minimum_alignment = 64} : buffer, buffer, buffer, buffer, buffer, buffer
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -184,7 +184,7 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%proj_arg: buffer, %hist_arg
   %hidden = index.constant @H : index
   %taps = index.constant @TAPS : index
   %last_tap = index.constant @LAST : index
-  %rows = index.constant @ROWS : index
+
   %hist_stride = index.constant @HSTRIDE : index
   %pblock = index.constant @PBLOCK : index
   %oblock = index.constant @OBLOCK : index
@@ -226,6 +226,15 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%proj_arg: buffer, %hist_arg
     %wc = kernel.async.copy %w_src to %w {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<@Lx@SLICExf32, #encoding.layout.strided<strides=[@H, 1]>> to view<@Lx@SLICExf32> -> kernel.async.token
     %wg = kernel.async.group %wc : kernel.async.token -> kernel.async.group
     kernel.async.wait %wg {newer_groups = 0} : kernel.async.group
+    // Runtime row count (element 0 of the count buffer, at most 255).
+    %cn_src = buffer.view %cntb[%origin] : buffer -> view<16xi32>
+    %cnc = kernel.async.copy %cn_src to %m {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<16xi32> to view<16xi32> -> kernel.async.token
+    %cng = kernel.async.group %cnc : kernel.async.token -> kernel.async.group
+    kernel.async.wait %cng {newer_groups = 0} : kernel.async.group
+    %cn_raw = view.load %m[%c0] : view<16xi32> -> i32
+    %cn_mask = scalar.constant 255 : i32
+    %cn_b = scalar.andi %cn_raw, %cn_mask : i32
+    %rows = index.cast %cn_b : i32 to index
     scf.for %row = [%c0 to %rows step %c1] {
       %m_e = index.mul %row, %c16 : index
       %m_bytes = index.mul %m_e, %c4 : index
@@ -329,11 +338,11 @@ pipeline.def<kernel> @@NAME_col(%column: index) run(%proj_arg: buffer, %hist_arg
                 "  %c3p = index.constant 3 : index\n  %part_stride = index.constant " + S(std::uint64_t(H / 8) * 64) +
                     " : index\n  %first = index.mul %column, %slice : index"}});
   std::string compose = "\npipeline.def<kernel> public retain target(@npu) @" + name +
-                        "() run(%proj: buffer, %hist: buffer, %wts: buffer, %meta: buffer, %out: buffer) {\n";
+                        "() run(%proj: buffer, %hist: buffer, %wts: buffer, %meta: buffer, %out: buffer, %cnt: buffer) {\n";
   for (int c = 0; c < 8; ++c) compose += "  %k" + S(c) + " = index.constant " + S(c) + " : index\n";
   for (int c = 0; c < 8; ++c)
     compose += "  pipeline.compose @" + name + "_col[%k" + S(c) +
-               "](%proj, %hist, %wts, %meta, %out) : [index](buffer, buffer, buffer, buffer, buffer)\n";
+               "](%proj, %hist, %wts, %meta, %out, %cnt) : [index](buffer, buffer, buffer, buffer, buffer, buffer)\n";
   return t + compose + "}\n";
 }
 
