@@ -38,10 +38,8 @@ def rows_record(codes, scales, rows):
     return np.concatenate(cs + [np.concatenate(ss).view(np.int8)])
 
 
-def main():
-    xclbin, so, gguf = sys.argv[1:4]
-    tokens = [int(x) for x in sys.argv[4:]] or [1, 1785, 3758, 314, 7428, 25, 1003, 2091]
-    ctx = 4096
+def pack(gguf, ctx=4096):
+    """Decode state S and weights W for a GGUF, with the float32 reference weights."""
     lay = L.Layout(ctx)
     d, info, base = gguf_tensors(gguf)
     T = lambda n: q8_rows(d, info, base, n)
@@ -116,6 +114,17 @@ def main():
     for kind, tab in rope.items():
         S[lay.rope[kind]:lay.rope[kind] + tab.nbytes] = tab.view(np.int8).reshape(-1)
 
+    return lay, S, W, ref, emb, out_norm, rope
+
+def main():
+    xclbin, so, gguf = sys.argv[1:4]
+    tokens = [int(x) for x in sys.argv[4:]] or [1, 1785, 3758, 314, 7428, 25, 1003, 2091]
+    ctx = 4096
+    lay, S, W, ref, emb, out_norm, rope = pack(gguf, ctx)
+    d, info, base = gguf_tensors(gguf)
+    T = lambda n: q8_rows(d, info, base, n)
+    F = lambda n: f32(d, info, base, n)
+    ec, es = T("token_embd.weight")
     print("device ...", flush=True)
     dev = pyxrt.device(0)
     xb = pyxrt.xclbin(xclbin)
