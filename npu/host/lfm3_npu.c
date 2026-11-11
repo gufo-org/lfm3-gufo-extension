@@ -5,11 +5,16 @@
 // keeps the runtime, compiler and device buffers alive across calls. Host data
 // moves through the runtime's mappable staging pool and queue transfers.
 
+#define _GNU_SOURCE
 #include "lfm3_npu.h"
 
+#include <dlfcn.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "iree/base/api.h"
 #include "iree/base/tooling/flags.h"
@@ -36,6 +41,7 @@ typedef struct lfm3_npu_kernel_t {
   iree_hal_executable_function_t function;
   char export_name[256];
   uint32_t workgroup_count[3];
+  iree_byte_sequence_t* contents;  // cached executable bytes, owned
 } lfm3_npu_kernel_t;
 
 struct lfm3_npu {
@@ -56,6 +62,10 @@ struct lfm3_npu {
   // Dispatches chain on one timeline: each waits for the previous value.
   iree_hal_semaphore_t* timeline;
   uint64_t submitted;
+  // Program cache directory (empty when disabled) and the identity of this
+  // library build, which keys every entry.
+  char cache_dir[1024];
+  uint64_t build_hash;
   char error[4096];
 };
 
@@ -98,6 +108,8 @@ static iree_status_t lfm3_npu_check_result(lfm3_npu* npu, loomc_result_t* result
   free(text);
   return status;
 }
+
+static void lfm3_npu_cache_open(lfm3_npu* npu, const char* device);
 
 int lfm3_npu_abi_version(void) { return LFM3_NPU_ABI_VERSION; }
 
@@ -194,6 +206,7 @@ int lfm3_npu_open(const char* device, lfm3_npu** out) {
     npu->target_profile = selection.target_profile;
     npu->executable_target = selection.executable_target;
   }
+  if (iree_status_is_ok(status)) lfm3_npu_cache_open(npu, device);
   return lfm3_npu_fail(npu, status);
 }
 
@@ -205,6 +218,7 @@ void lfm3_npu_close(lfm3_npu* npu) {
   for (int i = 0; i < npu->kernel_count; ++i) {
     if (!npu->kernels[i]) continue;
     loom_run_hal_prepared_candidate_deinitialize(&npu->kernels[i]->candidate);
+    iree_byte_sequence_release(npu->kernels[i]->contents);
     free(npu->kernels[i]);
   }
   if (npu->timeline) {
@@ -253,6 +267,158 @@ static iree_status_t lfm3_npu_launch_config(const loomc_artifact_t* artifact,
   return status;
 }
 
+// On-disk program cache. Compiling one Loom root takes seconds, so compiled
+// executables are stored by FNV-1a hash of this library's bytes, the device
+// URI, the source text and the root. A changed toolchain or source therefore
+// misses rather than loading a stale program. LFM3_NPU_CACHE_DIR selects the
+// directory ("off" disables it); the default is $XDG_CACHE_HOME/lfm3-npu or
+// ~/.cache/lfm3-npu. Entries are written to a temporary file and renamed, so
+// concurrent processes never see partial files.
+
+#define LFM3_NPU_CACHE_MAGIC "LFM3NPU1"
+
+static uint64_t lfm3_npu_fnv(uint64_t h, const void* data, size_t n) {
+  const unsigned char* p = (const unsigned char*)data;
+  for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+  return h;
+}
+
+static int lfm3_npu_mkdirs(char* path) {
+  for (char* p = path + 1; *p; ++p) {
+    if (*p != '/') continue;
+    *p = 0;
+    const int r = mkdir(path, 0755);
+    *p = '/';
+    if (r != 0 && errno != EEXIST) return 1;
+  }
+  return mkdir(path, 0755) != 0 && errno != EEXIST;
+}
+
+static void lfm3_npu_cache_open(lfm3_npu* npu, const char* device) {
+  npu->cache_dir[0] = 0;
+  const char* dir = getenv("LFM3_NPU_CACHE_DIR");
+  if (dir && strcmp(dir, "off") == 0) return;
+  char path[1024];
+  if (dir && *dir) {
+    snprintf(path, sizeof(path), "%s", dir);
+  } else if (getenv("XDG_CACHE_HOME") && *getenv("XDG_CACHE_HOME")) {
+    snprintf(path, sizeof(path), "%s/lfm3-npu", getenv("XDG_CACHE_HOME"));
+  } else if (getenv("HOME")) {
+    snprintf(path, sizeof(path), "%s/.cache/lfm3-npu", getenv("HOME"));
+  } else {
+    return;
+  }
+  // The library's own bytes identify the compiler build.
+  Dl_info info;
+  if (!dladdr((void*)&lfm3_npu_open, &info) || !info.dli_fname) return;
+  FILE* f = fopen(info.dli_fname, "rb");
+  if (!f) return;
+  uint64_t h = 14695981039346656037ull;
+  h = lfm3_npu_fnv(h, LFM3_NPU_CACHE_MAGIC, 8);
+  char chunk[1 << 16];
+  size_t n;
+  while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) h = lfm3_npu_fnv(h, chunk, n);
+  fclose(f);
+  h = lfm3_npu_fnv(h, device, strlen(device) + 1);
+  if (lfm3_npu_mkdirs(path)) return;
+  npu->build_hash = h;
+  snprintf(npu->cache_dir, sizeof(npu->cache_dir), "%s", path);
+}
+
+static void lfm3_npu_cache_path(const lfm3_npu* npu, uint64_t key, char* out, size_t size) {
+  snprintf(out, size, "%s/%016llx.bin", npu->cache_dir, (unsigned long long)key);
+}
+
+// Loads entry |key| into |kernel| (export name, workgroups, bytes). Returns
+// false on a miss or a malformed entry.
+static bool lfm3_npu_cache_load(lfm3_npu* npu, uint64_t key, lfm3_npu_kernel_t* kernel) {
+  if (!npu->cache_dir[0]) return false;
+  char path[1100];
+  lfm3_npu_cache_path(npu, key, path, sizeof(path));
+  FILE* f = fopen(path, "rb");
+  if (!f) return false;
+  char magic[8];
+  uint64_t stored_key = 0, length = 0;
+  uint32_t name_length = 0;
+  bool ok = fread(magic, 1, 8, f) == 8 && memcmp(magic, LFM3_NPU_CACHE_MAGIC, 8) == 0 &&
+            fread(&stored_key, 8, 1, f) == 1 && stored_key == key &&
+            fread(kernel->workgroup_count, 4, 3, f) == 3 && fread(&name_length, 4, 1, f) == 1 &&
+            name_length < sizeof(kernel->export_name) &&
+            fread(kernel->export_name, 1, name_length, f) == name_length &&
+            fread(&length, 8, 1, f) == 1 && length > 0 && length < (1ull << 32);
+  iree_byte_span_t span = iree_make_byte_span(NULL, 0);
+  if (ok) {
+    kernel->export_name[name_length] = 0;
+    ok = iree_status_is_ok(iree_allocator_malloc(npu->allocator, length, (void**)&span.data));
+    span.data_length = ok ? length : 0;
+  }
+  ok = ok && fread(span.data, 1, length, f) == length && fgetc(f) == EOF;
+  fclose(f);
+  if (ok) {
+    ok = iree_status_is_ok(
+        iree_byte_sequence_create_from_span_move(&span, npu->allocator, &kernel->contents));
+  }
+  if (!ok) iree_allocator_free(npu->allocator, span.data);
+  return ok;
+}
+
+typedef struct {
+  FILE* f;
+} lfm3_npu_cache_writer_t;
+
+static iree_status_t lfm3_npu_cache_write_segment(void* user_data, iree_const_byte_span_t segment) {
+  FILE* f = ((lfm3_npu_cache_writer_t*)user_data)->f;
+  return fwrite(segment.data, 1, segment.data_length, f) == segment.data_length
+             ? iree_ok_status()
+             : iree_make_status(IREE_STATUS_DATA_LOSS, "short write");
+}
+
+// Best effort: a failed store only costs the next process a compile.
+static void lfm3_npu_cache_store(lfm3_npu* npu, uint64_t key, const lfm3_npu_kernel_t* kernel,
+                                 const iree_byte_sequence_t* contents) {
+  if (!npu->cache_dir[0]) return;
+  char path[1100], temp[1200];
+  lfm3_npu_cache_path(npu, key, path, sizeof(path));
+  snprintf(temp, sizeof(temp), "%s.%d.tmp", path, (int)getpid());
+  FILE* f = fopen(temp, "wb");
+  if (!f) return;
+  const uint32_t name_length = (uint32_t)strlen(kernel->export_name);
+  const uint64_t length = iree_byte_sequence_length(contents);
+  lfm3_npu_cache_writer_t writer = {f};
+  const iree_byte_sequence_segment_callback_t callback = {lfm3_npu_cache_write_segment, &writer};
+  bool ok = fwrite(LFM3_NPU_CACHE_MAGIC, 1, 8, f) == 8 && fwrite(&key, 8, 1, f) == 1 &&
+            fwrite(kernel->workgroup_count, 4, 3, f) == 3 && fwrite(&name_length, 4, 1, f) == 1 &&
+            fwrite(kernel->export_name, 1, name_length, f) == name_length &&
+            fwrite(&length, 8, 1, f) == 1;
+  if (ok) {
+    iree_status_t status = iree_byte_sequence_enumerate(contents, callback);
+    ok = iree_status_is_ok(status);
+    iree_status_ignore(status);
+  }
+  ok = fclose(f) == 0 && ok;
+  if (!ok || rename(temp, path) != 0) unlink(temp);
+}
+
+static uint64_t lfm3_npu_cache_key(const lfm3_npu* npu, const char* source, size_t source_length,
+                                   const char* root) {
+  uint64_t h = lfm3_npu_fnv(npu->build_hash, &source_length, sizeof(source_length));
+  h = lfm3_npu_fnv(h, source, source_length);
+  return lfm3_npu_fnv(h, root, strlen(root) + 1);
+}
+
+// Prepares |kernel|'s executable bytes for dispatch.
+static iree_status_t lfm3_npu_prepare(lfm3_npu* npu, lfm3_npu_kernel_t* kernel,
+                                      const iree_byte_sequence_t* contents) {
+  const loom_device_artifact_t device_artifact = {
+      .executable_target = npu->executable_target,
+      .contents = contents,
+  };
+  IREE_RETURN_IF_ERROR(loom_run_hal_prepared_candidate_prepare(
+      &npu->runtime, &device_artifact, npu->allocator, &kernel->candidate));
+  return iree_hal_executable_lookup_function_by_name(
+      kernel->candidate.executable, iree_make_cstring_view(kernel->export_name), &kernel->function);
+}
+
 int lfm3_npu_compile(lfm3_npu* npu, const char* source, size_t source_length,
                      const char* source_name, const char* root,
                      int* out_kernel) {
@@ -260,6 +426,22 @@ int lfm3_npu_compile(lfm3_npu* npu, const char* source, size_t source_length,
   if (npu->kernel_count >= LFM3_NPU_MAX_KERNELS) {
     return lfm3_npu_fail(npu, iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
                                                "too many kernels"));
+  }
+  const uint64_t key = lfm3_npu_cache_key(npu, source, source_length, root);
+  {
+    lfm3_npu_kernel_t* cached = (lfm3_npu_kernel_t*)calloc(1, sizeof(*cached));
+    if (cached && lfm3_npu_cache_load(npu, key, cached)) {
+      iree_status_t status = lfm3_npu_prepare(npu, cached, cached->contents);
+      if (iree_status_is_ok(status)) {
+        npu->kernels[npu->kernel_count] = cached;
+        *out_kernel = npu->kernel_count++;
+        return 0;
+      }
+      // A stale or unloadable entry: compile afresh and overwrite it.
+      iree_status_ignore(status);
+      iree_byte_sequence_release(cached->contents);
+    }
+    free(cached);
   }
   const loomc_allocator_t loom_allocator =
       loomc_allocator_from_iree(npu->allocator);
@@ -359,16 +541,10 @@ int lfm3_npu_compile(lfm3_npu* npu, const char* source, size_t source_length,
                                     npu->allocator, kernel->workgroup_count);
   }
   if (iree_status_is_ok(status)) {
-    const loom_device_artifact_t device_artifact = {
-        .executable_target = npu->executable_target,
-        .contents = iree_byte_sequence_from_loomc(executable->contents),
-    };
-    status = loom_run_hal_prepared_candidate_prepare(
-        &npu->runtime, &device_artifact, npu->allocator, &kernel->candidate);
+    status = lfm3_npu_prepare(npu, kernel, iree_byte_sequence_from_loomc(executable->contents));
   }
   if (iree_status_is_ok(status)) {
-    status = iree_hal_executable_lookup_function_by_name(
-        kernel->candidate.executable, iree_make_cstring_view(kernel->export_name), &kernel->function);
+    lfm3_npu_cache_store(npu, key, kernel, iree_byte_sequence_from_loomc(executable->contents));
   }
   loomc_result_release(result);
   loomc_pass_program_release(pass_program);

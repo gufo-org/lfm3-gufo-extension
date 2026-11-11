@@ -28,5 +28,6 @@ libs=$(awk '/^build loom\/src\/loom\/tools\/loom-test\/loom-test:/{f=1;next} f&&
 objs=$(awk '/^build loom\/src\/loom\/tools\/loom-test\/loom-test:/{for(i=1;i<=NF;i++) if($i ~ /\.o$/ && $i !~ /loom-test\.c\.o$/) print $i; exit}' "$B/build.ninja")
 eval "$compiler $flags -O2 -fPIC -fvisibility=hidden -std=gnu11 -c '$HERE/lfm3_npu.c' -o '$OUT/lfm3_npu.o'"
 cd "$B"
-eval "${compiler/clang/clang++} -shared -fuse-ld=lld -pthread -o '$OUT/liblfm3_npu.so' '$OUT/lfm3_npu.o' $libs ${EXTRA_LDFLAGS:-} -ldl -lrt -lm"
+cxx="$(dirname "$compiler")/$(basename "$compiler" | sed 's/clang$/clang++/;s/gcc$/g++/;s/^cc$/c++/')"
+eval "$cxx -shared -fuse-ld=lld -pthread -o '$OUT/liblfm3_npu.so' '$OUT/lfm3_npu.o' $libs ${EXTRA_LDFLAGS:-} -ldl -lrt -lm"
 echo "$OUT/liblfm3_npu.so"
