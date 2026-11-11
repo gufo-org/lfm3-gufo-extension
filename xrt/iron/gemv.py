@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 @iron.jit
-def gemv(X: In, W: In, Y: Out, *, M: CompileTime[int], K: CompileTime[int], TM: CompileTime[int]):
+def gemv(X: In, W: In, Y: Out, *, M: CompileTime[int], K: CompileTime[int], TM: CompileTime[int], P: CompileTime[int] = 1):
     cores = COLS * ROWS
     assert M % (cores * TM) == 0
     steps = M // (cores * TM)
@@ -49,14 +49,15 @@ def gemv(X: In, W: In, Y: Out, *, M: CompileTime[int], K: CompileTime[int], TM: 
                                     names=[f"y{c}_{j}" for j in range(ROWS)], depths=[2] * ROWS))
 
     def body(x_in, w_in, y_out, k):
-        x = x_in.acquire(1)
-        for _ in range_(steps):
-            w = w_in.acquire(1)
-            y = y_out.acquire(1)
-            k(x, w, y)
-            w_in.release(1)
-            y_out.release(1)
-        x_in.release(1)
+        for _ in range_(P):
+            x = x_in.acquire(1)
+            for _ in range_(steps):
+                w = w_in.acquire(1)
+                y = y_out.acquire(1)
+                k(x, w, y)
+                w_in.release(1)
+                y_out.release(1)
+            x_in.release(1)
 
     workers = [Worker(body, [x_fifo.cons(), w_l2l1[c][j].cons(), y_l1l2[c][j].prod(), kernel],
                       tile=Tile(c, 2 + j))
@@ -64,21 +65,27 @@ def gemv(X: In, W: In, Y: Out, *, M: CompileTime[int], K: CompileTime[int], TM: 
     w_prods = [f.prod() for f in w_l3l2]
     y_conses = [f.cons() for f in y_l2l3]
     x_prod = x_fifo.prod()
-    w_ty = np.ndarray[(COLS * steps * ROWS * rec,), np.dtype[np.int8]]
-    yo_ty = np.ndarray[(COLS * steps * ROWS * TM,), np.dtype[np.float32]]
-    w_taps = TensorAccessPattern.full((COLS * steps * ROWS * rec,)).partition(COLS)
-    y_taps = TensorAccessPattern.full((COLS * steps * ROWS * TM,)).partition(COLS)
+    wsz, ysz = COLS * steps * ROWS * rec, COLS * steps * ROWS * TM
+    xs_ty = np.ndarray[(P * xrec,), np.dtype[np.int8]]
+    w_ty = np.ndarray[(P * wsz,), np.dtype[np.int8]]
+    yo_ty = np.ndarray[(P * ysz,), np.dtype[np.float32]]
+    x_taps = TensorAccessPattern.full((P * xrec,)).partition(P)
+    w_taps = TensorAccessPattern.full((P * wsz,)).partition(P * COLS)
+    y_taps = TensorAccessPattern.full((P * ysz,)).partition(P * COLS)
 
     def sequence(X, W, Y, xh, wh, yh):
-        tg = TaskGroup()
-        xh.fill(X, group=tg)
-        for c in range(COLS):
-            wh[c].fill(W, w_taps[c], group=tg)
-        for c in range(COLS):
-            yh[c].drain(Y, y_taps[c], wait=True, group=tg)
-        tg.finish()
+        # Phase p starts only after phase p - 1's outputs drained, as a
+        # decode layer's next projection would.
+        for p in range(P):
+            tg = TaskGroup()
+            xh.fill(X, x_taps[p], group=tg)
+            for c in range(COLS):
+                wh[c].fill(W, w_taps[p * COLS + c], group=tg)
+            for c in range(COLS):
+                yh[c].drain(Y, y_taps[p * COLS + c], wait=True, group=tg)
+            tg.finish()
 
-    rt = Runtime(sequence, [x_ty, w_ty, yo_ty, x_prod, w_prods, y_conses])
+    rt = Runtime(sequence, [xs_ty, w_ty, yo_ty, x_prod, w_prods, y_conses])
     return Program(from_name("npu2", n_cols=None), rt, workers=workers).resolve_program()
 
 
@@ -87,7 +94,8 @@ if __name__ == "__main__":
     p.add_argument("-M", type=int, default=8192)
     p.add_argument("-K", type=int, default=2048)
     p.add_argument("--tm", type=int, default=8)
+    p.add_argument("-P", type=int, default=1)
     p.add_argument("--xclbin-path", required=True)
     p.add_argument("--insts-path", required=True)
     a = p.parse_args()
-    gemv.specialize(M=a.M, K=a.K, TM=a.tm).compile(xclbin_path=a.xclbin_path, inst_path=a.insts_path)
+    gemv.specialize(M=a.M, K=a.K, TM=a.tm, P=a.P).compile(xclbin_path=a.xclbin_path, inst_path=a.insts_path)

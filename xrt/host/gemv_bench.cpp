@@ -17,7 +17,7 @@
 static std::uint16_t tobf(float f) { std::uint32_t b; std::memcpy(&b, &f, 4); return std::uint16_t((b + 0x7fff + ((b >> 16) & 1)) >> 16); }
 static float fbf(std::uint16_t h) { std::uint32_t b = std::uint32_t(h) << 16; float f; std::memcpy(&f, &b, 4); return f; }
 int main(int argc, char** argv) {
-  const int M = std::atoi(argv[3]), K = std::atoi(argv[4]), TM = argc > 5 ? std::atoi(argv[5]) : 8, iters = 50;
+  const int M = std::atoi(argv[3]), K = std::atoi(argv[4]), TM = argc > 5 ? std::atoi(argv[5]) : 8, P = argc > 6 ? std::atoi(argv[6]) : 1, iters = 50;
   const int COLS = 8, ROWS = 4, steps = M / (COLS * ROWS * TM), NB = K / 32;
   const std::size_t rec = std::size_t(TM) * K + std::size_t(TM) * NB * 2, xrec = K + NB * 2;
   std::vector<std::uint32_t> ins;
@@ -30,9 +30,9 @@ int main(int argc, char** argv) {
   xrt::hw_context ctx(dev, xb.get_uuid());
   xrt::kernel kern(ctx, kname);
   auto bo_i = xrt::bo(dev, ins.size() * 4, XCL_BO_FLAGS_CACHEABLE, kern.group_id(1));
-  auto bo_x = xrt::bo(dev, xrec, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
-  auto bo_w = xrt::bo(dev, rec * COLS * steps * ROWS, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(4));
-  auto bo_y = xrt::bo(dev, std::size_t(M) * 4, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(5));
+  auto bo_x = xrt::bo(dev, xrec * P, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
+  auto bo_w = xrt::bo(dev, rec * COLS * steps * ROWS * P, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(4));
+  auto bo_y = xrt::bo(dev, std::size_t(M) * 4 * P, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(5));
   std::memcpy(bo_i.map<void*>(), ins.data(), ins.size() * 4);
   std::mt19937 rng(3);
   std::uniform_int_distribution<int> q(-127, 127);
@@ -58,6 +58,10 @@ int main(int argc, char** argv) {
           for (int b = 0; b < NB; ++b) { auto h = tobf(ws[std::size_t(row0 + i) * NB + b]); std::memcpy(r + std::size_t(TM) * K + (std::size_t(i) * NB + b) * 2, &h, 2); }
         }
       }
+  for (int p = 1; p < P; ++p) {
+    std::memcpy(X + p * xrec, X, xrec);
+    std::memcpy(W + p * rec * COLS * steps * ROWS, W, rec * COLS * steps * ROWS);
+  }
   bo_i.sync(XCL_BO_SYNC_BO_TO_DEVICE); bo_x.sync(XCL_BO_SYNC_BO_TO_DEVICE); bo_w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   auto run = [&] { auto r = kern(3, bo_i, unsigned(ins.size()), bo_x, bo_w, bo_y); r.wait(); };
   run();
@@ -86,6 +90,6 @@ int main(int argc, char** argv) {
           const double got = Y[((std::size_t(c) * steps + t) * ROWS + j) * TM + i];
           maxrel = std::max(maxrel, std::fabs(got - ref) / (std::fabs(ref) + 1e-3));
         }
-  const double bytes = double(rec) * COLS * steps * ROWS;
-  std::printf("gemv %dx%d: sync %.1f us (%.1f GB/s), queued %.1f us (%.1f GB/s), max rel err %.2e\n", M, K, us, bytes / us / 1e3, qus, bytes / qus / 1e3, maxrel);
+  const double bytes = double(rec) * COLS * steps * ROWS * P;
+  std::printf("gemv %dx%d x%d phases: sync %.1f us (%.1f GB/s), queued %.1f us (%.1f GB/s), max rel err %.2e\n", M, K, P, us, bytes / us / 1e3, qus, bytes / qus / 1e3, maxrel);
 }

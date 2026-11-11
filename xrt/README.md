@@ -89,7 +89,20 @@ The results match a double-precision reference to within 1.1e-3 relative.
 51 GB/s is the NPU's DRAM ceiling. At that rate LFM3-1.7B's Q8 weights
 (about 1.83 GB per token) take about 36 ms, which is Halogen's 27.3 tok/s.
 
+`-P` chains dependent GEMVs in one XRT run. Each phase starts only after the
+previous phase's outputs drained to DDR, as a decode layer's next projection
+would. Each phase is a 2048 × 2048 GEMV:
+
+| Phases in one run | Time | Per phase | Pure streaming |
+| ---: | ---: | ---: | ---: |
+| 1 | 113 µs | 113 µs | 87 µs |
+| 24 | 2,229 µs | 92.9 µs | 87 µs |
+
+So a phase boundary (every core synchronized, plus a DDR round trip) costs
+about 6 µs. A whole decode token as about 100 dependent phases in one run
+would add about 0.6 ms to its 36 ms of weight streaming.
+
 ```sh
-python iron/gemv.py -M 8192 -K 2048 --xclbin-path gemv.xclbin --insts-path gemv.bin
-host/gemv_bench $PWD/gemv.xclbin $PWD/gemv.bin 8192 2048 8
+python iron/gemv.py -M 8192 -K 2048 [-P 24] --xclbin-path gemv.xclbin --insts-path gemv.bin
+host/gemv_bench $PWD/gemv.xclbin $PWD/gemv.bin 8192 2048 8 [24]
 ```
