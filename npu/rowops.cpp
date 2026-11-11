@@ -1,6 +1,9 @@
 #include "rowops.hpp"
 
 #include <cstdlib>
+#include <vector>
+#include <cctype>
+#include <algorithm>
 #include <set>
 #include <stdexcept>
 
@@ -254,6 +257,65 @@ namespace {
 std::string S(std::uint64_t v) { return std::to_string(v); }
 }  // namespace
 
+namespace {
+// Appends `suffix` to every SSA name in `text` except those in `keep` and the
+// buffer arguments %b<N>.
+std::string SuffixSsa(const std::string& text, const std::string& suffix, const std::vector<std::string>& keep) {
+  std::string out;
+  out.reserve(text.size() + text.size() / 8);
+  for (std::size_t p = 0; p < text.size();) {
+    if (text[p] == '%' && p + 1 < text.size() && (std::isalnum(static_cast<unsigned char>(text[p + 1])) || text[p + 1] == '_')) {
+      std::size_t q = p + 1;
+      while (q < text.size() && (std::isalnum(static_cast<unsigned char>(text[q])) || text[q] == '_')) ++q;
+      const std::string name = text.substr(p, q - p);
+      bool kept = name.size() > 2 && name[1] == 'b' &&
+                  std::all_of(name.begin() + 2, name.end(), [](char ch) { return std::isdigit(static_cast<unsigned char>(ch)) != 0; });
+      for (const auto& k : keep) kept |= name == k;
+      out += kept ? name : name + suffix;
+      p = q;
+    } else {
+      out += text[p++];
+    }
+  }
+  return out;
+}
+
+// Appends `suffix` to the SSA values `text` defines (names left of " = ")
+// and to their uses inside `text`.
+std::string SuffixDefs(const std::string& text, const std::string& suffix) {
+  std::vector<std::string> defs;
+  for (std::size_t line = 0; line < text.size();) {
+    const std::size_t end = std::min(text.find('\n', line), text.size());
+    const std::size_t eq = text.find(" = ", line);
+    if (eq != std::string::npos && eq < end)
+      for (std::size_t p = text.find('%', line); p != std::string::npos && p < eq; p = text.find('%', p + 1)) {
+        std::size_t q = p + 1;
+        while (q < text.size() && (std::isalnum(static_cast<unsigned char>(text[q])) || text[q] == '_')) ++q;
+        defs.push_back(text.substr(p, q - p));
+      }
+    line = end + 1;
+  }
+  std::string out;
+  for (std::size_t p = 0; p < text.size();) {
+    if (text[p] == '%') {
+      std::size_t q = p + 1;
+      while (q < text.size() && (std::isalnum(static_cast<unsigned char>(text[q])) || text[q] == '_')) ++q;
+      const std::string name = text.substr(p, q - p);
+      out += std::find(defs.begin(), defs.end(), name) != defs.end() ? name + suffix : name;
+      p = q;
+    } else {
+      out += text[p++];
+    }
+  }
+  return out;
+}
+
+std::string ReplaceAll(std::string s, const std::string& from, const std::string& to) {
+  for (std::size_t at = 0; (at = s.find(from, at)) != std::string::npos; at += to.size()) s.replace(at, from.size(), to);
+  return s;
+}
+}  // namespace
+
 std::string RowKernelProgram(const RowKernel& k) {
   using Layout = RowOperand::Layout;
   for (const auto* list : {&k.inputs, &k.outputs})
@@ -376,8 +438,10 @@ std::string RowKernelProgram(const RowKernel& k) {
     acquire += "      %" + tag + "_rd, %" + o.name + " = channel.acquire %" + tag + "_ch : channel<" + chan(o) + "> -> (read<" + chan(o) + ">, " + view(o) + ")\n";
     release += "      channel.release %" + tag + "_rd : read<" + chan(o) + ">\n";
   }
+  std::string out_decl;  // dual cores: output storage declared per half
   for (const auto& o : k.outputs) {
     const std::string tag = "out_" + o.name;
+    out_decl += consts(o, tag) + storage(o, tag);
     decl += consts(o, tag) + storage(o, tag);
     acquire += "      %" + tag + "_wr, %" + o.name + " = channel.reserve %" + tag + "_ch : channel<" + chan(o) + "> -> (write<" + chan(o) + ">, " + view(o) + ")\n";
     publish += "      channel.publish %" + tag + "_wr : write<" + chan(o) + ">\n";
@@ -429,6 +493,104 @@ std::string RowKernelProgram(const RowKernel& k) {
     return tile != "i" ? std::string("    channel.release %cnt_r : read<tile<16xi32>>\n")
                        : std::string("    channel.publish %cnt_w : write<tile<16xi32>>\n");
   };
+  const char* cores_env = std::getenv("GUFO_LFM3_NPU_ROW_CORES");
+  const bool dual = !(cores_env && std::string(cores_env) == "1");
+  if (dual) {
+    // Two halves per column: ingress [c,2] -> compute [c,3], ingress [c,5] ->
+    // compute [c,4]. Each compute core writes its own outputs (one DMA path
+    // per half and direction). Items alternate between the halves.
+    std::string in_decl;
+    for (const auto& o : k.inputs) in_decl += consts(o, "in_" + o.name) + storage(o, "in_" + o.name);
+    auto half = [&](std::uint32_t h) {
+      const std::string sfx = h ? "_h1" : "";
+      const std::string in_row = h ? "5" : "2", core_row = h ? "4" : "3";
+      std::string t = "  %memory = pipeline.memory<workgroup>[%column, " + core_row + "] : pool\n";
+      t += "  %pool_in = pipeline.memory<workgroup>[%column, " + in_row + "] : pool\n";
+      if (k.dynamic_rows)
+        for (auto [tile, pool] : std::vector<std::pair<std::string, std::string>>{{"i", "memory"}, {"c", "memory"}})
+          t += "  %cnt_" + tile + "_size = index.constant 64 : offset\n"
+               "  %cnt_" + tile + "_storage = buffer.alloca<workgroup> pool(%" + pool + ") align(64) %cnt_" + tile + "_size : buffer\n"
+               "  %cnt_" + tile + "_slots = buffer.view %cnt_" + tile + "_storage[%origin] : buffer -> view<1x16xi32>\n"
+               "  %cnt_" + tile + "_ch = channel.bind<fifo> %cnt_" + tile + "_slots, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>\n";
+      t += in_decl + out_decl;
+      // Items h*8 + column + 16 j.
+      std::string cnt_in, cnt_core;
+      std::string bound_h = "%my_items";
+      if (k.dynamic_rows) {
+        const std::string b = "%b" + S(k.bindings);
+        auto load = [&](const std::string& ch, const std::string& v) {
+          return "    %" + v + "_w, %" + v + " = channel.reserve %" + ch + " : channel<tile<16xi32>> -> (write<tile<16xi32>>, view<16xi32>)\n"
+                 "    %" + v + "_src = buffer.view " + b + "[%origin] : buffer -> view<16xi32>\n"
+                 "    %" + v + "_cp = kernel.async.copy %" + v + "_src to %" + v + " {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<16xi32> to view<16xi32> -> kernel.async.token\n"
+                 "    %" + v + "_g = kernel.async.group %" + v + "_cp : kernel.async.token -> kernel.async.group\n"
+                 "    kernel.async.wait %" + v + "_g {newer_groups = 0} : kernel.async.group\n";
+        };
+        const std::string calc =
+            "    %cnt_raw = view.load %cnt[%c0] : view<16xi32> -> i32\n"
+            "    %cnt_mask = scalar.constant 255 : i32\n"
+            "    %cnt_b = scalar.andi %cnt_raw, %cnt_mask : i32\n"
+            "    %first_i = index.cast %first : index to i32\n"
+            "    %fifteen_i = scalar.constant 15 : i32\n"
+            "    %four_i = scalar.constant 4 : i32\n"
+            "    %seg_i = scalar.constant " + S(k.segments) + " : i32\n"
+            "    %items_i = scalar.muli %cnt_b, %seg_i : i32\n"
+            "    %cr0 = scalar.addi %items_i, %fifteen_i : i32\n"
+            "    %cr1 = scalar.subi %cr0, %first_i : i32\n"
+            "    %cr2 = scalar.shrsi %cr1, %four_i : i32\n"
+            "    %zero_ci = scalar.constant 0 : i32\n"
+            "    %neg = scalar.cmpi slt, %cr2, %zero_ci : i32\n"
+            "    %cr3 = scf.select %neg, %zero_ci, %cr2 : i32\n"
+            "    %my_items_d = index.cast %cr3 : i32 to index\n";
+        cnt_in = load("cnt_c_ch", "cntc") + "    channel.publish %cntc_w : write<tile<16xi32>>\n" + load("cnt_i_ch", "cnt") + calc;
+        cnt_core = "    %cnt_r, %cnt = channel.acquire %cnt_c_ch : channel<tile<16xi32>> -> (read<tile<16xi32>>, view<16xi32>)\n" + calc;
+        bound_h = "%my_items_d";
+      }
+      const std::string head =
+          "    scf.for %local = [%c0 to " + bound_h + " step %c1] {\n"
+          "      %stride_items = index.mul %local, %c16 : index\n"
+          "      %item = index.add %stride_items, %first : index\n"
+          "      %row = index.div %item, %segments : index\n"
+          "      %piece = index.rem %item, %segments : index\n";
+      t += "  %half_off = index.constant " + S(h * 8) + " : index\n  %first = index.add %column, %half_off : index\n"
+           "  %rest = index.sub %items, %first : index\n  %rest15 = index.add %rest, %c15 : index\n"
+           "  %my_items = index.div %rest15, %c16 : index\n";
+      // Egress of item j - 1 follows ingress of item j; the last item drains
+      // after the loop.
+      auto at_item = [&](const std::string& idx) {
+        return "      %stride_items = index.mul " + idx + ", %c16 : index\n"
+               "      %item = index.add %stride_items, %first : index\n"
+               "      %row = index.div %item, %segments : index\n"
+               "      %piece = index.rem %item, %segments : index\n";
+      };
+      const std::string prev = at_item("%prev") + egress;
+      t += "  pipeline.strand workers([%column, " + in_row + "], [1, 1], [1, 1]) {\n" + cnt_in + head + ingress +
+           "      %has_prev = index.cmp ugt, %local, %c0 : index\n      scf.if %has_prev {\n"
+           "      %prev = index.sub %local, %c1 : index\n" + SuffixDefs(prev, "_e") + "      }\n    }\n"
+           "    %any = index.cmp ugt, " + bound_h + ", %c0 : index\n    scf.if %any {\n"
+           "      %prev_t = index.sub " + bound_h + ", %c1 : index\n" + SuffixDefs(ReplaceAll(prev, "%prev", "%prev_t"), "_t") + "    }\n" +
+           (k.dynamic_rows ? "    channel.publish %cnt_w : write<tile<16xi32>>\n" : "") + "  }\n";
+      t += "  pipeline.strand workers([%column, " + core_row + "], [1, 1], [1, 1]) {\n" + cnt_core + head + acquire + k.body +
+           publish + release + "    }\n" + (k.dynamic_rows ? "    channel.release %cnt_r : read<tile<16xi32>>\n" : "") + "  }\n";
+      return h ? SuffixSsa(t, sfx, {"%origin", "%c0", "%c1", "%c2", "%c4", "%c7", "%c8", "%c15", "%c16", "%segments", "%rows", "%column", "%items"}) : t;
+    };
+    std::string text = "aie2p.target<array> @npu\n";
+    text += kMathLibrary;
+    text += "\npipeline.def<kernel> @" + k.name + "_col(%column: index) run(" + args + ") {\n";
+    text += "  " + assume_out + " = buffer.assume.alignment " + assume_in + " {minimum_alignment = 64} : " + types + "\n";
+    text += "  %origin = index.constant 0 : offset\n  %c0 = index.constant 0 : index\n  %c1 = index.constant 1 : index\n  %c2 = index.constant 2 : index\n"
+            "  %c4 = index.constant 4 : index\n  %c7 = index.constant 7 : index\n  %c8 = index.constant 8 : index\n  %c15 = index.constant 15 : index\n"
+            "  %c16 = index.constant 16 : index\n"
+            "  %segments = index.constant " + S(k.segments) + " : index\n"
+            "  %rows = index.constant " + S(k.rows) + " : index\n"
+            "  %items = index.mul %rows, %segments : index\n";
+    text += half(0) + half(1) + "}\n";
+    text += "\npipeline.def<kernel> public retain target(@npu) @" + k.name + "() run(" + args + ") {\n";
+    for (std::uint32_t c = 0; c < 8; ++c) text += "  %k" + S(c) + " = index.constant " + S(c) + " : index\n";
+    for (std::uint32_t c = 0; c < 8; ++c)
+      text += "  pipeline.compose @" + k.name + "_col[%k" + S(c) + "](" + assume_in + ") : [index](" + types + ")\n";
+    text += "}\n";
+    return text;
+  }
   const std::string bound = k.dynamic_rows ? "%my_rows_d" : "%my_rows";
   // Work items (row, piece) spread over the columns, so a single row's
   // pieces still use the whole array.
