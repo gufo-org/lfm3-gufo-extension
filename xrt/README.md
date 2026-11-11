@@ -184,3 +184,21 @@ LFM3-1.7B, positions 0–7:
 | Top-1 agreement | 8 of 8 |
 | Full-vocabulary KL | 9e-3 to 2e-2 (6.7e-2 at position 0) |
 | Logit relative error | 6e-2 to 1e-1 |
+
+## Prefill
+
+Measured building blocks for prefill (one XRT run each, Strix Halo):
+
+| GEMM (M × K × N) | Kernel | Time | Throughput |
+| --- | --- | ---: | ---: |
+| 2048 × 2048 × 2048 | mlir-aie whole-array, int8 | 2.23 ms | 7.7 TOPS |
+| 1024 × 2048 × 15360 | mlir-aie whole-array, int8 | 11.2 ms | 5.8 TOPS |
+| 1024 × 2048 × 16384 | mlir-aie asymmetric tile buffering, bf16 × bfp16ebs8 | 2.90 ms | 23.7 TFLOPS |
+| 2048 × 2048 × 16384 | mlir-aie asymmetric tile buffering, bf16 × bfp16ebs8 | 5.72 ms | 24.0 TFLOPS |
+
+LFM3-1.7B's projections for a 1,024-token prompt are 3.54 TFLOP, about
+0.15 s at 24 TFLOPS. Halogen's 1k prefill is 0.273 s.
+
+Switching between two xclbins (hardware contexts) costs about 2.4 ms, so a
+prefill keeps every operation in one xclbin. The model switches contexts
+once between prefill and decode.
