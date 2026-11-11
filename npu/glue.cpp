@@ -136,29 +136,44 @@ RowKernel ReducePartialKernel(std::uint32_t m, std::uint32_t rows) {
   return k;
 }
 
-RowKernel SwiGluPackKernel(std::uint32_t I, std::uint32_t rows) {
+RowKernel SwiGluPackKernel(std::uint32_t I, std::uint32_t rows, bool partial) {
   RowKernel k;
-  k.name = "swiglu_i" + S(I) + "_r" + S(rows);
+  k.name = "swiglu_i" + S(I) + (partial ? "p" : "") + "_r" + S(rows);
   k.rows = rows;
-  const std::uint32_t piece = 512;
+  // K-split gate/up projections leave eight partial sums per element.
+  const std::uint32_t piece = partial ? 256 : 512;
   if (I % piece) throw std::invalid_argument("SwiGLU width must be a multiple of 512");
   k.segments = I / piece;
   k.bindings = 2;
-  k.inputs.push_back({"g", 0, 0, 0, piece, false, Layout::kBlocked, 2 * I / 8});
-  k.inputs.push_back({"u", 0, 0, std::uint64_t(I / 8) * 64, piece, false, Layout::kBlocked, 2 * I / 8});
+  const auto layout = partial ? Layout::kPartial : Layout::kBlocked;
+  k.inputs.push_back({"g", 0, 0, 0, piece, false, layout, 2 * I / 8});
+  k.inputs.push_back({"u", 0, 0, std::uint64_t(I / 8) * 64, piece, false, layout, 2 * I / 8});
   k.outputs.push_back({"xb", 1, 0, 0, piece, true, Layout::kBlocked, I / 8});
-  k.body = Fill(R"(      %n = index.constant @P : index
-      scf.for %i = [%c0 to %n step %c16] {
-        %gv = vector.load %g[%i] : view<@Pxf32> -> vector<16xf32>
+  const std::string load = partial ? R"(        %gv = scf.for %c = [%c0 to %c8p step %c1](%a = %zp : vector<16xf32>) -> (vector<16xf32>) {
+          %v = vector.load %g[%c, %i] : view<8x@Pxf32> -> vector<16xf32>
+          %s = vector.addf %a, %v : vector<16xf32>
+          scf.yield %s : vector<16xf32>
+        }
+        %uv = scf.for %c = [%c0 to %c8p step %c1](%a = %zp : vector<16xf32>) -> (vector<16xf32>) {
+          %v = vector.load %u[%c, %i] : view<8x@Pxf32> -> vector<16xf32>
+          %s = vector.addf %a, %v : vector<16xf32>
+          scf.yield %s : vector<16xf32>
+        }
+)"
+                                   : R"(        %gv = vector.load %g[%i] : view<@Pxf32> -> vector<16xf32>
         %uv = vector.load %u[%i] : view<@Pxf32> -> vector<16xf32>
-        %sg = func.call @sigmoid(%gv) : (vector<16xf32>) -> (vector<16xf32>)
+)";
+  k.body = Fill(std::string(partial ? "      %zp = vector.splatf 0.0 : vector<16xf32>\n      %c8p = index.constant 8 : index\n" : "") +
+                    R"(      %n = index.constant @P : index
+      scf.for %i = [%c0 to %n step %c16] {
+@LOAD        %sg = func.call @sigmoid(%gv) : (vector<16xf32>) -> (vector<16xf32>)
         %silu = func.call @fmul2(%gv, %sg) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         %o = func.call @fmul2(%silu, %uv) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         %ob = vector.fptrunc %o : vector<16xf32> to vector<16xbf16>
         vector.store %ob, %xb[%i] : vector<16xbf16>, view<@Pxbf16>
       }
 )",
-                {{"@P", S(piece)}});
+                {{"@LOAD", load}, {"@P", S(piece)}});
   return k;
 }
 

@@ -111,7 +111,9 @@ struct Backbone::Impl {
   std::vector<Layer> layers;
   Dense::Matrix head;
 
-  Dense::Matrix Make(std::span<const Tensor* const> tensors) { return dense->Upload(tensors); }
+  Dense::Matrix Make(std::span<const Tensor* const> tensors, bool k_split = false) {
+    return dense->Upload(tensors, k_split);
+  }
   void Run(const Dense::Matrix& p, std::span<const float> x, std::uint32_t n, std::span<float> y) {
     dense->Run(p, x, n, y);
   }
@@ -145,7 +147,9 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       }
       const Tensor* gateup[] = {&l.gate, &l.up};
       const Tensor* down[] = {&l.down};
-      p.gateup = m.Make(gateup);
+      // K split: prompt passes then stream the weights once for every block
+      // held at once (SwiGLU sums the eight partials); decode costs the same.
+      p.gateup = m.Make(gateup, true);
       p.down = m.Make(down);
     }
     const Tensor* head[] = {&w.output};
@@ -198,7 +202,7 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       d->x = npu.Alloc(R * H * 4), d->x2 = npu.Alloc(R * H * 4), d->o = npu.Alloc(R * H * 4), d->z = npu.Alloc(R * H * 4);
       d->xb2048 = npu.Alloc(B * H * 8 * 2 + pad);
       d->xb_ffn = npu.Alloc(B * c.intermediate * 8 * 2 + pad);
-      d->y_proj = npu.Alloc(B * 2 * c.intermediate * 8 * 4 + pad * 4);
+      d->y_proj = npu.Alloc(B * 2 * c.intermediate * 8 * 4 * 8 + pad * 4);  // eight partials
       d->y_out = npu.Alloc(B * H * 8 * 4 + pad * 4);
       d->y_down = npu.Alloc(B * 8 * H * 8 * 4 + pad * 4 * 8);
       d->y_head = npu.Alloc(std::uint64_t(m.head.shape.m) * 64 * 4);
@@ -658,7 +662,7 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
       }
       timed("proj gateup", [&] { dense->Enqueue(p.gateup, d.xb2048, d.y_proj, blocks); });
       {
-        const int k = row_kernel(SwiGluPackKernel(I, R8));
+        const int k = row_kernel(SwiGluPackKernel(I, R8, p.gateup.shape.split == Split::kColumns));
         const int b[] = {d.y_proj, d.xb_ffn, d.count};
         timed("swiglu", [&] { npu.Enqueue(k, b); });
       }

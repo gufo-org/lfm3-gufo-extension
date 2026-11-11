@@ -34,7 +34,10 @@ struct Dense::Impl {
   int Kernel(ProjectionShape s) {
     const auto key = std::make_tuple(s.k, s.m, s.blocks, int(s.split));
     if (auto it = kernels.find(key); it != kernels.end()) return it->second;
-    const int id = npu.Compile(ProjectionProgram(s), "projection.loom", ProjectionRoot(s));
+    // K split over several blocks: each weight record serves the blocks held at once.
+    const bool multi = s.split == Split::kColumns && s.blocks > 1 && KSplitBlocksPerPass(s) > 1;
+    const int id = multi ? npu.Compile(ProjectionKMultiProgram(s), "projection.loom", ProjectionRoot(s) + "_kmulti")
+                         : npu.Compile(ProjectionProgram(s), "projection.loom", ProjectionRoot(s));
     kernels.emplace(key, id);
     return id;
   }
@@ -57,11 +60,16 @@ Dense& Dense::Shared() {
   return *instance;
 }
 
-Dense::Matrix Dense::Upload(std::uint32_t rows, std::uint32_t cols, const RowFn& row) {
+Dense::Matrix Dense::Upload(std::uint32_t rows, std::uint32_t cols, const RowFn& row, bool k_split) {
   Matrix w;
   w.k = cols;
   w.m = rows;
   w.shape = PlanProjection(cols, rows, 1);
+  if (k_split && w.shape.split == Split::kRows) {
+    w.shape.split = Split::kColumns;
+    w.shape.k = (cols + 511) / 512 * 512;
+    w.shape.m = (rows + 7) / 8 * 8;
+  }
   const auto split = w.shape.split == Split::kRows ? ::lfm3::npu::Split::kRows
                                                    : ::lfm3::npu::Split::kColumns;
   const std::uint32_t kp = w.shape.k;
@@ -77,7 +85,7 @@ Dense::Matrix Dense::Upload(std::uint32_t rows, std::uint32_t cols, const RowFn&
   return w;
 }
 
-Dense::Matrix Dense::Upload(std::span<const Tensor* const> tensors) {
+Dense::Matrix Dense::Upload(std::span<const Tensor* const> tensors, bool k_split) {
   std::uint32_t rows = 0;
   for (const auto* t : tensors) {
     if (t->cols != tensors[0]->cols) throw std::invalid_argument("NPU matrix with mixed columns");
@@ -88,7 +96,7 @@ Dense::Matrix Dense::Upload(std::span<const Tensor* const> tensors) {
       if (r < t->rows) return DecodeRow(*t, r, out);
       r -= t->rows;
     }
-  });
+  }, k_split);
 }
 
 void Dense::Run(const Matrix& w, std::span<const float> x, std::uint32_t rows, std::span<float> y) {

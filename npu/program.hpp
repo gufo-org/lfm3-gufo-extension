@@ -30,6 +30,10 @@ ProjectionShape PlanProjection(std::uint32_t k, std::uint32_t m, std::uint32_t b
 // Public kernel name and its Loom module.
 std::string ProjectionRoot(const ProjectionShape& shape);
 std::string ProjectionProgram(const ProjectionShape& shape);
+// K-split shapes over several blocks: each weight record is applied to
+// KSplitBlocksPerPass blocks held at once. Root is ProjectionRoot + "_kmulti".
+std::uint32_t KSplitBlocksPerPass(const ProjectionShape& shape);
+std::string ProjectionKMultiProgram(const ProjectionShape& shape);
 
 constexpr std::uint32_t kColumns = 8;
 

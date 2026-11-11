@@ -22,7 +22,7 @@ RowKernel NormPackKernel(std::uint32_t hidden, std::uint32_t rows, Residual resi
 // Sum of a K-split output's eight parts: Yp (groups = m / 8) -> rows.
 RowKernel ReducePartialKernel(std::uint32_t m, std::uint32_t rows);
 // SwiGLU of a fused gate/up Yb (2 I) into the blocked BF16 input (I).
-RowKernel SwiGluPackKernel(std::uint32_t intermediate, std::uint32_t rows);
+RowKernel SwiGluPackKernel(std::uint32_t intermediate, std::uint32_t rows, bool partial = false);
 // Gated short convolution step for `rows` rows in order: proj Yb (3 H),
 // history pool [slot][width - 1][H] (tap-major), weights [width][H],
 // meta (slot at element 16 r), out blocked BF16 (H).

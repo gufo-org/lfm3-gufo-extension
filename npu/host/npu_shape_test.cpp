@@ -3,6 +3,7 @@
 // Usage: npu_shape_test [k m blocks ...]
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 
 #include "../program.hpp"
@@ -26,11 +27,18 @@ int main(int argc, char** argv) {
   }
   int failures = 0;
   for (const auto& c : cases) {
-    const auto shape = g::PlanProjection(c.k, c.m, c.blocks);
+    auto shape = g::PlanProjection(c.k, c.m, c.blocks);
+    if (std::getenv("FORCEK") && shape.split == g::Split::kRows) {  // K split at any K (multiple of 512)
+      shape.split = g::Split::kColumns;
+      shape.k = (c.k + 511) / 512 * 512;
+      shape.m = (c.m + 7) / 8 * 8;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     int kernel;
     try {
-      kernel = npu.Compile(g::ProjectionProgram(shape), "projection.loom", g::ProjectionRoot(shape));
+      const bool kmulti = std::getenv("KMULTI") && c.blocks > 1 && shape.split == g::Split::kColumns;
+      kernel = kmulti ? npu.Compile(g::ProjectionKMultiProgram(shape), "projection.loom", g::ProjectionRoot(shape) + "_kmulti")
+                      : npu.Compile(g::ProjectionProgram(shape), "projection.loom", g::ProjectionRoot(shape));
     } catch (const std::exception& e) {
       std::printf("%s: %s\n", g::ProjectionRoot(shape).c_str(), e.what());
       ++failures;

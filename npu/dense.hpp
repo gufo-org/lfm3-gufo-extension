@@ -31,9 +31,10 @@ class Dense {
   // The process-wide engine; throws when the NPU or liblfm3_npu.so is missing.
   static Dense& Shared();
   // Encodes rows x cols weights given row by row (cols floats each).
-  Matrix Upload(std::uint32_t rows, std::uint32_t cols, const RowFn& row);
+  // `k_split` forces the K split (eight partial sums) at any K.
+  Matrix Upload(std::uint32_t rows, std::uint32_t cols, const RowFn& row, bool k_split = false);
   // Stacks tensors' rows (same column count) into one matrix.
-  Matrix Upload(std::span<const Tensor* const> tensors);
+  Matrix Upload(std::span<const Tensor* const> tensors, bool k_split = false);
   // y[r][m] = W x[r] for `rows` rows of x (k floats each); y is rows x m.
   void Run(const Matrix& w, std::span<const float> x, std::uint32_t rows, std::span<float> y);
 
