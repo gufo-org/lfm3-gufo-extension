@@ -28,13 +28,13 @@ using Layout = RowOperand::Layout;
 std::string Scale(const std::string& view, const std::string& tag) {
   return Fill(R"(      %sq_@T = scf.for %i_@T = [%c0 to %n step %c16](%acc_@T = %zero : vector<16xf32>) -> (vector<16xf32>) {
         %v_@T = vector.load %@V[%i_@T] : view<@Nxf32> -> vector<16xf32>
-        %p_@T = func.call @fmul(%v_@T, %v_@T) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+        %p_@T = func.call @fmul2(%v_@T, %v_@T) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         %s_@T = vector.addf %acc_@T, %p_@T : vector<16xf32>
         scf.yield %s_@T : vector<16xf32>
       }
       %t_@T = vector.reduce<addf> %sq_@T, %fzero : vector<16xf32>, f32
       %tv_@T = vector.splat %t_@T : vector<16xf32>
-      %mean_@T = func.call @fmul(%tv_@T, %inv_n) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+      %mean_@T = func.call @fmul2(%tv_@T, %inv_n) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
       %me_@T = vector.addf %mean_@T, %eps : vector<16xf32>
       %scale_@T = func.call @rsqrt(%me_@T) : (vector<16xf32>) -> (vector<16xf32>)
 )",
@@ -77,8 +77,8 @@ RowKernel NormPackKernel(std::uint32_t H, std::uint32_t rows, Residual residual,
         %xv = vector.load %x[%i] : view<@Nxf32> -> vector<16xf32>
         %yv = vector.load %y[%i] : view<@Nxf32> -> vector<16xf32>
         %wv = vector.load %w[%i] : view<@WFxf32> -> vector<16xf32>
-        %ys = func.call @fmul(%yv, %scale_post) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-        %yw = func.call @fmul(%ys, %wv) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+        %ys = func.call @fmul2(%yv, %scale_post) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+        %yw = func.call @fmul2(%ys, %wv) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         %s = vector.addf %xv, %yw : vector<16xf32>
         vector.store %s, %@RES[%i] : vector<16xf32>, view<@Nxf32>
       }
@@ -99,8 +99,8 @@ RowKernel NormPackKernel(std::uint32_t H, std::uint32_t rows, Residual residual,
         %v = vector.load %@SRC[%i] : view<@Nxf32> -> vector<16xf32>
         %wi = index.add %i, %wn_off : index
         %g = vector.load %w[%wi] : view<@WFxf32> -> vector<16xf32>
-        %t = func.call @fmul(%v, %scale_norm) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
-        %u = func.call @fmul(%t, %g) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+        %t = func.call @fmul2(%v, %scale_norm) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
+        %u = func.call @fmul2(%t, %g) : (vector<16xf32>, vector<16xf32>) -> (vector<16xf32>)
         %h = vector.fptrunc %u : vector<16xf32> to vector<16xbf16>
         vector.store %h, %xb[%i] : vector<16xbf16>, view<@Nxbf16>
 @Z      }

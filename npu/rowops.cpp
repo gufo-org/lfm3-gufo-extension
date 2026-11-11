@@ -8,21 +8,27 @@ namespace gufo::models::lfm3::npu {
 const char* const kMathLibrary = R"LOOM(
 // a * b per lane to about F32 precision: each operand splits into three
 // BF16 parts; the six leading cross products accumulate, smallest first.
+// High BF16 part of x by truncation (the upper 16 bits, so no rounding
+// work) and the exact F32 remainder x - hi. AIE2P's F32 -> BF16 fptrunc
+// costs several instructions per vector; masking and a lane deinterleave
+// do not.
+func.def @split(%x: vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>) {
+  %xi = vector.bitcast %x : vector<16xf32> to vector<16xi32>
+  %mask = vector.splati -65536 : vector<16xi32>
+  %hi_i = vector.andi %xi, %mask : vector<16xi32>
+  %hi_f = vector.bitcast %hi_i : vector<16xi32> to vector<16xf32>
+  %rest = vector.subf %x, %hi_f : vector<16xf32>
+  %pairs = vector.bitcast %x : vector<16xf32> to vector<32xbf16>
+  %lo_h, %hi_h = vector.deinterleave<0> %pairs : vector<32xbf16> -> vector<16xbf16>, vector<16xbf16>
+  func.return %hi_h, %rest : vector<16xbf16>, vector<16xf32>
+}
 func.def @fmul(%a: vector<16xf32>, %b: vector<16xf32>) -> (vector<16xf32>) {
-  %a1 = vector.fptrunc %a : vector<16xf32> to vector<16xbf16>
-  %a1f = vector.extf %a1 : vector<16xbf16> to vector<16xf32>
-  %ar = vector.subf %a, %a1f : vector<16xf32>
-  %a2 = vector.fptrunc %ar : vector<16xf32> to vector<16xbf16>
-  %a2f = vector.extf %a2 : vector<16xbf16> to vector<16xf32>
-  %ar2 = vector.subf %ar, %a2f : vector<16xf32>
-  %a3 = vector.fptrunc %ar2 : vector<16xf32> to vector<16xbf16>
-  %b1 = vector.fptrunc %b : vector<16xf32> to vector<16xbf16>
-  %b1f = vector.extf %b1 : vector<16xbf16> to vector<16xf32>
-  %br = vector.subf %b, %b1f : vector<16xf32>
-  %b2 = vector.fptrunc %br : vector<16xf32> to vector<16xbf16>
-  %b2f = vector.extf %b2 : vector<16xbf16> to vector<16xf32>
-  %br2 = vector.subf %br, %b2f : vector<16xf32>
-  %b3 = vector.fptrunc %br2 : vector<16xf32> to vector<16xbf16>
+  %a1, %ar = func.call @split(%a) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
+  %a2, %ar2 = func.call @split(%ar) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
+  %a3, %ar3 = func.call @split(%ar2) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
+  %b1, %br = func.call @split(%b) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
+  %b2, %br2 = func.call @split(%br) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
+  %b3, %br3 = func.call @split(%br2) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
   %zero = vector.splatf 0.0 : vector<16xf32>
   %l0 = vector.interleave<0> %a1, %a2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
   %r0 = vector.interleave<0> %b3, %b2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
@@ -39,14 +45,10 @@ func.def @fmul(%a: vector<16xf32>, %b: vector<16xf32>) -> (vector<16xf32>) {
 // a * b to about 16 significant bits: two BF16 parts each, three cross
 // products (for values stored as F16/BF16 next).
 func.def @fmul2(%a: vector<16xf32>, %b: vector<16xf32>) -> (vector<16xf32>) {
-  %a1 = vector.fptrunc %a : vector<16xf32> to vector<16xbf16>
-  %a1f = vector.extf %a1 : vector<16xbf16> to vector<16xf32>
-  %ar = vector.subf %a, %a1f : vector<16xf32>
-  %a2 = vector.fptrunc %ar : vector<16xf32> to vector<16xbf16>
-  %b1 = vector.fptrunc %b : vector<16xf32> to vector<16xbf16>
-  %b1f = vector.extf %b1 : vector<16xbf16> to vector<16xf32>
-  %br = vector.subf %b, %b1f : vector<16xf32>
-  %b2 = vector.fptrunc %br : vector<16xf32> to vector<16xbf16>
+  %a1, %ar = func.call @split(%a) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
+  %a2, %ar2 = func.call @split(%ar) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
+  %b1, %br = func.call @split(%b) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
+  %b2, %br2 = func.call @split(%br) : (vector<16xf32>) -> (vector<16xbf16>, vector<16xf32>)
   %zero = vector.splatf 0.0 : vector<16xf32>
   %l0 = vector.interleave<0> %a1, %a2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
   %r0 = vector.interleave<0> %b2, %b1 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
