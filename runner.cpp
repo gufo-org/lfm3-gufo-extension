@@ -131,14 +131,17 @@ public:
                              .incremental_prefill = true,
                              .final_token_advance_required = true,
                              .incremental_text_is_exact = true,
-                             .prefix_reuse = true,
-                             .partial_prefill_retention = true},
+                             // The XRT engine keeps its rows private: no
+                             // cache captures or restores.
+                             .prefix_reuse = !model_->OnXrt(),
+                             .partial_prefill_retention = !model_->OnXrt()},
             .sampling_defaults = SamplingDefaults(),
             // Each prefill pass is the engine's 512-row workspace, the
             // host's decode-active budget. A pass that short gets one layer
             // group from the host, so passes run unsplit beside decoders.
             .scheduling = TextSchedulingProfile{
-                .pass_tokens = Session::kPrefillChunk,
+                // The XRT engine prefills up to 4096 rows per call.
+                .pass_tokens = model_->OnXrt() ? 4096 : Session::kPrefillChunk,
                 .max_layer_groups = 1,
                 .max_yield_decode_width = Session::kMaxBatch}};
   }
@@ -250,7 +253,7 @@ public:
     if (offset != s.session->Position() || offset >= prompt.size())
       throw std::logic_error("LFM3 prefill frontier mismatch");
     auto count = std::min<std::size_t>(
-        {Session::kPrefillChunk, max_input_tokens, prompt.size() - offset});
+        {model_->OnXrt() ? std::size_t(4096) : Session::kPrefillChunk, max_input_tokens, prompt.size() - offset});
     if (!count)
       throw std::invalid_argument("LFM3 prefill budget must be positive");
     std::string error;

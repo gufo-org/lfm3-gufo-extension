@@ -66,6 +66,7 @@ gufo_extension_target(
   SOURCES
     engine.cpp
     upload.cpp
+    xrt/engine.cpp
   LINK_LIBRARIES
     gufo_lfm3_npu
     gufo_lfm3

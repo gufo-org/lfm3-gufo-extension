@@ -31,6 +31,10 @@ public:
   // NPU sessions keep their state in host memory: DeviceHidden and
   // ContinuationData return host pointers and DeviceStream is null.
   bool OnNpu() const;
+  // The whole model runs on the XDNA NPU through XRT when
+  // GUFO_LFM3_DEVICE=xrt at load (xrt/engine.hpp): sessions take tokens,
+  // keep no continuation rows and support no snapshots or embeddings.
+  bool OnXrt() const;
 
 private:
   Model();
@@ -130,6 +134,8 @@ private:
   std::unique_ptr<Impl> impl_;
   struct Npu;
   std::unique_ptr<Npu> npu_;
+  struct Xrt;
+  std::unique_ptr<Xrt> xrt_;
   ContinuationHooks* hooks_{};
   Session(std::shared_ptr<Model> model, std::uint32_t context);
   friend class Model;
