@@ -519,3 +519,25 @@ against the pair route, HRX about 2x. Ruled out within it:
 Open: the two-matrix access pattern under HRX's dispatch. The reproducer is
 small enough to report upstream; a dispatch-order or MALL-allocation
 difference is the next suspect.
+
+## November 11 pass: the LFM3 family on the NPU
+
+`GUFO_LFM3_DEVICE=npu` (with `LFM3_NPU_LIBRARY` pointing at
+`liblfm3_npu.so`, built by [`npu/host/build.sh`](../npu/host/build.sh)) runs
+the backbone and towers through Loom programs on the XDNA NPU. Projections use
+block-floating `bfp16ebs8` weights encoded at load; kernels are generated per
+shape at run time ([`npu/program.cpp`](../npu/program.cpp)). Normalization,
+convolutions, rotary embedding, attention, sampling, mel and inverse STFT
+still run on the host in FP32.
+
+| Model | Path | Check |
+| --- | --- | --- |
+| LFM3-1.7B | text serve, batch, snapshots, component cache | KL 0.0015 against the FP32 reference, identical top-5; coherent chat, 12.1 tok/s decode |
+| LFM3-VL-2B | vision tower + backbone | same answer as the GPU on a test image |
+| LFM3-Audio-2B | ASR encoder | same transcript as the GPU |
+| LFM3-Audio-2B | depth decoder, codec (TTS) | NPU speech transcribed correctly on the GPU; 4 s of audio in 7.9 s |
+| d1-Omni-2B | decision API | not yet: `ForwardDecision` returns an error on the NPU |
+
+Open: d1 decision attention masks; moving attention, norms and convolutions
+onto the NPU; asynchronous dispatch (about 150 µs per synchronous dispatch);
+speed of TTS and prefill.
