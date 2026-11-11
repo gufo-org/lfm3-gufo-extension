@@ -1,0 +1,94 @@
+"""Phase plan of the prefill xclbin, shared by the design (model.py) and the host.
+
+Buffers (bf16 elements unless noted):
+  a: token records, M x REC: [xn | x | o | pad]
+  b: GEMM weights, bfp16ebs8 blocks (9 bytes per 8 values), in phase order
+  c: scratch: SwiGLU output, per-conv-layer [bx | C] rows (6 state rows first),
+     conv output rows, and A blocks (128 x 512) of small per-phase constants
+
+Every phase is a dict with "kind" in gemm, norm, conv. GEMM phases carry an A
+source and a C destination:
+  A ("rec",)                 xn of the records
+  A ("half", off, stride)    columns 0..63 of every 128 of a scratch matrix
+  A ("plain", off, stride)   a scratch matrix
+  C ("o",)                   the records' o slot
+  C ("plain", off, stride)   a scratch matrix
+  C ("halves", off, stride)  columns 64..127 of every 128, two blocks per tile
+"""
+
+H, I, REC = 2048, 7680, 8192
+M_TILE, N_TILE, K_TILE, MTK = 128, 128, 64, 512
+CONV_ROW, Y_ROW = 4096, 2560
+STATE = 6
+ABLOCK = M_TILE * MTK
+
+
+class Plan:
+    def __init__(self, kinds, M=1024):
+        self.M, self.kinds = M, list(kinds)
+        self.c_off = 0
+        self.b_off = 0
+        self.sw = self._c(M * 15360)
+        self.ys = self._c(M * Y_ROW + 4096)
+        self.cs = {}
+        self.ablocks = []          # (c offset, what) for the host to fill
+        self.phases = [self._norm(("embed",))]
+        for l, kind in enumerate(self.kinds):
+            assert kind == "conv", kind
+            cs = self.cs[l] = self._c((STATE + M) * CONV_ROW + 512)
+            rows = cs + STATE * CONV_ROW
+            self.phases += [
+                self._gemm(H, 4096, "bx", ("rec",), ("plain", rows, CONV_ROW), (l, "conv_bx")),
+                self._gemm(H, H, "plain", ("rec",), ("halves", rows, CONV_ROW), (l, "conv_c")),
+                dict(kind="conv", cs=cs, ys=self.ys, taps=[self._ablock((l, "taps", q)) for q in range(4)]),
+                self._gemm(H, H, "plain", ("plain", self.ys, Y_ROW), ("o",), (l, "conv_out")),
+                self._norm((l, "post")),
+                self._gemm(H, 2 * I, "swiglu", ("rec",), ("plain", self.sw, 2 * I), (l, "gate_up")),
+                self._gemm(I, H, "plain", ("half", self.sw, 2 * I), ("o",), (l, "down")),
+                self._norm((l, "ffn_post")),
+            ]
+        self.b_size = self.b_off
+        self.c_size = self.c_off
+
+    def codes(self):
+        """One code per phase for the core interpreter (see prefill_next)."""
+        out = []
+        for ph in self.phases:
+            if ph["kind"] == "gemm":
+                tiles = (self.M // M_TILE) * (ph["N"] // N_TILE) // 32
+                mode = {"plain": 0, "swiglu": 1, "bx": 2}[ph["mode"]]
+                out.append(0 | mode << 2 | tiles << 4 | (ph["K"] // K_TILE) << 11)
+            else:
+                out.append({"norm": 1, "conv": 2}[ph["kind"]])
+        return out
+
+    def _c(self, n):
+        at = self.c_off
+        self.c_off += (n + 63) // 64 * 64
+        return at
+
+    def _ablock(self, what):
+        at = self._c(ABLOCK)
+        self.ablocks.append((at, what))
+        return at
+
+    def _norm(self, what):
+        return dict(kind="norm", w=self._ablock(what))
+
+    def _gemm(self, K, N, mode, a, c, what):
+        at = self.b_off
+        self.b_off += K * N // 8
+        return dict(kind="gemm", K=K, N=N, mode=mode, a=a, c=c, b=at, what=what)
+
+
+def ablock_put(vec):
+    """A 128 x 512 A block whose first L1 objects hold vec linearly, 2048 values each
+    (object i: rows 32 i .. 32 i + 31 of columns 0..63, blocked [m/r][k/s][r][s])."""
+    import numpy as np
+    vec = np.asarray(vec, np.uint16).reshape(-1)
+    assert vec.size <= 4 * 2048
+    z = np.zeros((M_TILE, MTK), np.uint16)
+    p = np.arange(vec.size)
+    obj, q = p // 2048, p % 2048
+    z[obj * 32 + (q // 512) * 8 + (q // 8) % 8, ((q // 64) % 8) * 8 + q % 8] = vec
+    return z.reshape(-1)

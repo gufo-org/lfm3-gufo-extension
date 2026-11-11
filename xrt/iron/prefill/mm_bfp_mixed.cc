@@ -222,9 +222,14 @@ inline void Store16(bfloat16 *d, int cb, aie::vector<bfloat16, 16> v) {
 
 extern "C" {
 
-// wp: post-norm weight (2048, one A object); row: [x | o]; slot 0..15; part q = 0..3.
+// Row slot within the current C object: rows of a phase come in multiples of 16.
+int row_slot;
+
+// wp: post-norm weight (2048, one A object); row: [x | o]; part q = 0..3.
 void prefill_norm_row(const bfloat16 *__restrict wp, const bfloat16 *__restrict row, bfloat16 *__restrict tile,
-                      int32_t slot, int32_t part) {
+                      int32_t part) {
+  const int slot = row_slot;
+  row_slot = (slot + 1) & 15;
 #ifdef NORM_STUB
   return;
 #endif
@@ -261,6 +266,101 @@ void prefill_norm_row(const bfloat16 *__restrict wp, const bfloat16 *__restrict 
       Store16(d, c >> 3, r.to_vector<bfloat16>());
     }
   }
+}
+
+// In place on a C tile whose columns 0..63 are the conv B gate and 64..127
+// the conv input of the same 64 channels: writes B * x into columns 0..63.
+void prefill_bx(bfloat16 *__restrict c) {
+  for (int bi = 0; bi < 16; ++bi)
+    for (int bj = 0; bj < 8; ++bj)
+      for (int e = 0; e < 64; e += 16) {
+        bfloat16 *g = c + (bi * 16 + bj) * 64 + e;
+        const aie::vector<bfloat16, 16> u = aie::load_v<16>(c + (bi * 16 + bj + 8) * 64 + e);
+        aie::store_v(g, aie::mul(aie::load_v<16>(g), u).to_vector<bfloat16>());
+      }
+}
+
+}  // extern "C"
+
+// ---- Prefill short convolution phase. The scratch row of token t is
+// [bx_j 64 | C_j 64] for the 32 channel blocks j; core q owns blocks
+// 8q..8q+7 (512 channels). Its 7 x 512 taps (tap k of channel e at k * 512 + e)
+// and a ring of the last 6 bx rows live in the half of its C tile that the
+// drain discards: within each 8x8 block, elements 32..63. The other half
+// holds y = conv(bx) * C for 16 tokens: token s, channel e at linear
+// s * 1024 + e of the tile.
+
+namespace {
+inline bfloat16 *Spare(bfloat16 *tile, int u) { return tile + ((u >> 5) << 6) + 32 + (u & 31); }
+constexpr int kHist = 7 * 512;
+int conv_ring;
+}  // namespace
+
+extern "C" {
+
+// Copies taps [which * 2048, which * 2048 + 2048) (only 1536 for which = 1)
+// from an A object into the tile and restarts the history ring.
+void prefill_conv_taps(const bfloat16 *__restrict a, bfloat16 *__restrict tile, int32_t which) {
+  conv_ring = 0;
+  const int n = which ? 1536 : 2048;
+  for (int i = 0; i < n; i += 16) aie::store_v(Spare(tile, which * 2048 + i), aie::load_v<16>(a + i));
+}
+
+// One token row for core part q. With out = 0 it only enters the history.
+void prefill_conv_row(const bfloat16 *__restrict row, bfloat16 *__restrict tile, int32_t part, int32_t out) {
+  const int ring = conv_ring;
+  const int slot = row_slot;
+  if (out) row_slot = (slot + 1) & 15;
+  for (int jb = 0; jb < 8; ++jb) {
+    const bfloat16 *bx = row + (part * 8 + jb) * 128;
+    for (int e = 0; e < 64; e += 16) {
+      const int ch = jb * 64 + e;
+      const aie::vector<bfloat16, 16> cur = aie::load_v<16>(bx + e);
+      if (out) {
+        aie::accum<accfloat, 16> acc = aie::mul(aie::load_v<16>(Spare(tile, 6 * 512 + ch)), cur);
+        for (int k = 0; k < 6; ++k) {
+          int h = ring + k;
+          if (h >= 6) h -= 6;
+          acc = aie::mac(acc, aie::load_v<16>(Spare(tile, k * 512 + ch)), aie::load_v<16>(Spare(tile, kHist + h * 512 + ch)));
+        }
+        const aie::vector<bfloat16, 16> y = aie::mul(acc.to_vector<bfloat16>(), aie::load_v<16>(bx + 64 + e)).to_vector<bfloat16>();
+        // linear slot * 1024 + ch: tile row slot * 8 + (ch >> 7), column ch & 127
+        bfloat16 *d = tile + slot * 1024 + (((ch & 127) >> 3) << 6) + ((ch >> 7) << 3);
+        aie::store_v(d, y.extract<8>(0));
+        aie::store_v(d + 64, y.extract<8>(1));
+      }
+      aie::store_v(Spare(tile, kHist + ring * 512 + ch), cur);
+    }
+  }
+  conv_ring = ring == 5 ? 0 : ring + 1;
+}
+
+// ---- Phase interpreter. PREFILL_PLAN lists one code per phase:
+// kind | mode << 2 | tiles << 4 | ksteps << 11 (kind 0 GEMM, 1 norm, 2 conv;
+// mode 0 plain, 1 SwiGLU, 2 bx).
+#ifndef PREFILL_PLAN
+#define PREFILL_PLAN 0
+#endif
+namespace {
+const int32_t kPlan[] = {PREFILL_PLAN};
+int phase_at, epilogue_mode;
+}  // namespace
+
+// cnt: [GEMM tiles, k steps, norm, conv]
+void prefill_next(int32_t *__restrict cnt) {
+  const int32_t code = kPlan[phase_at];
+  phase_at = phase_at + 1 == int(sizeof(kPlan) / sizeof(kPlan[0])) ? 0 : phase_at + 1;  // the core reruns per dispatch
+  const int kind = code & 3;
+  epilogue_mode = (code >> 2) & 3;
+  cnt[0] = kind == 0 ? (code >> 4) & 127 : 0;
+  cnt[1] = code >> 11;
+  cnt[2] = kind == 1;
+  cnt[3] = kind == 2;
+}
+
+void prefill_epilogue(bfloat16 *__restrict c) {
+  if (epilogue_mode == 1) prefill_swiglu(c);
+  else if (epilogue_mode == 2) prefill_bx(c);
 }
 
 }  // extern "C"
