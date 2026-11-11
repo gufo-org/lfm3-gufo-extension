@@ -84,6 +84,9 @@ std::string ResidentFfnProgram(std::uint32_t H, std::uint32_t I, float eps, cons
   // Batching: eight gate/up records per weight slot and eight output tiles
   // per output record (consecutive groups are contiguous in both).
   constexpr std::uint32_t kBatch = 8;
+  // Down records per weight DMA (two consecutive groups share a slot when
+  // they fit): larger transfers stream closer to the DRAM ceiling.
+  const std::uint32_t dpair = 2 * d_tiles * 72 <= std::max(kBatch * gu_tiles * 72, d_tiles * 72) && (H / 8 / C) % 2 == 0 ? 2 : 1;
   const std::uint32_t slot = std::max(kBatch * gu_rec, d_rec);
   const std::uint32_t sw_groups = I / 8 / C, sw_piece = 30, sw_n = sw_piece * 8, sw_pn = 8 * sw_n;
   const std::uint32_t red_piece = 32, red_n = red_piece * 8;
@@ -328,9 +331,9 @@ std::string ResidentFfnProgram(std::uint32_t H, std::uint32_t I, float eps, cons
 @DMA        channel.publish %ww : write<tile<@RECN>>
       }
 )",
-              {{"@C", cs}, {"@ND", S(d_groups)}, {"@RD", S(d_rec)}, {"@FD", S(std::uint64_t(c) * d_groups)}, {"@RECN", rec_n},
-               {"@DRN", S(d_rec) + "xi8"},
-               {"@DMA", Fill(Dma("wd", "src", "view<" + S(d_rec) + "xi8>", "wsub", "view<" + S(d_rec) + "xi8>", true), {{"\n      ", "\n        "}, {"      %wd_c", "        %wd_c"}})}});
+              {{"@C", cs}, {"@ND", S(d_groups / dpair)}, {"@RD", S(std::uint64_t(dpair) * d_rec)}, {"@FD", S(std::uint64_t(c) * d_groups / dpair)}, {"@RECN", rec_n},
+               {"@DRN", S(dpair * d_rec) + "xi8"},
+               {"@DMA", Fill(Dma("wd", "src", "view<" + S(dpair * d_rec) + "xi8>", "wsub", "view<" + S(dpair * d_rec) + "xi8>", true), {{"\n      ", "\n        "}, {"      %wd_c", "        %wd_c"}})}});
     Wi += "  }\n";
     // ---------------- Storer (c, 4).
     std::string St = "  pipeline.strand workers([" + cs + ", 4], [1, 1], [1, 1]) {\n";
@@ -533,22 +536,33 @@ std::string ResidentFfnProgram(std::uint32_t H, std::uint32_t I, float eps, cons
       %c64t4 = index.constant 64 : index
       scf.for %g = [%c0 to %nd step %c1] {
         %yw, %yv = channel.reserve %yr@C : @YC -> (write<@YCT>, @YT)
-        scf.for %k = [%c0 to %kb4 step %c1] {
+        %kbp = index.constant @KBP : index
+        scf.for %kp = [%c0 to %kbp step %c1] {
           %wrr, %wv = channel.acquire %wr@C : channel<tile<@RECN>> -> (read<tile<@RECN>>, view<@RECN>)
-          %wd = view.subview %wv[0] : view<@RECN> -> view<@DRN>
-          %z = vector.splatf 0.0 : vector<64xf32>
-          %init = vector.fragment<init> %z shape [%c8, %c8] : vector<64xf32>
-          %acc = func.call @dot_d(%w4xv, %wd, %c0, %init) : (@DXT, view<@DRN>, index, vector<64xf32>) -> (vector<64xf32>)
-          channel.release %wrr : read<tile<@RECN>>
-          %yo = index.mul %k, %c64t4 : index
-          %ys = view.subview %yv[%yo] : @YT -> view<64xf32>
-          %yt = view.bitcast %ys : view<64xf32> -> view<8x8xf32>
-          vector.fragment.store<result> %acc, %yt[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>
+#PAIR#          channel.release %wrr : read<tile<@RECN>>
         }
         channel.publish %yw : write<@YCT>
       }
 )",
-              {{"@C", cs}, {"@ND", S(d_groups / kBatch)}, {"@KB", S(kBatch)}, {"@RECN", rec_n}, {"@DRN", S(d_rec) + "xi8"},
+              {{"#PAIR#", [&] {
+                  std::string t;
+                  for (std::uint32_t j = 0; j < dpair; ++j)
+                    t += Fill(R"(          %wd@J = view.subview %wv[@OFF] : view<@RECN> -> view<@DRN>
+          %z@J = vector.splatf 0.0 : vector<64xf32>
+          %init@J = vector.fragment<init> %z@J shape [%c8, %c8] : vector<64xf32>
+          %acc@J = func.call @dot_d(%w4xv, %wd@J, %c0, %init@J) : (@DXT, view<@DRN>, index, vector<64xf32>) -> (vector<64xf32>)
+          %kk@J0 = index.mul %kp, %dp2 : index
+          %kj@J = index.constant @J : index
+          %k@J = index.add %kk@J0, %kj@J : index
+          %yo@J = index.mul %k@J, %c64t4 : index
+          %ys@J = view.subview %yv[%yo@J] : @YT -> view<64xf32>
+          %yt@J = view.bitcast %ys@J : view<64xf32> -> view<8x8xf32>
+          vector.fragment.store<result> %acc@J, %yt@J[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>
+)", {{"@J", S(j)}, {"@OFF", S(std::uint64_t(j) * d_rec)}});
+                  return "          %dp2 = index.constant " + S(dpair) + " : index\n" + t;
+                }()},
+               {"@KBP", S(kBatch / dpair)},
+               {"@C", cs}, {"@ND", S(d_groups / kBatch)}, {"@KB", S(kBatch)}, {"@RECN", rec_n}, {"@DRN", S(d_rec) + "xi8"},
                {"@DXT", dx_t}, {"@YCT", "tile<" + S(kBatch * 64) + "xf32>"}, {"@YC", "channel<tile<" + S(kBatch * 64) + "xf32>>"},
                {"@YT", "view<" + S(kBatch * 64) + "xf32>"}}) +
          rel("w4x", inc) + flush("4") + "@@S5@@" + barrier("4");
