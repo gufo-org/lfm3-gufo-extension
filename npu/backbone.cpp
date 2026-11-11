@@ -77,7 +77,7 @@ struct Device {
   bool resident{};
   int w_first{-1}, cos_g{-1}, sin_g{-1}, cos_s{-1}, sin_s{-1};
   // Activations for up to kMaxRows rows.
-  int x{-1}, x2{-1}, o{-1}, z{-1}, xb2048{-1}, xb_ffn{-1}, y_proj{-1}, y_out{-1}, y_down{-1}, y_head{-1},
+  int x{-1}, x2{-1}, o{-1}, z{-1}, xb2048{-1}, xb_ffn{-1}, y_proj{-1}, y_out{-1}, y_down{-1}, y_head{-1}, y_rows{-1},
       q{-1}, gates{-1}, meta_g{-1}, meta_s{-1}, groups{-1}, xb_head{-1}, count{-1};
   std::map<std::string, int> kernels;
 
@@ -213,6 +213,7 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       d->y_out = npu.Alloc(B * H * 8 * 4 + pad * 4);
       d->y_down = npu.Alloc(B * 8 * H * 8 * 4 + pad * 4 * 8);
       d->y_head = npu.Alloc(std::uint64_t(m.head.shape.m) * 64 * 4);
+      d->y_rows = npu.Alloc(std::uint64_t(m.head.shape.m) * 8 * 4);
       d->xb_head = npu.Alloc(std::uint64_t(H) * 8 * 2);
       d->q = npu.Alloc(R * c.heads * D * 4), d->gates = npu.Alloc(R * 16 * 4);
       d->count = npu.Alloc(64);
@@ -725,7 +726,6 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
       if (chunk[r].logits) wanted.push_back(r);
     if (!wanted.empty() && !logits.empty()) {
       const std::uint32_t mp = head.shape.m, V = c.vocab;
-      std::vector<float> block(std::size_t(mp) * 64);
       std::vector<std::uint16_t> xb(std::size_t(H) * 8);
       for (std::size_t w0 = 0; w0 < wanted.size(); w0 += 8) {
         const std::size_t n = std::min<std::size_t>(8, wanted.size() - w0);
@@ -733,14 +733,17 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
         for (std::size_t i = 0; i < n; ++i)
           std::copy_n(z.begin() + std::size_t(wanted[w0 + i]) * H, H, rows8.begin() + i * H);
         ::lfm3::npu::PackActivations(rows8, std::uint32_t(n), H, xb);
-        npu.Write(d.xb_head, 0, xb.data(), xb.size() * 2);
+        timed("head pack", [&] { npu.Write(d.xb_head, 0, xb.data(), xb.size() * 2); });
         timed("head", [&] { dense->Enqueue(head, d.xb_head, d.y_head, 1); });
-        npu.Read(d.y_head, 0, block.data(), block.size() * 4);
-        for (std::size_t i = 0; i < n; ++i) {
-          float* out = logits.data() + logit_row * V;
-          for (std::uint32_t v = 0; v < V; ++v) out[v] = block[(std::size_t(v / 8) * 8 + i) * 8 + v % 8];
-          ++logit_row;
-        }
+        // Host reads of device memory are slow (about 250 MB/s), so the
+        // wanted rows leave the blocked layout on the NPU first.
+        timed("head read", [&] {
+          const int k = d.Row(UnblockKernel(mp, 8));
+          const int b[] = {d.y_head, d.y_rows};
+          npu.Enqueue(k, b);
+          for (std::size_t i = 0; i < n; ++i, ++logit_row)
+            npu.Read(d.y_rows, i * std::size_t(mp) * 4, logits.data() + logit_row * V, std::size_t(V) * 4);
+        });
       }
     }
   }

@@ -636,10 +636,20 @@ static iree_status_t lfm3_npu_drain(lfm3_npu* npu) {
 
 int lfm3_npu_finish(lfm3_npu* npu) { return lfm3_npu_fail(npu, lfm3_npu_drain(npu)); }
 
+// Device buffers are host memory on XDNA: map them directly when the pool's
+// memory type allows it, else stage through a transfer (one queued copy and
+// semaphore per call, about 250 MB/s for a 2 MiB read).
+static bool lfm3_npu_mappable(iree_hal_buffer_t* buffer) {
+  return iree_all_bits_set(iree_hal_buffer_memory_type(buffer), IREE_HAL_MEMORY_TYPE_HOST_VISIBLE) &&
+         iree_all_bits_set(iree_hal_buffer_allowed_usage(buffer), IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED);
+}
+
 int lfm3_npu_write(lfm3_npu* npu, int id, uint64_t offset, const void* data,
                    uint64_t bytes) {
   if (lfm3_npu_finish(npu)) return 1;
   if (id < 0 || id >= npu->buffer_count || !npu->buffers[id]) return 1;
+  if (lfm3_npu_mappable(npu->buffers[id]) && !getenv("LFM3_NPU_STAGED_IO"))
+    return lfm3_npu_fail(npu, iree_hal_buffer_map_write(npu->buffers[id], offset, data, bytes));
   iree_hal_buffer_t* staging = NULL;
   iree_status_t status = lfm3_npu_staging(npu, bytes, &staging);
   if (iree_status_is_ok(status)) {
@@ -656,6 +666,8 @@ int lfm3_npu_read(lfm3_npu* npu, int id, uint64_t offset, void* data,
                   uint64_t bytes) {
   if (lfm3_npu_finish(npu)) return 1;
   if (id < 0 || id >= npu->buffer_count || !npu->buffers[id]) return 1;
+  if (lfm3_npu_mappable(npu->buffers[id]) && !getenv("LFM3_NPU_STAGED_IO"))
+    return lfm3_npu_fail(npu, iree_hal_buffer_map_read(npu->buffers[id], offset, data, bytes));
   iree_hal_buffer_t* staging = NULL;
   iree_status_t status = lfm3_npu_staging(npu, bytes, &staging);
   if (iree_status_is_ok(status)) {

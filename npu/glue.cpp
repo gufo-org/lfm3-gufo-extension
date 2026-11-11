@@ -112,6 +112,25 @@ RowKernel NormPackKernel(std::uint32_t H, std::uint32_t rows, Residual residual,
   return k;
 }
 
+RowKernel UnblockKernel(std::uint32_t m, std::uint32_t rows) {
+  RowKernel k;
+  k.name = "unblock_m" + S(m) + "_r" + S(rows);
+  k.rows = rows;
+  const std::uint32_t piece = 512;
+  k.segments = m / piece;
+  k.bindings = 2;
+  k.inputs.push_back({"y", 0, 0, 0, piece, false, Layout::kBlocked, m / 8});
+  k.outputs.push_back({"o", 1, m, 0, piece});
+  k.body = Fill(R"(      %n = index.constant @P : index
+      scf.for %i = [%c0 to %n step %c16] {
+        %v = vector.load %y[%i] : view<@Pxf32> -> vector<16xf32>
+        vector.store %v, %o[%i] : vector<16xf32>, view<@Pxf32>
+      }
+)",
+                {{"@P", S(piece)}});
+  return k;
+}
+
 RowKernel ReducePartialKernel(std::uint32_t m, std::uint32_t rows) {
   RowKernel k;
   k.name = "reduce_m" + S(m) + "_r" + S(rows);
