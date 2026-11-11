@@ -59,7 +59,10 @@ struct Device {
   std::uint32_t context{}, cap_global{}, cap_sliding{}, table_rows{};
   int next_slot{};
   // Per-layer device buffers.
-  std::vector<int> w_op, w_ffn, conv_w, qn, kn, hist, kpool, vpool;
+  std::vector<int> w_op, w_ffn, conv_w, qn, qn_mma, kn, hist, kpool, vpool;
+  // Matrix-unit attention (AttendMmaProgram) with its pre-scaled Q norms;
+  // GUFO_LFM3_NPU_ATTN=scalar keeps the scalar kernel.
+  bool mma{};
   int w_first{-1}, cos_g{-1}, sin_g{-1}, cos_s{-1}, sin_s{-1};
   // Activations for up to kMaxRows rows.
   int x{-1}, x2{-1}, o{-1}, z{-1}, xb2048{-1}, xb_ffn{-1}, y_proj{-1}, y_out{-1}, y_down{-1}, y_head{-1},
@@ -146,7 +149,7 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
       d->npu = &m.dense->runtime();
       const std::uint32_t H = c.hidden, L = c.conv_width, D = c.head_dim;
       const std::size_t n = c.layers.size();
-      d->w_op.assign(n, -1), d->w_ffn.assign(n, -1), d->conv_w.assign(n, -1), d->qn.assign(n, -1),
+      d->w_op.assign(n, -1), d->w_ffn.assign(n, -1), d->conv_w.assign(n, -1), d->qn.assign(n, -1), d->qn_mma.assign(n, -1),
           d->kn.assign(n, -1), d->hist.assign(n, -1), d->kpool.assign(n, -1), d->vpool.assign(n, -1);
       auto pair = [&](const Tensor& a, const Tensor& b) {
         std::vector<float> v(2 * H);
@@ -154,6 +157,11 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
         std::copy_n(Floats(b), H, v.begin() + H);
         return d->Upload(v);
       };
+      {
+        const char* attn = std::getenv("GUFO_LFM3_NPU_ATTN");
+        d->mma = !(attn && std::string_view(attn) == "scalar") && c.heads % 8 == 0 && c.heads / 8 == 2 &&
+                 D % 8 == 0 && D <= 128;
+      }
       d->w_first = d->Upload(std::vector<float>(Floats(w.layers[0].norm), Floats(w.layers[0].norm) + H));
       for (std::size_t i = 0; i < n; ++i) {
         const auto& l = w.layers[i];
@@ -167,7 +175,12 @@ std::unique_ptr<Backbone> Backbone::Load(const Weights& w, std::string* error) {
             for (std::uint32_t tp = 0; tp < L; ++tp) tw[tp * H + ch] = Floats(l.conv)[ch * L + tp];
           d->conv_w[i] = d->Upload(tw);
         } else {
-          d->qn[i] = d->Upload(std::vector<float>(Floats(l.q_norm), Floats(l.q_norm) + D));
+          std::vector<float> qn(Floats(l.q_norm), Floats(l.q_norm) + D);
+          d->qn[i] = d->Upload(qn);
+          // The matrix-unit kernel expects Q times log2(e) / sqrt(D); the norm
+          // weight scales Q linearly through the rotary embedding.
+          for (auto& v : qn) v *= float(MmaQueryScale(D));
+          d->qn_mma[i] = d->Upload(qn);
           d->kn[i] = d->Upload(std::vector<float>(Floats(l.k_norm), Floats(l.k_norm) + D));
         }
       }
@@ -559,6 +572,11 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
     // Kernels that spread rows over the eight columns run at least eight
     // rows (a column without rows would leave the array context).
     const std::uint32_t R8 = std::max<std::uint32_t>(R, 8);
+    // Matrix-unit attention packs four rows per block when the pass holds one
+    // session's rows in position order (prefill), else one row per block.
+    std::uint32_t rpb = R > 1 ? 4 : 1;
+    for (std::uint32_t r = 1; r < R && rpb > 1; ++r)
+      if (chunk[r].state != chunk[0].state || chunk[r].position != chunk[r - 1].position + 1) rpb = 1;
     const auto key = [&](const std::string& n) { return n + "_r" + std::to_string(R); };
     // Row kernels compile once for kMaxRows and read the count at run time.
     auto row_kernel = [&](RowKernel k) {
@@ -598,10 +616,11 @@ void Backbone::Impl::ForwardDevice(std::span<const float> inputs, std::span<cons
         s8.rows = R8;
         const std::string pk = "prep" + tag + "_r" + std::to_string(R8);
         const int prep = d.Kernel(pk, [&] { return QkPrepProgram(s8, pk); }, "@" + pk);
-        const std::string ak = "attend" + tag + "_dyn";
-        const int attend = d.Kernel(ak, [&] { return AttendProgram(s, ak); }, "@" + ak);
+        const bool mma = d.mma && !s.groups && s.heads % s.kv_heads == 0;
+        const std::string ak = "attend" + tag + (mma ? "_mma" + std::to_string(rpb) : "") + "_dyn";
+        const int attend = d.Kernel(ak, [&] { return mma ? AttendMmaProgram(s, ak, rpb) : AttendProgram(s, ak); }, "@" + ak);
         const int meta = swa ? d.meta_s : d.meta_g;
-        const int b1[] = {d.y_proj, d.qn[il], d.kn[il], swa ? d.cos_s : d.cos_g, swa ? d.sin_s : d.sin_g, meta, d.q, d.gates, d.kpool[il], d.vpool[il]};
+        const int b1[] = {d.y_proj, mma ? d.qn_mma[il] : d.qn[il], d.kn[il], swa ? d.cos_s : d.cos_g, swa ? d.sin_s : d.sin_g, meta, d.q, d.gates, d.kpool[il], d.vpool[il]};
         timed("qk prep", [&] { npu.Enqueue(prep, b1); });
         const int b2[] = {d.q, d.gates, d.kpool[il], d.vpool[il], meta, d.groups, d.xb2048, d.count};
         timed("attend", [&] { npu.Enqueue(attend, b2); });
