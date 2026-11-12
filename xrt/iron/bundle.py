@@ -3,7 +3,7 @@ lfm3_token.py's xclbin, the prefill weights and scratch for prefill/model.py's
 xclbin, and the offsets the library needs to hand a prefill over to decode.
 
 Usage: bundle.py <gguf> <out dir> <decode xclbin> <dispatch.so> <prefill xclbin> <insts head rows 0> <insts head rows 512>
-                 [--small <M=512 xclbin> <its insts>] [--prefill-only]
+                 [--small <M=512 xclbin> <its insts>] [--prefill-only | --decode-only]
 (the prefill instruction streams come from model.py ... 1024 0 and ... 1024 512; both run on one xclbin)
 """
 import json
@@ -49,11 +49,12 @@ def main():
     import host as PH  # prefill host (imports pyxrt lazily only in Runner)
     md = PH.Model(gguf)
     plan = P.Plan(P.lfm3_kinds(), head_row0=0)
-    E, Cs = PH.pack(plan, md)
-    E.tofile(out / "prefill_weights.bin")
-    Cs.tofile(out / "prefill_scratch.bin")
-    del E, Cs
-    md.drop()
+    if "--decode-only" not in sys.argv:
+        E, Cs = PH.pack(plan, md)
+        E.tofile(out / "prefill_weights.bin")
+        Cs.tofile(out / "prefill_scratch.bin")
+        del E, Cs
+        md.drop()
 
     import token_host as TH
     if not prefill_only:
@@ -64,7 +65,7 @@ def main():
     else:
         lay = L.Layout(ctx)
 
-    small = sys.argv.index("--small") if "--small" in sys.argv else None
+    small = sys.argv.index("--small") if "--small" in sys.argv and "--decode-only" not in sys.argv else None
     if small:
         sp = P.Plan(P.lfm3_kinds(), M=512, head_row0=0)
         _, Cs512 = PH.pack_scratch(sp, md)
