@@ -26,6 +26,14 @@ ATTN_LAYERS = [l for l in range(LAYERS) if l >= 2 and l % 2 == 0]
 SWA_LAYERS = {4, 8, 12, 16, 20}
 WINDOW = 256
 VOCAB, HEAD_ROWS = 128000, 512
+NARROW_VOCAB = 131072  # the LM head of a narrow plan: whole groups of 4 tiles per column
+
+
+def narrow_tiles(N):
+    """Tiles per column and K step of a narrow GEMM (rows < 512): the largest T <= 4
+    dividing the column's tiles; core rows >= T idle."""
+    per_col = N // N_TILE // 8
+    return next(t for t in (4, 3, 2, 1) if per_col % t == 0)
 
 
 def lfm3_kinds(n=LAYERS):
@@ -70,7 +78,15 @@ class Plan:
                 dict(kind="conv", cs=cs, ys=self.ys, taps=[self._ablock((l, "taps", q)) for q in range(4)]),
                 self._gemm(H, H, "plain", ("plain", self.ys, Y_ROW), ("o",), (l, "conv_out")),
             ] + self._ffn(l)
-        if head_row0 is not None:
+        self.junk = self._c(3 * M_TILE * N_TILE)  # idle core rows of narrow GEMMs drain here
+        if head_row0 is not None and M < HEAD_ROWS:
+            # narrow plan: the head over all M rows
+            self.head_rows, self.head_n, self.head_row0 = M, NARROW_VOCAB, 0
+            self.logits = self._c(M * NARROW_VOCAB)
+            self.phases.append(self._gemm(H, NARROW_VOCAB, "plain", ("rec", 0), ("plain", self.logits, NARROW_VOCAB), ("head",),
+                                          rows=M))
+        elif head_row0 is not None:
+            self.head_rows, self.head_n = HEAD_ROWS, VOCAB
             # LM head over the 512 rows that hold the last token: output_norm is folded into
             # the weights, logits land as bf16 [512][VOCAB]. The core program does not depend
             # on head_row0, so its variants share one xclbin.
@@ -94,10 +110,14 @@ class Plan:
         out = []
         for ph in self.phases:
             if ph["kind"] == "gemm":
-                tiles = (ph["rows"] // M_TILE) * (ph["N"] // N_TILE) // 32
+                if ph["rows"] < HEAD_ROWS:  # narrow: groups of T tiles per column
+                    t_ = narrow_tiles(ph["N"])
+                    tiles = ph["N"] // N_TILE // 8 // t_
+                else:
+                    t_, tiles = 0, (ph["rows"] // M_TILE) * (ph["N"] // N_TILE) // 32
                 assert tiles < 128
                 mode = {"plain": 0, "swiglu": 1, "bx": 2}[ph["mode"]]
-                out.append(0 | mode << 3 | tiles << 5 | (ph["K"] // K_TILE) << 12)
+                out.append(0 | mode << 3 | tiles << 5 | (ph["K"] // K_TILE) << 12 | t_ << 20)
             else:
                 out.append({"norm": 1, "conv": 2, "qkr": 3, "attn": 4}[ph["kind"]] | ph.get("mode", 0) << 3)
         return out

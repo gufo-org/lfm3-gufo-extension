@@ -28,14 +28,15 @@ def write_flat(meta, path):
     lines += [f"d.{k} {d[k]}" for k in ("s_bytes", "w_bytes", "logits", "emb", "emb_row", "state_col")]
     lines += [f"d.kv {' '.join(map(str, d['kv']))}", f"d.state {' '.join(map(str, d['state']))}",
               f"d.attn_layers {' '.join(map(str, d['attn_layers']))}", f"d.conv_layers {' '.join(map(str, d['conv_layers']))}"]
-    lines += [f"p.{k} {p[k]}" for k in ("M", "rec", "c_size", "conv_row", "state_rows", "piece", "logits", "head_rows")]
+    lines += [f"p.{k} {p[k]}" for k in ("M", "rec", "c_size", "conv_row", "state_rows", "piece", "logits", "head_rows", "head_n")]
     lines += [f"p.cs {' '.join(str(p['cs'][str(l)]) for l in d['conv_layers'])}",
               f"p.pieces {' '.join(str(p['pieces'][str(l)]) for l in d['attn_layers'])}"]
-    if "prefill512" in meta:
-        q = meta["prefill512"]
-        lines += [f"q.{k} {q[k]}" for k in ("M", "c_size", "logits")]
-        lines += [f"q.cs {' '.join(str(q['cs'][str(l)]) for l in d['conv_layers'])}",
-                  f"q.pieces {' '.join(str(q['pieces'][str(l)]) for l in d['attn_layers'])}"]
+    for key, Ms in (("q", 512), ("r", 128)):
+        if f"prefill{Ms}" in meta:
+            q = meta[f"prefill{Ms}"]
+            lines += [f"{key}.{k} {q[k]}" for k in ("M", "c_size", "logits", "head_n", "head_rows")]
+            lines += [f"{key}.cs {' '.join(str(q['cs'][str(l)]) for l in d['conv_layers'])}",
+                      f"{key}.pieces {' '.join(str(q['pieces'][str(l)]) for l in d['attn_layers'])}"]
     Path(path).write_text("\n".join(lines) + "\n")
 
 
@@ -65,15 +66,18 @@ def main():
     else:
         lay = L.Layout(ctx)
 
-    small = sys.argv.index("--small") if "--small" in sys.argv and "--decode-only" not in sys.argv else None
-    if small:
-        sp = P.Plan(P.lfm3_kinds(), M=512, head_row0=0)
-        _, Cs512 = PH.pack_scratch(sp, md)
-        Cs512.tofile(out / "prefill512_scratch.bin")
-        shutil.copyfile(sys.argv[small + 1], out / "prefill512.xclbin")
-        shutil.copyfile(sys.argv[small + 2], out / "prefill512_head0.insts")
-        meta_small = dict(M=sp.M, c_size=sp.c_size, logits=sp.logits, cs={str(l): v for l, v in sp.cs.items()},
-                          pieces={str(l): v for l, v in sp.pieces.items()})
+    # smaller prefill variants: --small (M = 512) and --tiny (M = 128), each <xclbin> <insts>
+    smaller = {}
+    for flag, Ms in (("--small", 512), ("--tiny", 128)):
+        if flag in sys.argv and "--decode-only" not in sys.argv:
+            at = sys.argv.index(flag)
+            sp = P.Plan(P.lfm3_kinds(), M=Ms, head_row0=0)
+            _, Csm = PH.pack_scratch(sp, md)
+            Csm.tofile(out / f"prefill{Ms}_scratch.bin")
+            shutil.copyfile(sys.argv[at + 1], out / f"prefill{Ms}.xclbin")
+            shutil.copyfile(sys.argv[at + 2], out / f"prefill{Ms}_head0.insts")
+            smaller[Ms] = dict(M=sp.M, c_size=sp.c_size, logits=sp.logits, head_n=sp.head_n, head_rows=sp.head_rows,
+                               cs={str(l): v for l, v in sp.cs.items()}, pieces={str(l): v for l, v in sp.pieces.items()})
     for src, name in ((dxclbin, "decode.xclbin"), (dso, "decode_dispatch.so"), (pxclbin, "prefill.xclbin"),
                       (pins0, "prefill_head0.insts"), (pins512, "prefill_head512.insts")):
         shutil.copyfile(src, out / name)
@@ -87,12 +91,13 @@ def main():
         },
         "prefill": {
             "M": plan.M, "rec": P.REC, "c_size": plan.c_size, "logits": plan.logits, "head_rows": P.HEAD_ROWS,
+            "head_n": plan.head_n,
             "conv_row": P.CONV_ROW, "state_rows": P.STATE, "piece": P.PIECE,
             "cs": {str(l): v for l, v in plan.cs.items()}, "pieces": {str(l): v for l, v in plan.pieces.items()},
         },
     }
-    if small:
-        meta["prefill512"] = meta_small
+    for Ms, mv in smaller.items():
+        meta[f"prefill{Ms}"] = mv
     (out / "bundle.json").write_text(json.dumps(meta, indent=1))
     write_flat(meta, out / "bundle.txt")
     print("bundle written to", out, {f.name: os.path.getsize(f) for f in out.iterdir()})

@@ -152,6 +152,7 @@ struct flm_lfm3 {
     dec = Load(dev, dir + "/decode.xclbin");
     struct Spec { const char *key, *xclbin, *ins0, *ins512, *scratch; };
     std::vector<Spec> specs;
+    if (meta.v.count("r.M")) specs.push_back({"r", "/prefill128.xclbin", "/prefill128_head0.insts", nullptr, "/prefill128_scratch.bin"});
     if (meta.v.count("q.M")) specs.push_back({"q", "/prefill512.xclbin", "/prefill512_head0.insts", nullptr, "/prefill512_scratch.bin"});
     specs.push_back({"p", "/prefill.xclbin", "/prefill_head0.insts", "/prefill_head512.insts", "/prefill_scratch.bin"});
     for (const Spec &sp : specs) {
@@ -325,12 +326,14 @@ struct flm_lfm3 {
     size_t vi = 0;
     while (pre[vi].M < m) ++vi;
     Variant &P = pre[vi];
-    const int head_rows = meta("p.head_rows"), v = m - 1 >= head_rows;
+    const int head_rows = meta.v.count(P.key + ".head_rows") ? int(meta(P.key + ".head_rows")) : int(meta("p.head_rows"));
+    const int v = m - 1 >= head_rows;
+    const size_t head_n = meta.v.count(P.key + ".head_n") ? size_t(meta(P.key + ".head_n")) : size_t(vocab);
     auto run = P.x.kernel(3u, P.ins[v], P.ins_n[v], p_rec, p_w, P.c);
     run.wait();
     const double t2 = Now();
     if (logits) {
-      const size_t at = meta(P.key + ".logits") + size_t(m - 1 - v * head_rows) * vocab;
+      const size_t at = meta(P.key + ".logits") + size_t(m - 1 - v * head_rows) * head_n;
       P.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE, size_t(vocab) * 2, at * 2);
       const uint16_t *lg = P.c.map<const uint16_t *>() + at;
       for (int i = 0; i < vocab; ++i) logits[i] = FromBf16(lg[i]);

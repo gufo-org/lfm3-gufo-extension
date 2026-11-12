@@ -57,8 +57,8 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                                 object_file_name=obj)
     zero_k = kernels.zero((m, n), bfloat16)
     matmul_k = ext("matmul_vectorized_different_datatypes", [A_l1_ty, B_l1_ty, C_l1_ty])
-    cnt_ty = np.ndarray[(8,), np.dtype[np.int32]]
-    next_k = ext("prefill_next", [cnt_ty])
+    cnt_ty = np.ndarray[(16,), np.dtype[np.int32]]
+    next_k = ext("prefill_next", [cnt_ty, np.int32])
     epi_k = ext("prefill_epilogue", [C_l1_ty])
     norm_k = ext("prefill_row", [A_l1_ty, B_l1_ty, C_l1_ty, np.int32])
     taps_k = ext("prefill_conv_taps", [A_l1_ty, C_l1_ty])
@@ -112,18 +112,26 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                     in_b.release(1)
 
             for _ in range_(len(plan.phases)):
-                nxt(cnt)
-                # GEMM: cnt[0] C tiles of cnt[1] k steps, then the phase's epilogue
+                nxt(cnt, q)
+                # GEMM: cnt[0] C tiles (or narrow groups) of cnt[1] k steps, then the epilogue.
+                # A narrow K step streams T tiles' B objects: skip cnt[7], take cnt[8], skip cnt[9].
                 for _ in range_(cnt[0]):
                     acc = out_c.acquire(1)
                     zero(acc)
                     for _ in range_(cnt[1]):
-                        wb = in_b.acquire(1)
-                        for _ in range_(4):
-                            xa = in_a.acquire(1)
-                            matmul(xa, wb, acc)
-                            in_a.release(1)
-                        in_b.release(1)
+                        for _ in range_(cnt[7]):
+                            in_b.acquire(1)
+                            in_b.release(1)
+                        for _ in range_(cnt[8]):
+                            wb = in_b.acquire(1)
+                            for _ in range_(4):
+                                xa = in_a.acquire(1)
+                                matmul(xa, wb, acc)
+                                in_a.release(1)
+                            in_b.release(1)
+                        for _ in range_(cnt[9]):
+                            in_b.acquire(1)
+                            in_b.release(1)
                     epi(acc)
                     out_c.release(1)
                 # Row phases (norm, or qk-norm + RoPE for qkr; the kernel dispatches):
@@ -194,6 +202,56 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                 C_conses[col].drain(buf[dst], tap=TAP((size[dst],), *tap), group=tg, wait=True)
             tg.finish()
 
+        def a_fill(row, tg, src, K, tr):
+            if src[0] == "rec":
+                row_base = src[1] if len(src) > 1 else 0
+                A_prods[row].fill(a, tap=TAP((a_size,), (row_base + tr * m) * P.REC, [1, K // mtk, m, mtk], [0, mtk, P.REC, 1]), group=tg, wait=False)
+            elif src[0] == "heads":
+                A_prods[row].fill(c, tap=TAP((c_size,), src[1] + tr * m * 128, [K // mtk, m, mtk // 128, 128],
+                                             [mtk // 128 * M * 128, 128, M * 128, 1]), group=tg, wait=False)
+            elif src[0] == "plain":
+                A_prods[row].fill(c, tap=TAP((c_size,), src[1] + tr * m * src[2], [1, K // mtk, m, mtk], [0, mtk, src[2], 1]), group=tg, wait=False)
+            else:  # half
+                A_prods[row].fill(c, tap=TAP((c_size,), src[1] + tr * m * src[2], [K // mtk, m, mtk // 64, 64], [mtk * 2, src[2], 128, 1]), group=tg, wait=False)
+
+        def narrow_gemm(ph, K, N):
+            # M = 128 rows: every core row works on the same rows, core row r on tile r of
+            # the column's T tiles per K step (rows >= T idle and drain junk).
+            T = P.narrow_tiles(N)
+            groups = N // n // COLS // T
+            # two groups in flight: a shim tile holds 16 buffer descriptors
+            slots, done = [None] * 2, [True] * 2
+
+            def fin(i):
+                if not done[i]:
+                    slots[i].finish()
+                    done[i] = True
+            for g in range(groups):
+                si = g % 2
+                fin(si)
+                tg = TaskGroup()
+                slots[si], done[si] = tg, False
+                for row in range(T):
+                    a_fill(row, tg, ph["a"], K, 0)
+                for col in range(COLS):
+                    t0 = (g * COLS + col) * T
+                    # per K step the T tiles' objects (n k / 8 bfp blocks each, as 8 x 128)
+                    B_prods[col].fill(b, tap=TAP((b_size,), ph["b"] + t0 * (n * K // 8), [K // k, T, 8, n * k // 64],
+                                                 [n * k // 8, n * K // 8, n * k // 64, 1]), group=tg, wait=False)
+                for col in range(COLS):
+                    t0 = (g * COLS + col) * T
+                    dst = ph["c"]
+                    if dst[0] == "o":
+                        C_conses[col].drain(a, tap=TAP((a_size,), 2 * P.H + t0 * n, [1, T, m, n], [0, n, P.REC, 1]), group=tg, wait=T == ROWS)
+                    elif dst[0] == "plain":
+                        C_conses[col].drain(c, tap=TAP((c_size,), dst[1] + t0 * n, [1, T, m, n], [0, n, dst[2], 1]), group=tg, wait=T == ROWS)
+                    else:  # halves
+                        C_conses[col].drain(c, tap=TAP((c_size,), dst[1] + t0 * 2 * n + 64, [T, m, 2, 64], [2 * n, dst[2], 128, 1]), group=tg, wait=T == ROWS)
+                    if T < ROWS:
+                        C_conses[col].drain(c, tap=TAP((c_size,), plan.junk, [1, 1, (ROWS - T) * m, n], [0, 0, n, 1]), group=tg, wait=True)
+            for i in range(2):
+                fin(i)
+
         for ph in plan.phases:
             if ph["kind"] == "norm":
                 elementwise(
@@ -246,6 +304,9 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                     tg.finish()
                 continue
             K, N, mode = ph["K"], ph["N"], ph["mode"]
+            if ph["rows"] < P.HEAD_ROWS:
+                narrow_gemm(ph, K, N)
+                continue
             n_rt, n_ct = ph["rows"] // m // ROWS, N // n // COLS
             slots, done = [None] * 4, [True] * 4
 

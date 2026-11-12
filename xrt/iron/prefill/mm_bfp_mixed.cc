@@ -651,15 +651,25 @@ const int32_t kPlan[] = {PREFILL_PLAN};
 int phase_at, epilogue_mode, row_qkr;
 }  // namespace
 
-// cnt: [GEMM tiles, k steps, norm, conv, qkr, attention, round KV objects]
-void prefill_next(int32_t *__restrict cnt) {
+// cnt: [GEMM tiles or groups, k steps, row phase, conv, -, attention, round KV
+// objects / conv rows, conv A objects / B skipped before, own B objects, skipped after]
+int core_row;
+void prefill_next(int32_t *__restrict cnt, int32_t row) {
+  core_row = row;
   const int32_t code = kPlan[phase_at];
   phase_at = phase_at + 1 == int(sizeof(kPlan) / sizeof(kPlan[0])) ? 0 : phase_at + 1;  // the core reruns per dispatch
   const int kind = code & 7;
   const int mode = (code >> 3) & 3;
   epilogue_mode = mode;
   cnt[0] = kind == 0 ? (code >> 5) & 127 : 0;
-  cnt[1] = code >> 12;
+  cnt[1] = (code >> 12) & 255;
+  // GEMM B objects of a K step: skipped before, this core's (0 or 1), skipped after.
+  // Wide plans: every object is this core's. Narrow: T tiles per K step, core row
+  // r < T takes tile r.
+  const int t = (code >> 20) & 7;
+  cnt[7] = t == 0 ? 0 : (core_row < t ? core_row : t);
+  cnt[8] = t == 0 ? 1 : (core_row < t ? 1 : 0);
+  cnt[9] = t == 0 ? 0 : (core_row < t ? t - 1 - core_row : 0);
   cnt[2] = kind == 1 || kind == 3;  // row phases: norm or qkr
   cnt[3] = kind == 2;
   cnt[4] = 0;

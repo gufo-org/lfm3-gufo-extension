@@ -112,7 +112,10 @@ def pack(plan, md, weights=True):
                 E.append(enc(gemm_weight(md, ph["what"])))
         md.drop()
     if hasattr(plan, "logits") and weights:
-        E.append(enc(gemm_weight(md, ("head",))))
+        hw = gemm_weight(md, ("head",))
+        if plan.head_n > hw.shape[1]:  # narrow plans pad the vocabulary with zero weights
+            hw = np.concatenate([hw, np.zeros((hw.shape[0], plan.head_n - hw.shape[1]), np.float32)], 1)
+        E.append(enc(hw))
         md.drop()
     Cs = np.zeros(plan.c_size, np.uint16)
     for off, what in plan.ablocks:
@@ -355,7 +358,7 @@ def head_check(argv):
     runs = {0: Runner(xclbin, ins0, plan, E, Cs)}
     del E
     for n in map(int, ns):
-        row0 = 0 if n - 1 < P.HEAD_ROWS else P.HEAD_ROWS
+        row0 = 0 if n - 1 < plan.head_rows else plan.head_rows
         if row0 not in runs:
             r = runs[0]
             ins = np.fromfile(ins512, dtype=np.uint32)
@@ -376,7 +379,7 @@ def head_check(argv):
         dt = time.perf_counter() - t0
         r.bo_c.sync(r.fd)
         row = n - 1 - row0
-        lg = from_bf16(np.frombuffer(r.bo_c.read(P.VOCAB * 2, (plan.logits + row * P.VOCAB) * 2), np.uint16))
+        lg = from_bf16(np.frombuffer(r.bo_c.read(P.VOCAB * 2, (plan.logits + row * plan.head_n) * 2), np.uint16))
         md.drop()
         xs = reference(md, kinds, x[:n])
         ref = rms(xs[-1][n - 1], md.f("output_norm.weight")) @ emb.T
