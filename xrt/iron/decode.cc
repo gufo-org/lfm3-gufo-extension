@@ -350,19 +350,53 @@ void Fold(const bfloat16* const* v, int valid) {
   const aie::vector<float, 16> f = Exp16(aie::sub(att_m, m));
   alignas(64) float p[16];
   aie::store_v(p, aie::select(aie::zeros<float, 16>(), Exp16(aie::sub(s, m)), real));
+  alignas(64) bfloat16 p_hi[16], p_lo[16];
+  {
+    aie::accum<accfloat, 16> t;
+    t.from_vector(aie::load_v<16>(p));
+    const aie::vector<bfloat16, 16> hi = t.to_vector<bfloat16>();
+    aie::accum<accfloat, 16> h;
+    h.from_vector(hi);
+    t.from_vector(aie::sub(aie::load_v<16>(p), h.to_vector<float>()));
+    aie::store_v(p_hi, hi);
+    aie::store_v(p_lo, t.to_vector<bfloat16>());
+  }
   att_l = aie::add(aie::mul(att_l, f).to_vector<float>(), aie::broadcast<float, 16>(aie::reduce_add(aie::load_v<16>(p))));
   att_m = m;
   for (int d = 0; d < kD; d += 16) {
     aie::accum<accfloat, 16> a = aie::mul(aie::load_v<16>(att_acc + d), f);
-    for (int i = 0; i < valid; ++i) a = aie::mac(a, Bf16ToFloat(v[i] + d), aie::broadcast<float, 16>(p[i]));
+    // p = hi + lo in bf16: two native bf16 MACs instead of an emulated f32 one (error ~2^-17)
+    for (int i = 0; i < valid; ++i) {
+      const aie::vector<bfloat16, 16> vv = aie::load_v<16>(v[i] + d);
+      a = aie::mac(a, vv, aie::broadcast<bfloat16, 16>(p_hi[i]));
+      a = aie::mac(a, vv, aie::broadcast<bfloat16, 16>(p_lo[i]));
+    }
     aie::store_v(att_acc + d, a.to_vector<float>());
   }
 }
 
-float DotBf16(const float* q, const bfloat16* k) {
+// q = att_qh + att_ql in bf16 (set by dec_attn_begin): native bf16 MACs, error ~2^-17.
+alignas(64) bfloat16 att_qh[kD], att_ql[kD];
+float DotBf16(const float* /*q*/, const bfloat16* k) {
   aie::accum<accfloat, 16> a = aie::zeros<accfloat, 16>();
-  for (int i = 0; i < kD; i += 16) a = aie::mac(a, aie::load_v<16>(q + i), Bf16ToFloat(k + i));
+  for (int i = 0; i < kD; i += 16) {
+    const aie::vector<bfloat16, 16> kk = aie::load_v<16>(k + i);
+    a = aie::mac(a, aie::load_v<16>(att_qh + i), kk);
+    a = aie::mac(a, aie::load_v<16>(att_ql + i), kk);
+  }
   return aie::reduce_add(a.to_vector<float>());
+}
+void SplitQ() {
+  for (int i = 0; i < kD; i += 16) {
+    aie::accum<accfloat, 16> t;
+    t.from_vector(aie::load_v<16>(att_q + i));
+    const aie::vector<bfloat16, 16> hi = t.to_vector<bfloat16>();
+    aie::accum<accfloat, 16> h;
+    h.from_vector(hi);
+    t.from_vector(aie::sub(aie::load_v<16>(att_q + i), h.to_vector<float>()));
+    aie::store_v(att_qh + i, hi);
+    aie::store_v(att_ql + i, t.to_vector<bfloat16>());
+  }
 }
 }  // namespace
 
@@ -384,6 +418,7 @@ void dec_attn_begin(const float* x, int32_t c, int32_t j, int32_t cached) {
   }
   NormRope(att_q, qn, cs, sn);
   NormRope(att_k, kn, cs, sn);
+  SplitQ();
   att_gate = aie::broadcast<float, 16>(x[3072 + h]);
   att_m = aie::broadcast<float, 16>(-1e30f);
   att_l = aie::zeros<float, 16>();
