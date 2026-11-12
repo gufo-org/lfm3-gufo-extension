@@ -88,22 +88,6 @@ void QuantizeBf16(const bfloat16* in, int n, int8_t* q, float* scratch) {
 }
 
 // One weight row of k codes (scales at `scales`) against quantized x.
-__attribute__((noinline)) float Dot(const int8_t* x, int k, const int8_t* row, const bfloat16* scales) {
-  const bfloat16* xs = reinterpret_cast<const bfloat16*>(x + k);
-  aie::accum<accfloat, 16> acc = aie::zeros<accfloat, 16>();
-  for (int b0 = 0; b0 < k / 32; b0 += 16) {
-    alignas(64) int32_t sums[16];
-    for (int j = 0; j < 16; ++j) {
-      const int b = b0 + j;
-      aie::accum<acc32, 32> m = aie::mul(aie::load_v<32>(row + b * 32), aie::load_v<32>(x + b * 32));
-      sums[j] = aie::reduce_add(m.to_vector<int32>(0));
-    }
-    aie::vector<float, 16> sf = aie::to_float(aie::load_v<16>(sums), 0);
-    aie::vector<float, 16> sc = aie::mul(aie::load_v<16>(scales + b0), aie::load_v<16>(xs + b0)).to_vector<float>();
-    acc = aie::mac(acc, sf, sc);
-  }
-  return aie::reduce_add(acc.to_vector<float>());
-}
 
 // Four rows of kH codes as one 4-row record (token_host.tile4): per 32-code block b
 // two 8 x 8 int8 tiles t [k][n], column n < 4 holding codes 32 b + 16 t + k of row n
@@ -112,13 +96,14 @@ __attribute__((noinline)) float Dot(const int8_t* x, int k, const int8_t* row, c
 // tile t's own accumulator, C rows 4 o + 2 t and 4 o + 2 t + 1 hold block b + o's
 // chunk partial sums at columns 0..3 and 4..7.
 alignas(64) int32_t dot4_sums[kH / 32 * 4 + 16];
-__attribute__((noinline)) void Dot4(const int8_t* x, const int8_t* w, float* out) {
-  const bfloat16* xs = reinterpret_cast<const bfloat16*>(x + kH);
-  const bfloat16* ws = reinterpret_cast<const bfloat16*>(w + 4 * kH);
+inline const bfloat16* Scales(const int8_t* q8, int k) { return reinterpret_cast<const bfloat16*>(q8 + k); }
+// nb blocks (a multiple of 16); xs: x's block scales (32-byte aligned).
+__attribute__((noinline)) void Dot4(const int8_t* x, const bfloat16* xs, const int8_t* w, int nb, float* out) {
+  const bfloat16* ws = reinterpret_cast<const bfloat16*>(w + 128 * nb);
   // 512-bit loads need 64-byte alignment: one A per pair of blocks, the odd block
   // in A rows 4..7 (C rows 4..7).
   aie::vector<int32, 16> four = aie::zeros<int32, 16>();  // sums of 4 blocks, stored aligned
-  for (int b = 0; b < kH / 32; b += 2) {
+  for (int b = 0; b < nb; b += 2) {
     const aie::vector<int8, 64> a = aie::load_v<64>(x + 32 * b);
 #pragma clang loop unroll(disable)
     for (int o = 0; o < 2; ++o) {
@@ -132,7 +117,7 @@ __attribute__((noinline)) void Dot4(const int8_t* x, const int8_t* w, float* out
     if ((b & 3) == 2) aie::store_v(dot4_sums + 4 * (b - 2), four);
   }
   aie::accum<accfloat, 16> acc = aie::zeros<accfloat, 16>();
-  for (int q = 0; q < kH / 32 / 16; ++q) {
+  for (int q = 0; q < nb / 16; ++q) {
     // x scales of blocks 16 q .. 16 q + 15, each repeated for the four rows
     const aie::vector<bfloat16, 16> v = aie::load_v<16>(xs + 16 * q);
     const auto [z0, z1] = aie::interleave_zip(v, v, 1);
@@ -216,7 +201,7 @@ void dec_quant(const bfloat16* x, int8_t* q8, float* scratch, int32_t n) {
 // Gate rows of two channels, then their up rows.
 void dec_gate_up(const int8_t* q8, const int8_t* w) {
   alignas(16) float r4[4];  // gate a, gate b, up a, up b
-  Dot4(q8, w, r4);
+  Dot4(q8, Scales(q8, kH), w, kH / 32, r4);
   acc_a[acc_n] = r4[0];
   acc_a[acc_n + 1] = r4[1];
   acc_b[acc_n] = r4[2];
@@ -239,14 +224,23 @@ void dec_gate_flush(bfloat16* out) {
   acc_n = 0;
 }
 
-// One row of k codes (k = I for down).
-void dec_row(const int8_t* q8, const int8_t* w, int32_t k) {
-  acc_a[acc_n++] = Dot(q8, k, w, reinterpret_cast<const bfloat16*>(w + k));
+// Down projection: four rows per record over one slice of I (2048, 2048, 2048,
+// 1536 codes; token_host packs them in that order), accumulated over the slices.
+int down_slice;
+void dec_row(const int8_t* q8, const int8_t* w, int32_t /*k*/) {
+  alignas(16) float r4[4];
+  const int q = down_slice;
+  Dot4(q8 + 2048 * q, Scales(q8, kI) + 64 * q, w, q < 3 ? 64 : 48, r4);
+  for (int r = 0; r < 4; ++r) acc_a[acc_n + r] = (q ? acc_a[acc_n + r] : 0.0f) + r4[r];
+  if (++down_slice == 4) {
+    down_slice = 0;
+    acc_n += 4;
+  }
 }
 
 // Four rows of H codes (out projections, head).
 void dec_rows4(const int8_t* q8, const int8_t* w) {
-  Dot4(q8, w, acc_a + acc_n);
+  Dot4(q8, Scales(q8, kH), w, kH / 32, acc_a + acc_n);
   acc_n += 4;
 }
 
@@ -268,12 +262,18 @@ void dec_conv_load(const int8_t* rec) {
 }
 
 // The next channel: B, C and x rows, scales, then 7 f32 taps.
+// One channel's record (token_host.tile4 of rows B, C, x and a fourth row whose
+// first 28 codes are the 7 f32 taps, with zero scales).
 void dec_conv(const int8_t* q8, const int8_t* w) {
-  const bfloat16* s = reinterpret_cast<const bfloat16*>(w + 3 * kH);
-  const float* taps = reinterpret_cast<const float*>(w + 3 * kH + 3 * (kH / 32) * 2);
-  acc_a[acc_n] = Dot(q8, kH, w, s);                         // B
-  acc_b[acc_n] = Dot(q8, kH, w + kH, s + kH / 32);          // C
-  acc_c[acc_n] = Dot(q8, kH, w + 2 * kH, s + 2 * (kH / 32));  // x
+  alignas(16) float r4[4];
+  Dot4(q8, Scales(q8, kH), w, kH / 32, r4);
+  acc_a[acc_n] = r4[0];  // B
+  acc_b[acc_n] = r4[1];  // C
+  acc_c[acc_n] = r4[2];  // x
+  // code j of row 3 in block 0: tile j / 16, column 3 + 4 * ((j / 8) % 2), k = j % 8
+  alignas(4) int8_t tb[4 * kTaps];
+  for (int j = 0; j < 4 * kTaps; ++j) tb[j] = w[64 * (j >> 4) + 8 * (j & 7) + 3 + 4 * ((j >> 3) & 1)];
+  const float* taps = reinterpret_cast<const float*>(tb);
   for (int t = 0; t < kTaps; ++t) conv_taps[t][acc_n] = taps[t];
   ++acc_n;
 }

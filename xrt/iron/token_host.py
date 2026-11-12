@@ -35,8 +35,10 @@ def tile4(cs, ss):
     """Four rows of H codes (int8 [4, H]) and their bf16 block scales ([4, H / 32]) as
     decode.cc's Dot4 reads them: per 32-code block two 8 x 8 tiles t [k][n] (n < 4: row n,
     codes 16 t + k of the block; n >= 4: row n - 4, codes 16 t + 8 + k), then scales [block][row]."""
-    c = np.asarray(cs, np.int8).reshape(4, H // 32, 2, 2, 8)        # [row][block][t][half][k]
-    t = c.transpose(1, 2, 4, 3, 0).reshape(H // 32, 2, 8, 8)         # [block][t][k][half * 4 + row]
+    c = np.asarray(cs, np.int8)
+    nb = c.shape[1] // 32
+    c = c.reshape(4, nb, 2, 2, 8)                                    # [row][block][t][half][k]
+    t = c.transpose(1, 2, 4, 3, 0).reshape(nb, 2, 8, 8)              # [block][t][k][half * 4 + row]
     return np.concatenate([t.reshape(-1), np.asarray(ss, np.uint16).T.copy().view(np.int8).reshape(-1)])
 
 
@@ -80,7 +82,11 @@ def pack(gguf, ctx=4096):
             taps = F(p + "shortconv.conv.weight").reshape(H, 7)
             def conv_rec(c, j, r):
                 ch = ((c * 8 + r // 16) * 2 + (j - 2)) * 16 + r % 16
-                return np.concatenate([rows_record(ic, isc, [ch, H + ch, 2 * H + ch]), taps[ch].astype(np.float32).view(np.int8)])
+                # rows B, C, x and a fourth row carrying the taps (zero scales)
+                tap_row = np.zeros(H, np.int8)
+                tap_row[:28] = taps[ch].astype(np.float32).view(np.int8)
+                return tile4([ic[ch], ic[H + ch], ic[2 * H + ch], tap_row],
+                             [bf16(isc[ch]), bf16(isc[H + ch]), bf16(isc[2 * H + ch]), np.zeros(H // 32, np.uint16)])
             put((l, "conv"), stream_pack(conv_rec, L.CONV_RECS, streams=range(1, 16, 2), cores_of=lambda s: (2, 3)))
             put((l, "conv_out"), stream_pack(lambda c, j, r: rows_record(oc, osc, [hrow(c, j, 4 * r + i) for i in range(4)]),
                                              L.OUT_RECS))
@@ -90,7 +96,12 @@ def pack(gguf, ctx=4096):
             a, b = [((c * 15 + x // 16) * 4 + j) * 16 + x % 16 for x in (2 * r, 2 * r + 1)]
             return tile4([gc[a], gc[b], uc[a], uc[b]], [bf16(gs[a]), bf16(gs[b]), bf16(us[a]), bf16(us[b])])
         put((l, "gate_up"), stream_pack(gu, L.GU_RECS))
-        put((l, "down"), stream_pack(lambda c, j, r: np.concatenate([dc[hrow(c, j, r)], bf16(ds[hrow(c, j, r)]).view(np.int8)]),
+        def down(c, j, r):
+            # four rows (r // 4) over slice r % 4 of I: 2048, 2048, 2048, 1536 codes
+            rows, q = [hrow(c, j, 4 * (r // 4) + i) for i in range(4)], r % 4
+            k0, k1 = 2048 * q, min(2048 * q + 2048, I)
+            return tile4([dc[h][k0:k1] for h in rows], [bf16(ds[h][k0 // 32:k1 // 32]) for h in rows])
+        put((l, "down"), stream_pack(down,
                                      L.DOWN_RECS))
         lw.update(gate=(gc, gs), up=(uc, us), down=(dc, ds), norm=F(p + "attn_norm.weight"),
                   post=F(p + "post_attention_norm.weight"), ffn_norm=F(p + "ffn_norm.weight"),
