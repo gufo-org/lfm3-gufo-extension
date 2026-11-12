@@ -665,6 +665,10 @@ struct Session::Xrt {
     tokens.insert(tokens.end(), run.begin(), run.end());
     logits_ready = want_logits;
   }
+  void Speculate(std::uint32_t token) {
+    if (!poisoned && tokens.size() < context)
+      model->impl_->xrt->Speculate(this, tokens, token);
+  }
   // Logits of the last row when the pass that wrote it did not ask: replay.
   void EnsureLogits() {
     if (logits_ready || tokens.empty())
@@ -908,6 +912,10 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
       *error = e.what();
     return false;
   }
+}
+void Session::Speculate(std::uint32_t token) {
+  if (xrt_)
+    xrt_->Speculate(token);
 }
 bool Session::Forward(std::span<const std::uint32_t> tokens,
                       std::span<float> logits, std::string* error) {

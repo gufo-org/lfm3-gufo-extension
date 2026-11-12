@@ -64,6 +64,9 @@ public:
                        std::span<const std::uint32_t> positions,
                        std::span<const std::uint32_t> vocabulary,
                        std::span<float> logits, std::string* error = nullptr);
+  // Hint that `token` is the next one advanced: on XRT its decode starts now, so
+  // host work overlaps the NPU. Correct whatever is advanced next.
+  void Speculate(std::uint32_t token);
   // Advances text tokens and optionally returns the final logits.
   // State is session-owned; device weights are shared by sessions.
   bool Forward(std::span<const std::uint32_t> tokens,

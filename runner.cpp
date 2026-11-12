@@ -304,9 +304,13 @@ public:
       s.logits_ready = true;
     }
     auto token = sampler.Sample(s.logits);
+    const bool stop = state.stop_at_eos() && model_->tokenizer().IsStop(token);
+    // On XRT the token's decode starts now; logprobs and streaming overlap it.
+    if (!stop && model_->OnXrt())
+      s.session->Speculate(token);
     auto logprobs =
         sampling::CollectLogprobs(s.logits, token, sampler.config().logprobs);
-    if (state.stop_at_eos() && model_->tokenizer().IsStop(token))
+    if (stop)
       return {.stop = true,
               .token = token,
               .piece = {},

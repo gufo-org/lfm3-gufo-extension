@@ -26,6 +26,10 @@ public:
            std::span<float> logits);
   // Forgets `owner` so its next pass replays from the start.
   void Release(const void* owner);
+  // Starts decoding `token` after `history` without waiting, when the library
+  // supports it; the next Run of exactly that token takes its logits. The host
+  // samples, scores and streams while the NPU decodes.
+  void Speculate(const void* owner, std::span<const std::uint32_t> history, std::uint32_t token);
   std::uint32_t vocab() const { return vocab_; }
 
 private:
@@ -38,6 +42,7 @@ private:
   std::mutex mutex_;
   const void* owner_{};
   std::vector<std::uint32_t> resident_;  // tokens the engine context holds
+  bool speculating_{};                   // resident_.back() is a started decode
   void Prefill(std::span<const std::uint32_t> tokens, std::span<float> logits);
 };
 

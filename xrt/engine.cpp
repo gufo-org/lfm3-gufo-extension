@@ -16,6 +16,9 @@ struct Engine::Api {
   int (*prefill)(void*, const std::int32_t*, int, float*);
   int (*decode)(void*, std::int32_t, float*);
   void (*clear)(void*);
+  // optional (liblfm3_xrt.so): a decode that returns at once, then its wait
+  int (*decode_start)(void*, std::int32_t) = nullptr;
+  int (*decode_finish)(void*, float*) = nullptr;
 };
 
 std::unique_ptr<Engine> Engine::Open(std::uint32_t context, std::uint32_t vocab, std::string* error) {
@@ -43,6 +46,8 @@ std::unique_ptr<Engine> Engine::Open(std::uint32_t context, std::uint32_t vocab,
       !bind(a.last_error, "flm_lfm3_last_error") || !bind(a.vocab, "flm_lfm3_vocab") ||
       !bind(a.prefill, "flm_lfm3_prefill") || !bind(a.decode, "flm_lfm3_decode") || !bind(a.clear, "flm_lfm3_clear"))
     return fail("the library lacks the flm_lfm3 entry points");
+  if (!bind(a.decode_start, "flm_lfm3_decode_start") || !bind(a.decode_finish, "flm_lfm3_decode_finish"))
+    a.decode_start = nullptr, a.decode_finish = nullptr;
   e->engine_ = a.create(model, assets, int(context));
   if (!e->engine_)
     return fail(a.last_error());
@@ -78,9 +83,33 @@ void Engine::Prefill(std::span<const std::uint32_t> tokens, std::span<float> log
   }
 }
 
+void Engine::Speculate(const void* owner, std::span<const std::uint32_t> history, std::uint32_t token) {
+  std::lock_guard lock(mutex_);
+  if (!api_->decode_start || speculating_ || owner != owner_ || resident_.size() != history.size() ||
+      !std::equal(history.begin(), history.end(), resident_.begin()) || resident_.empty())
+    return;
+  if (api_->decode_start(engine_, std::int32_t(token)))
+    return;  // a later pass replays (resident_ unchanged)
+  resident_.push_back(token);
+  speculating_ = true;
+}
+
 void Engine::Run(const void* owner, std::span<const std::uint32_t> history, std::span<const std::uint32_t> tokens,
                  std::span<float> logits) {
   std::lock_guard lock(mutex_);
+  if (speculating_) {
+    speculating_ = false;
+    // The decode started by Speculate is this exact step: wait for its logits.
+    if (owner == owner_ && tokens.size() == 1 && resident_.size() == history.size() + 1 &&
+        resident_.back() == tokens[0] && std::equal(history.begin(), history.end(), resident_.begin())) {
+      if (api_->decode_finish(engine_, logits.empty() ? nullptr : logits.data()))
+        throw std::runtime_error(std::string("LFM3 XRT engine: ") + api_->last_error());
+      return;
+    }
+    // Otherwise the started token is not part of this history: the checks below replay.
+    if (api_->decode_finish(engine_, nullptr))
+      throw std::runtime_error(std::string("LFM3 XRT engine: ") + api_->last_error());
+  }
   const bool current = owner == owner_ && resident_.size() == history.size() &&
                        std::equal(history.begin(), history.end(), resident_.begin());
   if (!current) {

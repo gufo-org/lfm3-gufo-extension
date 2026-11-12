@@ -22,6 +22,10 @@ int flm_lfm3_length(flm_lfm3* m);
 // inputs: `ids[i] < 0` takes row -ids[i] - 1 of `rows`. Same contract otherwise.
 int flm_lfm3_prefill_mixed(flm_lfm3* m, const int32_t* ids, const float* rows, int count, float* logits);
 int flm_lfm3_decode_row(flm_lfm3* m, const float* row, float* logits);
+// liblfm3_xrt.so only: start a decode and return; _finish waits and writes the
+// logits. Any other call on the engine first waits for a started decode.
+int flm_lfm3_decode_start(flm_lfm3* m, int32_t id);
+int flm_lfm3_decode_finish(flm_lfm3* m, float* logits);
 void flm_lfm3_clear(flm_lfm3* m);
 #ifdef __cplusplus
 }

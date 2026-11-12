@@ -200,6 +200,7 @@ struct flm_lfm3 {
   }
 
   ~flm_lfm3() {
+    Finish(nullptr);
     if (dl) dlclose(dl);
   }
 
@@ -254,7 +255,8 @@ struct flm_lfm3 {
 
   // Decodes `id` at position `length` and appends it. A row id (< 0) goes through
   // the spare embedding-table row after the vocabulary, as token `vocab`.
-  void Decode(int32_t id, float *logits) {
+  void Decode(int32_t id, float *logits, bool wait = true) {
+    Finish(nullptr);  // a decode started without waiting
     if (id < 0) {
       float *spare = reinterpret_cast<float *>(d_s.map<char *>() + meta("d.emb") + size_t(vocab) * meta("d.emb_row"));
       std::memcpy(spare, Row(id), size_t(hidden) * 4);
@@ -279,9 +281,23 @@ struct flm_lfm3 {
     }
     d_ins.sync(XCL_BO_SYNC_BO_TO_DEVICE, size_t(n) * 4, 0);
     const double t0 = Now();
-    auto run = dec.kernel(3u, d_ins, uint32_t(n), d_s, d_w);
+    pending_ = dec.kernel(3u, d_ins, uint32_t(n), d_s, d_w);
+    pending_live_ = true;
+    pending_t0_ = t0;
+    pending_g_ = t0 - g0;
     Prepare(pos + 1);  // on the host while the NPU runs
-    run.wait();
+    ++length;
+    if (wait) Finish(logits);
+  }
+
+  // Waits for a started decode and reads its logits (when asked).
+  xrt::run pending_;
+  bool pending_live_ = false;
+  double pending_t0_ = 0, pending_g_ = 0;
+  void Finish(float *logits) {
+    if (!pending_live_) return;
+    pending_.wait();
+    pending_live_ = false;
     const double t1 = Now();
     if (logits) {
       const size_t off = meta("d.logits");
@@ -289,14 +305,14 @@ struct flm_lfm3 {
       std::memcpy(logits, d_s.map<const char *>() + off, size_t(vocab) * 4);
     }
     if (Timing())
-      std::fprintf(stderr, "lfm3_xrt: decode pos %d %.2f ms (instructions %.2f ms, logits %.2f ms)\n", pos,
-                   1e3 * (t1 - t0), 1e3 * (t0 - g0), 1e3 * (Now() - t1));
-    ++length;
+      std::fprintf(stderr, "lfm3_xrt: decode pos %d %.2f ms (instructions %.2f ms, logits %.2f ms)\n", length - 1,
+                   1e3 * (t1 - pending_t0_), 1e3 * pending_g_, 1e3 * (Now() - t1));
   }
 
   // Prefills m <= M fresh tokens (positions 0 .. m - 1), writes the last token's
   // logits and hands the state to decode.
   void Prefill(const int32_t *ids, int m, float *logits) {
+    Finish(nullptr);
     const double t0 = Now();
     uint16_t *R = p_rec.map<uint16_t *>();
     for (int t = 0; t < m; ++t) {
@@ -378,6 +394,7 @@ struct flm_lfm3 {
   }
 
   void Clear() {
+    Finish(nullptr);
     // Decode reads only cached positions, and conv states are rewritten by the next
     // prefill; a fresh decode-only start needs zero conv states.
     // Only the state chunks (the first 96 x 4 x 32 bytes of each column): the taps follow.
@@ -454,6 +471,28 @@ int flm_lfm3_decode(flm_lfm3 *m, int32_t id, float *logits) {
 }
 
 int flm_lfm3_length(flm_lfm3 *m) { return m->length; }
+
+// Starts decoding `id` and returns at once; flm_lfm3_decode_finish (or any other
+// call) waits for it. The host can work (logprobs, streaming) while the NPU runs.
+int flm_lfm3_decode_start(flm_lfm3 *m, int32_t id) {
+  try {
+    m->Decode(id, nullptr, false);
+    return 0;
+  } catch (const std::exception &e) {
+    g_error = e.what();
+    return 1;
+  }
+}
+
+int flm_lfm3_decode_finish(flm_lfm3 *m, float *logits) {
+  try {
+    m->Finish(logits);
+    return 0;
+  } catch (const std::exception &e) {
+    g_error = e.what();
+    return 1;
+  }
+}
 
 void flm_lfm3_clear(flm_lfm3 *m) {
   try {
