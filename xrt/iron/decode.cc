@@ -142,7 +142,8 @@ alignas(64) float acc_a[16];
 alignas(64) float acc_b[16];
 alignas(64) float acc_c[16];
 #ifndef DECODE_ATTN_ROLE
-alignas(64) float conv_taps[kTaps][16];
+alignas(64) float conv_taps[kTaps][128];  // tap-major for this core's 128 channels
+const float* conv_x;                        // [B 128 | C 128 | x 128] of the mix phase
 #endif
 #ifndef DECODE_ATTN_ROLE
 alignas(64) float conv_state[128 * (kTaps - 1)];
@@ -259,36 +260,24 @@ void dec_conv_load(const int8_t* rec) {
   conv_l = conv_k = acc_n = 0;
   const float* s = reinterpret_cast<const float*>(rec);
   for (int i = 0; i < 128 * (kTaps - 1); i += 16) aie::store_v(conv_state + i, aie::load_v<16>(s + i));
+  // the taps follow the state in the record (token_host writes them once)
+  for (int i = 0; i < 128 * kTaps; i += 16) aie::store_v(&conv_taps[0][0] + i, aie::load_v<16>(s + 128 * (kTaps - 1) + i));
 }
 
 // The next channel: B, C and x rows, scales, then 7 f32 taps.
-// One channel's record (token_host.tile4 of rows B, C, x and a fourth row whose
-// first 28 codes are the 7 f32 taps, with zero scales).
-void dec_conv(const int8_t* q8, const int8_t* w) {
-  alignas(16) float r4[4];
-  Dot4(q8, Scales(q8, kH), w, kH / 32, r4);
-  acc_a[acc_n] = r4[0];  // B
-  acc_b[acc_n] = r4[1];  // C
-  acc_c[acc_n] = r4[2];  // x
-  // code j of row 3 in block 0: tile j / 16, column 3 + 4 * ((j / 8) % 2), k = j % 8
-  alignas(4) int8_t tb[4 * kTaps];
-  for (int j = 0; j < 4 * kTaps; ++j) tb[j] = w[64 * (j >> 4) + 8 * (j & 7) + 3 + 4 * ((j >> 3) & 1)];
-  const float* taps = reinterpret_cast<const float*>(tb);
-  for (int t = 0; t < kTaps; ++t) conv_taps[t][acc_n] = taps[t];
-  ++acc_n;
-}
 
 // The last sixteen channels' convolution, as bf16. History is kept
 // tap-major for these lanes: conv_state[t * 128 + channel].
 void dec_conv_flush(bfloat16* out) {
   const int l0 = conv_l;
-  aie::vector<float, 16> bx = aie::mul(aie::load_v<16>(acc_a), aie::load_v<16>(acc_c)).to_vector<float>();
-  aie::accum<accfloat, 16> sum = aie::mul(bx, aie::load_v<16>(conv_taps[kTaps - 1]));
-  for (int t = 0; t < kTaps - 1; ++t) sum = aie::mac(sum, aie::load_v<16>(conv_state + t * 128 + l0), aie::load_v<16>(conv_taps[t]));
+  // B, C and x of these sixteen channels come from the ConvIn phase's output
+  aie::vector<float, 16> bx = aie::mul(aie::load_v<16>(conv_x + l0), aie::load_v<16>(conv_x + 256 + l0)).to_vector<float>();
+  aie::accum<accfloat, 16> sum = aie::mul(bx, aie::load_v<16>(conv_taps[kTaps - 1] + l0));
+  for (int t = 0; t < kTaps - 1; ++t) sum = aie::mac(sum, aie::load_v<16>(conv_state + t * 128 + l0), aie::load_v<16>(conv_taps[t] + l0));
   for (int t = 0; t + 1 < kTaps - 1; ++t) aie::store_v(conv_state + t * 128 + l0, aie::load_v<16>(conv_state + (t + 1) * 128 + l0));
   aie::store_v(conv_state + (kTaps - 2) * 128 + l0, bx);
   aie::accum<accfloat, 16> r;
-  r.from_vector(aie::mul(sum.to_vector<float>(), aie::load_v<16>(acc_b)).to_vector<float>());
+  r.from_vector(aie::mul(sum.to_vector<float>(), aie::load_v<16>(conv_x + 128 + l0)).to_vector<float>());
   aie::store_v(out, r.to_vector<bfloat16>());
   conv_l += 16;
   acc_n = 0;
@@ -503,7 +492,7 @@ void dec_kv_store(bfloat16* out) {
 // objects per phase (idle roles emit zeros), as the column's drains expect.
 
 namespace {
-enum Kind : int32_t { kEmbed, kConv1, kConv2, kAttn1, kAttn2, kAttn3, kFfn1, kFfn2, kHead, kIdle };
+enum Kind : int32_t { kEmbed, kConvIn, kConvMix, kConv2, kAttn1, kAttn2, kAttn3, kFfn1, kFfn2, kHead, kIdle };
 constexpr int kLayers = 24, kHeadRows = 128000;
 // LFM3-1.7B: layers 2, 4, ..., 22 attend; the rest convolve.
 bool Attends(int l) { return l >= 2 && l % 2 == 0; }
@@ -518,8 +507,9 @@ Counts Plan(int kind, int j, const int32_t* rtp, int attn_index) {
   const bool attn_role = j < 2;
   switch (kind) {
     case kEmbed: return {1, 0, 8, 0, 0, 0, kind, 0};
-    case kConv1:  // B/C/x and the convolution: rows 4-5 own 128 channels each
-      return attn_role ? Counts{3, 0, 8, 8, 0, 96, kIdle, 1} : Counts{3, 1, 8, 8, 16, 96, kind, 0};
+    case kConvIn: return {3, 0, 8, 24, 2, 0, kind, 0};     // 192 of the 6144 B/C/x rows: 48 records x 4
+    case kConvMix:  // the convolution: rows 4-5 own 128 channels each; no weights
+      return attn_role ? Counts{0, 0, 0, 8, 0, 96, kIdle, 0} : Counts{1, 1, 0, 8, 0, 96, kind, 0};
     case kConv2: return {1, 0, 0, 8, 2, 0, kind, 0};       // 64 out rows: 16 records x 4
     case kAttn1: return {3, 0, 8, 13, 2, 0, kind, 0};      // 104 q/k/v/gate rows
     case kAttn2: {
@@ -538,9 +528,9 @@ int KindAt(int layer, int step) {
   if (layer < 0) return kEmbed;
   if (layer >= kLayers) return kHead;
   if (Attends(layer)) return step == 0 ? kAttn1 : step == 1 ? kAttn2 : step == 2 ? kAttn3 : step == 3 ? kFfn1 : kFfn2;
-  return step == 0 ? kConv1 : step == 1 ? kConv2 : step == 2 ? kFfn1 : kFfn2;
+  return step == 0 ? kConvIn : step == 1 ? kConvMix : step == 2 ? kConv2 : step == 3 ? kFfn1 : kFfn2;
 }
-int StepsAt(int layer) { return layer < 0 || layer >= kLayers ? 1 : Attends(layer) ? 5 : 4; }
+int StepsAt(int layer) { return layer < 0 || layer >= kLayers ? 1 : 5; }
 }  // namespace
 
 extern "C" {
@@ -563,7 +553,7 @@ void ROLE(next)(int32_t* counts, const int32_t* rtp, int32_t c, int32_t j) {
 
 void ROLE(own)(const int8_t* rec) {
 #ifndef DECODE_ATTN_ROLE
-  if (ph_kind == kConv1) dec_conv_load(rec);
+  if (ph_kind == kConvMix) dec_conv_load(rec);
 #endif
 }
 
@@ -573,10 +563,15 @@ void ROLE(begin)(int8_t* x, int8_t* q8, float* scratch) {
     case kEmbed:  // x already holds h (f32): the embedding table is dequantized
       slice_t = 0;
       break;
-    case kConv1: case kAttn1: case kFfn1: case kHead: case kIdle:
+    case kConvIn: case kAttn1: case kFfn1: case kHead: case kIdle:
       if (ph_kind != kIdle || copy_r) dec_pre(xf, q8, scratch);
-      if (ph_kind == kConv1) conv_l = conv_k = acc_n = 0;
       break;
+#ifndef DECODE_ATTN_ROLE
+    case kConvMix:
+      conv_x = xf;
+      conv_l = conv_k = acc_n = 0;
+      break;
+#endif
     case kConv2: case kAttn3: dec_quant(reinterpret_cast<const bfloat16*>(x), q8, scratch, kH); break;
     case kFfn2: dec_quant(reinterpret_cast<const bfloat16*>(x), q8, scratch, kI); break;
 #ifdef DECODE_ATTN_ROLE
@@ -593,11 +588,10 @@ void ROLE(pre_out)(const int8_t* x, int8_t* out) {
 void ROLE(rec)(const int8_t* q8, const int8_t* w) {
   switch (ph_kind) {
 #ifndef DECODE_ATTN_ROLE
-    case kConv1: dec_conv(q8, w); break;
 #else
     case kAttn2: dec_attn_rec(w); break;
 #endif
-    case kConv2: case kAttn1: case kAttn3: case kHead: dec_rows4(q8, w); break;
+    case kConvIn: case kConv2: case kAttn1: case kAttn3: case kHead: dec_rows4(q8, w); break;
     case kFfn1: dec_gate_up(q8, w); break;
     case kFfn2: dec_row(q8, w, kI); break;
   }
@@ -606,10 +600,10 @@ void ROLE(rec)(const int8_t* q8, const int8_t* w) {
 void ROLE(flush)(int8_t* out) {
   switch (ph_kind) {
 #ifndef DECODE_ATTN_ROLE
-    case kConv1: dec_conv_flush(reinterpret_cast<bfloat16*>(out)); break;
+    case kConvMix: dec_conv_flush(reinterpret_cast<bfloat16*>(out)); break;
 #endif
     case kFfn1: dec_gate_flush(reinterpret_cast<bfloat16*>(out)); break;
-    case kConv2: case kAttn1: case kAttn3: case kFfn2: case kHead: dec_rows_flush(reinterpret_cast<float*>(out)); break;
+    case kConvIn: case kConv2: case kAttn1: case kAttn3: case kFfn2: case kHead: dec_rows_flush(reinterpret_cast<float*>(out)); break;
     default: aie::store_v(reinterpret_cast<float*>(out), aie::load_v<8>(zeros16)); break;
   }
 }
@@ -623,7 +617,7 @@ void ROLE(finish)() {
 void ROLE(post_out)(int8_t* out) {
   switch (ph_kind) {
 #ifndef DECODE_ATTN_ROLE
-    case kConv1: dec_conv_store(reinterpret_cast<float*>(out)); break;
+    case kConvMix: dec_conv_store(reinterpret_cast<float*>(out)); break;
 #else
     case kAttn2: {  // 8 attention-output objects, then 16 cache-entry objects
       if (att_out_k < 8) dec_attn_out(reinterpret_cast<bfloat16*>(out));

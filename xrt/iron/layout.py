@@ -13,12 +13,14 @@ ATTN_LAYERS = [l for l in range(LAYERS) if l >= 2 and l % 2 == 0]
 SWA_LAYERS = {4, 8, 12, 16, 20}
 N_ATTN = len(ATTN_LAYERS)
 CONV_LAYERS = [l for l in range(LAYERS) if l not in ATTN_LAYERS]
-PHASES = 1 + 4 * len(CONV_LAYERS) + 5 * N_ATTN + 1
+PHASES = 1 + 5 * len(CONV_LAYERS) + 5 * N_ATTN + 1
 EMB_ROW = 4 * H                   # dequantized f32 row
 QKV_ROWS = 3328                   # q 2048 | k 512 | v 512 | gate 16 | pad
 QKV_BYTES = 2 * REC               # rows f32, then q-norm and k-norm bf16
-CONV_RECS, OUT_RECS, QKV_RECS, GU_RECS, DOWN_RECS, HEAD_RECS = 128, 16, 26, 120, 64, 1000
-STATE_COL = 96 * ROWS * 32        # convolution state drained per column: [chunk][core][32]
+CONVIN_RECS, OUT_RECS, QKV_RECS, GU_RECS, DOWN_RECS, HEAD_RECS = 48, 16, 26, 120, 64, 1000
+STATE_CHUNKS, TAP_CHUNKS = 96, 112  # per conv core: 6 x 128 state f32, then 7 x 128 taps f32
+STATE_COL = (REC // 32) * ROWS * 32  # per column [chunk][core][32]: state (drained) then taps (static)
+BCX_COL = 2 * 3 * 128 * 4           # ConvIn output per column: [conv core][B | C | x][128 ch] f32
 WINDOW = 256
 CompileTimeCtx = int
 
@@ -43,6 +45,7 @@ class Layout:
         self.att = take(17 * 1024 + 512)
         self.junk = take(COLS * 4 * 32)
         self.qkv = [take(QKV_BYTES) for _ in ATTN_LAYERS]
+        self.bcx = take(COLS * BCX_COL + REC)  # the mix phase reads a whole record per conv core
         self.state = [take(COLS * STATE_COL) for _ in CONV_LAYERS]
         take(272 * 128)  # reads of the last column's state run past it
         self.rope = {kind: take((ctx + 1) * 512 + REC) for kind in ("global", "swa")}
@@ -57,7 +60,7 @@ class Layout:
                 self.w[(l, "qkv")] = take(2 * COLS * 2 * QKV_RECS * REC)
                 self.w[(l, "attn_out")] = take(2 * COLS * 2 * OUT_RECS * REC)
             else:
-                self.w[(l, "conv")] = take(COLS * 2 * CONV_RECS * REC)  # second streams only
+                self.w[(l, "conv_in")] = take(2 * COLS * 2 * CONVIN_RECS * REC)
                 self.w[(l, "conv_out")] = take(2 * COLS * 2 * OUT_RECS * REC)
             self.w[(l, "gate_up")] = take(2 * COLS * 2 * GU_RECS * REC)
             self.w[(l, "down")] = take(2 * COLS * 2 * DOWN_RECS * REC)
@@ -77,11 +80,7 @@ class Layout:
     def weights(self, name, s, records):
         n = 2 * records * REC
         base = self.w[name]
-        if name[1] == "conv":
-            assert s % 2 == 1
-            base += (s // 2) * n
-        else:
-            base += s * n
+        base += s * n
         return t(self.w_bytes, base, [1, 2 * records, REC // 512, 512], [0, REC, 512, 1])
 
     def hidden(self, offset, c):
@@ -105,15 +104,21 @@ class Layout:
             if l in CONV_LAYERS:
                 i = CONV_LAYERS.index(l)
                 st = self.state[i]
+                # ConvIn: B, C and x rows on every core; column c writes its conv cores' channels.
                 yield Phase(
-                    heads={s: [("S", self.head_records(op_in, 3))] + (
-                        [("S", t(self.s_bytes, st + (s // 2) * STATE_COL + 2 * 32, [1, 2, REC // 32, 32], [0, 32, ROWS * 32, 1]))]
-                        if s % 2 else []) for s in range(16)},
-                    stream={s: [("W", self.weights((l, "conv"), s, CONV_RECS))] for s in range(1, 16, 2)},
-                    drains=lambda c, op_in=op_in, ffn_in=ffn_in, st=st: [
+                    heads={s: [("S", self.head_records(op_in, 3))] for s in range(16)},
+                    stream={s: [("W", self.weights((l, "conv_in"), s, CONVIN_RECS))] for s in range(16)},
+                    drains=lambda c, ffn_in=ffn_in: [
                         self.hidden(ffn_in, c),
+                        t(self.s_bytes, self.bcx + c * BCX_COL, [1, 1, BCX_COL // 64, 64], [0, 0, 64, 1])])
+                # ConvMix: the conv cores' channels, state and taps; no weights.
+                yield Phase(
+                    heads={s: [("S", t(self.s_bytes, self.bcx + (s // 2) * BCX_COL, [1, 2, REC // 512, 512], [0, BCX_COL // 2, 512, 1])),
+                               ("S", t(self.s_bytes, st + (s // 2) * STATE_COL + 2 * 32, [1, 2, REC // 32, 32], [0, 32, ROWS * 32, 1]))]
+                           for s in range(1, 16, 2)},
+                    drains=lambda c, st=st: [
                         t(self.s_bytes, self.vec + c * 1024, [1, 1, 32, 32], [0, 0, 32, 1]),
-                        t(self.s_bytes, st + c * STATE_COL, [1, 1, STATE_COL // 64, 64], [0, 0, 64, 1])])
+                        t(self.s_bytes, st + c * STATE_COL, [1, 1, STATE_CHUNKS * ROWS * 32 // 64, 64], [0, 0, 64, 1])])
                 yield Phase(
                     heads={s: [("S", t(self.s_bytes, self.vec + 64, [2, 1, 136, 64], [0, 0, 128, 1]))] for s in range(16)},
                     stream={s: [("W", self.weights((l, "conv_out"), s, OUT_RECS))] for s in range(16)},

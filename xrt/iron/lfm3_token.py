@@ -138,13 +138,18 @@ def token(S: InOut, W: In, *, tok: DispatchTime[np.int32], pos: DispatchTime[np.
                     rtps[c][j][2 * i + 1] = swa_recs if swa else global_recs
                 barriers[c][j].set(1)
         for phase in lay.phases(d):
-            # Inputs first (a shim tile holds 8 tasks at once), then weights and drains.
+            # One task group per phase when every shim tile holds at most 8 tasks: the FIFO
+            # already orders a stream's inputs before its weights, so only the drains are
+            # waited on. Otherwise the inputs go first in a group of their own.
+            per_col = [sum(len(phase.heads(s)) + len(phase.stream(s)) for s in (2 * c, 2 * c + 1)) + len(phase.drains(c))
+                       for c in range(COLS)]
             tg = TaskGroup()
             for s in range(2 * COLS):
                 for (buf, t) in phase.heads(s):
-                    wh[s].fill(S if buf == "S" else W, t, wait=True, group=tg)
-            tg.finish()
-            tg = TaskGroup()
+                    wh[s].fill(S if buf == "S" else W, t, wait=max(per_col) > 8, group=tg)
+            if max(per_col) > 8:
+                tg.finish()
+                tg = TaskGroup()
             for s in range(2 * COLS):
                 for (buf, t) in phase.stream(s):
                     wh[s].fill(S if buf == "S" else W, t, group=tg)

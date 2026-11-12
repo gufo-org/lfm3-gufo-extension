@@ -31,6 +31,11 @@ def stream_pack(builder, records, streams=range(16), cores_of=lambda s: (s % 2 *
     return np.concatenate(out)
 
 
+def conv_channel(c, j, lane):
+    """Channel of conv core (c, j in {2, 3}) lane 0..127."""
+    return ((c * 8 + lane // 16) * 2 + (j - 2)) * 16 + lane % 16
+
+
 def tile4(cs, ss):
     """Four rows of H codes (int8 [4, H]) and their bf16 block scales ([4, H / 32]) as
     decode.cc's Dot4 reads them: per 32-code block two 8 x 8 tiles t [k][n] (n < 4: row n,
@@ -80,14 +85,16 @@ def pack(gguf, ctx=4096):
         else:
             ic, isc = T(p + "shortconv.in_proj.weight"); oc, osc = T(p + "shortconv.out_proj.weight")
             taps = F(p + "shortconv.conv.weight").reshape(H, 7)
-            def conv_rec(c, j, r):
-                ch = ((c * 8 + r // 16) * 2 + (j - 2)) * 16 + r % 16
-                # rows B, C, x and a fourth row carrying the taps (zero scales)
-                tap_row = np.zeros(H, np.int8)
-                tap_row[:28] = taps[ch].astype(np.float32).view(np.int8)
-                return tile4([ic[ch], ic[H + ch], ic[2 * H + ch], tap_row],
-                             [bf16(isc[ch]), bf16(isc[H + ch]), bf16(isc[2 * H + ch]), np.zeros(H // 32, np.uint16)])
-            put((l, "conv"), stream_pack(conv_rec, L.CONV_RECS, streams=range(1, 16, 2), cores_of=lambda s: (2, 3)))
+            def conv_in(c, j, r):
+                # ConvIn row l of core j drains to position p of column c's block
+                # [conv core jj][B | C | x][128 channels] (ConvMix reads it per conv core)
+                rows = []
+                for l4 in range(4 * r, 4 * r + 4):
+                    p_ = ((l4 // 8) * 4 + j) * 8 + l4 % 8
+                    jj, part, rr = p_ // 384, (p_ % 384) // 128, p_ % 128
+                    rows.append(part * H + conv_channel(c, jj + 2, rr))
+                return rows_record(ic, isc, rows)
+            put((l, "conv_in"), stream_pack(conv_in, L.CONVIN_RECS))
             put((l, "conv_out"), stream_pack(lambda c, j, r: rows_record(oc, osc, [hrow(c, j, 4 * r + i) for i in range(4)]),
                                              L.OUT_RECS))
             lw.update(inp=(ic, isc), out=(oc, osc), taps=taps)
@@ -126,6 +133,18 @@ def pack(gguf, ctx=4096):
         at = lay.qkv[i] + L.QKV_ROWS * 4
         S[at:at + 2 * D] = bf16(ref[l]["qn"]).view(np.int8)
         S[at + 2 * D:at + 4 * D] = bf16(ref[l]["kn"]).view(np.int8)
+    # conv taps after each conv core's state in its record: chunk k >= STATE_CHUNKS of
+    # [chunk][core][8 f32], f = 8 (k - STATE_CHUNKS) + e = tap * 128 + lane
+    f_ = np.arange(L.TAP_CHUNKS * 8)
+    for i, l in enumerate(L.CONV_LAYERS):
+        taps = ref[l]["taps"]
+        for c in range(COLS):
+            for j in (2, 3):
+                vals = taps[conv_channel(c, j, f_ % 128), f_ // 128].astype(np.float32).reshape(L.TAP_CHUNKS, 8)
+                at = lay.state[i] + c * L.STATE_COL + (L.STATE_CHUNKS * ROWS + j) * 32
+                for k in range(L.TAP_CHUNKS):
+                    S[at + k * ROWS * 32:at + k * ROWS * 32 + 32] = vals[k].view(np.int8)
+
     def rope_table(theta, f):
         i = np.arange(D // 2)
         inv = theta ** (-2.0 * i / D) / f

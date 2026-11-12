@@ -321,19 +321,21 @@ struct flm_lfm3 {
             st[(c * state_col + ((f / 8) * 4 + j) * 32) / 4 + f % 8] =
                 FromBf16(C[row0 + tap * conv_row + (ch / 64) * 128 + ch % 64]);
           }
-      d_s.sync(XCL_BO_SYNC_BO_TO_DEVICE, 8 * state_col, state[i]);
+      for (int c = 0; c < 8; ++c) d_s.sync(XCL_BO_SYNC_BO_TO_DEVICE, 96 * 4 * 32, state[i] + c * state_col);
     }
   }
 
   void Clear() {
     // Decode reads only cached positions, and conv states are rewritten by the next
     // prefill; a fresh decode-only start needs zero conv states.
+    // Only the state chunks (the first 96 x 4 x 32 bytes of each column): the taps follow.
     char *S = d_s.map<char *>();
-    const size_t state_col = meta("d.state_col");
-    for (int64_t off : meta.list("d.state")) {
-      std::memset(S + off, 0, 8 * state_col);
-      d_s.sync(XCL_BO_SYNC_BO_TO_DEVICE, 8 * state_col, off);
-    }
+    const size_t state_col = meta("d.state_col"), state_bytes = 96 * 4 * 32;
+    for (int64_t off : meta.list("d.state"))
+      for (int c = 0; c < 8; ++c) {
+        std::memset(S + off + c * state_col, 0, state_bytes);
+        d_s.sync(XCL_BO_SYNC_BO_TO_DEVICE, state_bytes, off + c * state_col);
+      }
     length = 0;
   }
 };
