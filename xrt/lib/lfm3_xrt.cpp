@@ -202,13 +202,24 @@ struct flm_lfm3 {
     if (dl) dlclose(dl);
   }
 
+  // Input rows of a mixed prompt: token ids >= 0, embedding rows for ids < 0.
+  const float *rows_{};
+  const float *Row(int32_t id) const { return id >= 0 ? Embedding(id) : rows_ + size_t(-id - 1) * hidden; }
+
   const float *Embedding(int id) const {
     return reinterpret_cast<const float *>(const_cast<xrt::bo &>(d_s).map<const char *>() + meta("d.emb") +
                                            size_t(id) * meta("d.emb_row"));
   }
 
-  // Decodes `id` at position `length` and appends it.
+  // Decodes `id` at position `length` and appends it. A row id (< 0) goes through
+  // the spare embedding-table row after the vocabulary, as token `vocab`.
   void Decode(int32_t id, float *logits) {
+    if (id < 0) {
+      float *spare = reinterpret_cast<float *>(d_s.map<char *>() + meta("d.emb") + size_t(vocab) * meta("d.emb_row"));
+      std::memcpy(spare, Row(id), size_t(hidden) * 4);
+      d_s.sync(XCL_BO_SYNC_BO_TO_DEVICE, size_t(hidden) * 4, meta("d.emb") + size_t(vocab) * meta("d.emb_row"));
+      id = vocab;
+    }
     if (length >= max_length) throw std::runtime_error("context is full");
     const int pos = length;
     const int first = std::max(0, pos - window + 1), cached_swa = pos - first;
@@ -237,7 +248,7 @@ struct flm_lfm3 {
     const double t0 = Now();
     uint16_t *R = p_rec.map<uint16_t *>();
     for (int t = 0; t < m; ++t) {
-      const float *e = Embedding(ids[t]);
+      const float *e = Row(ids[t]);
       uint16_t *x = R + size_t(t) * rec + hidden;
       for (int i = 0; i < hidden; ++i) x[i] = Bf16(e[i]);
     }
@@ -361,6 +372,20 @@ int flm_lfm3_prefill(flm_lfm3 *m, const int32_t *ids, int count, float *logits) 
     g_error = e.what();
     return 1;
   }
+}
+
+int flm_lfm3_prefill_mixed(flm_lfm3 *m, const int32_t *ids, const float *rows, int count, float *logits) {
+  m->rows_ = rows;
+  const int r = flm_lfm3_prefill(m, ids, count, logits);
+  m->rows_ = nullptr;
+  return r;
+}
+
+int flm_lfm3_decode_row(flm_lfm3 *m, const float *row, float *logits) {
+  m->rows_ = row;
+  const int r = flm_lfm3_decode(m, -1, logits);
+  m->rows_ = nullptr;
+  return r;
 }
 
 int flm_lfm3_decode(flm_lfm3 *m, int32_t id, float *logits) {

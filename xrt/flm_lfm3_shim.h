@@ -17,6 +17,11 @@ int flm_lfm3_vocab(const flm_lfm3* m);
 int flm_lfm3_prefill(flm_lfm3* m, const int32_t* ids, int count, float* logits);
 int flm_lfm3_decode(flm_lfm3* m, int32_t id, float* logits);
 int flm_lfm3_length(flm_lfm3* m);
+// liblfm3_xrt.so only (dlsym; absent in FastFlowLM's shim). Rows are input
+// embeddings (hidden floats each) in place of token ids, for audio and image
+// inputs: `ids[i] < 0` takes row -ids[i] - 1 of `rows`. Same contract otherwise.
+int flm_lfm3_prefill_mixed(flm_lfm3* m, const int32_t* ids, const float* rows, int count, float* logits);
+int flm_lfm3_decode_row(flm_lfm3* m, const float* row, float* logits);
 void flm_lfm3_clear(flm_lfm3* m);
 #ifdef __cplusplus
 }
