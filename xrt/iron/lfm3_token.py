@@ -56,7 +56,7 @@ def token(S: InOut, W: In, *, tok: DispatchTime[np.int32], pos: DispatchTime[np.
         k = {"next": ExternalFunction(f"{role}_next", source_file=src, arg_types=[cnt_ty, rtp_ty, np.int32, np.int32],
                                       object_file_name=obj, compile_flags=flags + extra)}
         for name, types in {"copy": [rec_ty, in_ty], "own": [rec_ty], "begin": [in_ty, q8_ty, scratch_ty],
-                            "pre_out": [in_ty, out_ty], "rec": [q8_ty, rec_ty], "flush": [out_ty],
+                            "pre_out": [in_ty, out_ty], "rec": [q8_ty, rec_ty], "flush": [out_ty, cnt_ty],
                             "finish": [], "post_out": [out_ty]}.items():
             k[name] = Kernel(f"{role}_{name}", obj, types)
         kernels[role] = k
@@ -106,7 +106,7 @@ def token(S: InOut, W: In, *, tok: DispatchTime[np.int32], pos: DispatchTime[np.
                     w = w_in.acquire(1)
                     rec(q8, w)
                     w_in.release(1)
-                flush(o)
+                flush(o, cnt)  # may set the next inner count (down projection)
                 y_out.release(1)
             finish()
             for _ in range_(cnt[5]):

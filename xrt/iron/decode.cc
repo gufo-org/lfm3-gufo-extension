@@ -225,18 +225,31 @@ void dec_gate_flush(bfloat16* out) {
   acc_n = 0;
 }
 
-// Down projection: four rows per record over one slice of I (2048, 2048, 2048,
-// 1536 codes; token_host packs them in that order), accumulated over the slices.
-int down_slice;
+// Down projection without padding: a core's 64 rows are 4 sets of 16; a set is four
+// 4-row groups of 240 blocks of I, packed (token_host) as 960 units of 136 bytes (one
+// block of tile4 codes, then the scales of each segment) in 15 records of 64 units.
+// A record holds one or two segments, each a multiple of 16 blocks.
+int down_u, down_flush;
+alignas(64) float down_acc[16];
 void dec_row(const int8_t* q8, const int8_t* w, int32_t /*k*/) {
   alignas(16) float r4[4];
-  const int q = down_slice;
-  Dot4(q8 + 2048 * q, Scales(q8, kI) + 64 * q, w, q < 3 ? 64 : 48, r4);
-  for (int r = 0; r < 4; ++r) acc_a[acc_n + r] = (q ? acc_a[acc_n + r] : 0.0f) + r4[r];
-  if (++down_slice == 4) {
-    down_slice = 0;
-    acc_n += 4;
+  const int u0 = down_u;
+  int u = u0;
+  while (u < u0 + 64) {
+    const int g = u / 240, kb = u - 240 * g;
+    const int end = (u0 + 64 < 240 * (g + 1)) ? u0 + 64 : 240 * (g + 1);
+    Dot4(q8 + 32 * kb, Scales(q8, kI) + kb, w + 136 * (u - u0), end - u, r4);
+    for (int r = 0; r < 4; ++r) down_acc[4 * g + r] = (kb ? down_acc[4 * g + r] : 0.0f) + r4[r];
+    u = end;
   }
+  down_u = u == 960 ? 0 : u;
+}
+// Rows 0..7 of a set after its first 8 records, rows 8..15 after the other 7.
+void dec_down_flush(float* out, int32_t* cnt) {
+  const int f = down_flush;
+  aie::store_v(out, aie::load_v<8>(down_acc + 8 * f));
+  down_flush ^= 1;
+  cnt[4] = f ? 16 : 14;  // records of the next flush, doubled (both cores' records stream)
 }
 
 // Four rows of H codes (out projections, head).
@@ -602,13 +615,14 @@ void ROLE(rec)(const int8_t* q8, const int8_t* w) {
   }
 }
 
-void ROLE(flush)(int8_t* out) {
+void ROLE(flush)(int8_t* out, int32_t* cnt) {
   switch (ph_kind) {
 #ifndef DECODE_ATTN_ROLE
     case kConvMix: dec_conv_flush(reinterpret_cast<bfloat16*>(out)); break;
 #endif
     case kFfn1: dec_gate_flush(reinterpret_cast<bfloat16*>(out)); break;
-    case kConvIn: case kConv2: case kAttn1: case kAttn3: case kFfn2: case kHead: dec_rows_flush(reinterpret_cast<float*>(out)); break;
+    case kFfn2: dec_down_flush(reinterpret_cast<float*>(out), cnt); break;
+    case kConvIn: case kConv2: case kAttn1: case kAttn3: case kHead: dec_rows_flush(reinterpret_cast<float*>(out)); break;
     default: aie::store_v(reinterpret_cast<float*>(out), aie::load_v<8>(zeros16)); break;
   }
 }

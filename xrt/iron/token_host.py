@@ -104,10 +104,19 @@ def pack(gguf, ctx=4096):
             return tile4([gc[a], gc[b], uc[a], uc[b]], [bf16(gs[a]), bf16(gs[b]), bf16(us[a]), bf16(us[b])])
         put((l, "gate_up"), stream_pack(gu, L.GU_RECS))
         def down(c, j, r):
-            # four rows (r // 4) over slice r % 4 of I: 2048, 2048, 2048, 1536 codes
-            rows, q = [hrow(c, j, 4 * (r // 4) + i) for i in range(4)], r % 4
-            k0, k1 = 2048 * q, min(2048 * q + 2048, I)
-            return tile4([dc[h][k0:k1] for h in rows], [bf16(ds[h][k0 // 32:k1 // 32]) for h in rows])
+            # set r // 15 of 16 rows: four 4-row groups of 240 blocks as 960 units of 136 bytes,
+            # 64 per record; a segment is tile4 codes of its blocks, then their scales
+            st, k = divmod(r, 15)
+            rows = [hrow(c, j, 16 * st + i) for i in range(16)]
+            out, u, u1 = [], 64 * k, 64 * k + 64
+            while u < u1:
+                g, kb = divmod(u, 240)
+                end = min(u1, 240 * (g + 1))
+                grp = rows[4 * g:4 * g + 4]
+                out.append(tile4([dc[h][32 * kb:32 * (kb + end - u)] for h in grp],
+                                 [bf16(ds[h][kb:kb + end - u]) for h in grp]))
+                u = end
+            return np.concatenate(out)
         put((l, "down"), stream_pack(down,
                                      L.DOWN_RECS))
         lw.update(gate=(gc, gs), up=(uc, us), down=(dc, ds), norm=F(p + "attn_norm.weight"),
