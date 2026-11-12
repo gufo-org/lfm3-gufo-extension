@@ -29,7 +29,8 @@ public:
   // Starts decoding `token` after `history` without waiting, when the library
   // supports it; the next Run of exactly that token takes its logits. The host
   // samples, scores and streams while the NPU decodes.
-  void Speculate(const void* owner, std::span<const std::uint32_t> history, std::uint32_t token);
+  void Speculate(const void* owner, std::span<const std::uint32_t> history,
+                 std::uint32_t token);
   std::uint32_t vocab() const { return vocab_; }
 
 private:
