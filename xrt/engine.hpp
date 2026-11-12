@@ -53,8 +53,12 @@ private:
   const void* owner_{};
   std::vector<std::uint32_t> resident_;  // tokens the engine context holds
   bool speculating_{};                   // resident_.back() is a started decode
+  std::size_t pending_{};                // the last pending_ of resident_ wait for a pass
+  static constexpr std::size_t kFreshPrefill = 1024;  // rows of the library's largest prefill
+  void Flush(std::span<const std::uint32_t> tokens, std::span<float> logits);
   void Prefill(std::span<const std::uint32_t> tokens, std::span<float> logits);
-  const float* rows_{};  // rows of the current RunMixed
+  const float* rows_{};       // rows of the current RunMixed
+  const float* last_rows_{};  // the latest rows a session passed (deferred rows use them)
 };
 
 }  // namespace gufo::models::lfm3::xrt

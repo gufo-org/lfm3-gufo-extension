@@ -85,7 +85,8 @@ void Engine::Prefill(std::span<const std::uint32_t> tokens, std::span<float> log
     if (rows && !api_->prefill_mixed)
       throw std::runtime_error("LFM3 XRT engine: the library takes no embedding rows");
     if (n == 1 && !resident_.empty()) {
-      rc = rows ? api_->decode_row(engine_, rows_ + std::size_t(tokens[off] - kRowBase) * hidden_, out)
+      const float* base_rows = rows_ ? rows_ : last_rows_;  // deferred rows flush later
+      rc = rows ? api_->decode_row(engine_, base_rows + std::size_t(tokens[off] - kRowBase) * hidden_, out)
                 : api_->decode(engine_, std::int32_t(tokens[off]), out);
     } else if (rows) {
       // the library's mixed form: id < 0 takes row -id - 1
@@ -93,7 +94,7 @@ void Engine::Prefill(std::span<const std::uint32_t> tokens, std::span<float> log
       for (std::size_t i = 0; i < n; ++i)
         ids[i] = tokens[off + i] >= kRowBase ? -std::int32_t(tokens[off + i] - kRowBase) - 1
                                              : std::int32_t(tokens[off + i]);
-      rc = api_->prefill_mixed(engine_, ids.data(), rows_, int(n), out);
+      rc = api_->prefill_mixed(engine_, ids.data(), rows_ ? rows_ : last_rows_, int(n), out);
     } else {
       rc = api_->prefill(engine_, reinterpret_cast<const std::int32_t*>(tokens.data() + off), int(n), out);
     }
@@ -113,6 +114,8 @@ void Engine::Speculate(const void* owner,
       !std::equal(history.begin(), history.end(), resident_.begin()) ||
       resident_.empty())
     return;
+  if (pending_)
+    Flush({}, {});
   if (api_->decode_start(engine_, std::int32_t(token)))
     return;  // a later pass replays (resident_ unchanged)
   resident_.push_back(token);
@@ -144,17 +147,42 @@ void Engine::Run(const void* owner, std::span<const std::uint32_t> history, std:
   const bool current = owner == owner_ && resident_.size() == history.size() &&
                        std::equal(history.begin(), history.end(), resident_.begin());
   if (!current) {
+    // Another history: nothing of it is on the device yet.
+    api_->clear(engine_);
+    resident_.assign(history.begin(), history.end());
+    pending_ = resident_.size();
+    owner_ = owner;
+  }
+  // Inputs that need no logits wait: the next pass that does runs them all at once.
+  if (logits.empty() && resident_.size() + tokens.size() <= kFreshPrefill) {
+    resident_.insert(resident_.end(), tokens.begin(), tokens.end());
+    pending_ += tokens.size();
+    return;
+  }
+  Flush(tokens, logits);
+}
+
+// Runs the pending inputs and `tokens`. A continuation runs on the NPU as one decode
+// step per row; when that costs more than prefilling the whole history again (a fresh
+// prefill takes up to kFreshPrefill rows), the history is prefilled again.
+void Engine::Flush(std::span<const std::uint32_t> tokens, std::span<float> logits) {
+  const std::size_t base = resident_.size() - pending_, total = resident_.size() + tokens.size();
+  std::vector<std::uint32_t> work(resident_.begin() + std::ptrdiff_t(base), resident_.end());
+  work.insert(work.end(), tokens.begin(), tokens.end());
+  pending_ = 0;
+  if (work.empty())
+    return;
+  const double prefill_ms = total <= 128 ? 62 : total <= 512 ? 125 : total <= kFreshPrefill ? 246 : 1e30;
+  if (base > 0 && work.size() > 1 && prefill_ms < 37.0 * double(work.size())) {
+    std::vector<std::uint32_t> all(resident_.begin(), resident_.end());
+    all.insert(all.end(), tokens.begin(), tokens.end());
     api_->clear(engine_);
     resident_.clear();
-    owner_ = owner;
-    if (!history.empty()) {
-      std::vector<std::uint32_t> all(history.begin(), history.end());
-      all.insert(all.end(), tokens.begin(), tokens.end());
-      Prefill(all, logits);
-      return;
-    }
+    Prefill(all, logits);
+    return;
   }
-  Prefill(tokens, logits);
+  resident_.resize(base);
+  Prefill(work, logits);
 }
 
 bool Engine::SupportsRows() const { return api_->prefill_mixed != nullptr; }
@@ -165,13 +193,15 @@ void Engine::Hidden(const void* owner, std::span<float> out) {
     throw std::runtime_error("this LFM3 XRT library exposes no hidden states");
   if (owner != owner_ || speculating_ || resident_.empty())
     throw std::runtime_error("LFM3 XRT hidden state of another pass");
+  if (pending_)
+    Flush({}, {});
   if (api_->hidden(engine_, out.data()))
     throw std::runtime_error(std::string("LFM3 XRT engine: ") + api_->last_error());
 }
 
 void Engine::RunMixed(const void* owner, std::span<const std::uint32_t> history, std::span<const std::uint32_t> inputs,
                       const float* rows, std::span<float> logits) {
-  rows_ = rows;
+  rows_ = last_rows_ = rows;
   Run(owner, history, inputs, logits);
   rows_ = nullptr;
 }
