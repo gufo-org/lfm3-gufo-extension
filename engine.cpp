@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <mutex>
@@ -13,6 +15,8 @@
 
 #include "continuation_hooks.hpp"
 #include "hip/ops.hpp"
+#include "npu/d1.hpp"
+#include "npu/engine.hpp"
 #include "upload.hpp"
 namespace gufo::models::lfm3 {
 namespace {
@@ -88,6 +92,8 @@ void Visit(Weights& w, F f) {
 }  // namespace
 struct Model::Impl {
   std::unique_ptr<core::GgufReader> reader;
+  std::unique_ptr<npu::Engine> npu;
+  std::unique_ptr<npu::Decider> decider;  // d1 on the NPU
   std::unique_ptr<Tokenizer> tokenizer;
   Weights weights;
   DeviceWeights device;
@@ -109,7 +115,8 @@ struct Model::Impl {
 Model::Model() : impl_(std::make_unique<Impl>()) {}
 Model::~Model() = default;
 std::shared_ptr<Model> Model::Load(const std::string& path, std::string* error,
-                                   std::uint32_t session_context) {
+                                   std::uint32_t session_context,
+                                   const std::string& npu_bundle) {
   try {
     auto m = std::shared_ptr<Model>(new Model);
     m->impl_->reader = core::GgufReader::OpenFile(path, error);
@@ -119,6 +126,21 @@ std::shared_ptr<Model> Model::Load(const std::string& path, std::string* error,
     if (!w)
       return nullptr;
     m->impl_->weights = *w;
+    if (!npu_bundle.empty()) {
+      const auto& c = m->impl_->weights.config;
+      m->impl_->tokenizer = Tokenizer::Load(*m->impl_->reader, error);
+      if (!m->impl_->tokenizer)
+        return nullptr;
+      if (c.decision) {
+        m->impl_->decider =
+            std::make_unique<npu::Decider>(npu_bundle, m->impl_->weights);
+        return m;
+      }
+      m->impl_->npu = npu::Engine::Open(npu_bundle, c.context, c.vocab, error);
+      if (!m->impl_->npu)
+        return nullptr;
+      return m;
+    }
     // Copy packed weights verbatim so quantization and mapped-file lifetime
     // never depend on a session; tied embeddings share one copy. The
     // tokenizer parses on this thread meanwhile.
@@ -152,6 +174,9 @@ const Config& Model::config() const {
 }
 const Tokenizer& Model::tokenizer() const {
   return *impl_->tokenizer;
+}
+bool Model::OnNpu() const {
+  return impl_->npu != nullptr || impl_->decider != nullptr;
 }
 struct Session::Impl {
   static constexpr std::size_t kChunk = Session::kPrefillChunk;
@@ -502,8 +527,102 @@ struct Session::Impl {
       }
   }
 };
-Session::Session(std::shared_ptr<Model> m, std::uint32_t context)
-    : impl_(std::make_unique<Impl>(std::move(m), context)) {}
+
+// NPU sessions: input history over the model's shared npu::Engine.
+struct Session::Npu {
+  std::shared_ptr<Model> model;
+  std::uint32_t context;
+  // Inputs so far: token ids, or npu::Engine::kRowBase + k for embedding row k
+  // of `rows`.
+  std::vector<std::uint32_t> tokens;
+  std::vector<float> rows;
+  std::vector<float> logits;
+  bool logits_ready{}, poisoned{};
+  // Final hidden state of the last row, read on demand (host memory: the
+  // audio voice runs on the host too).
+  std::vector<float> hidden;
+  bool hidden_ready{};
+  const float* Hidden() {
+    hidden.resize(model->config().hidden);
+    if (!hidden_ready) {
+      model->impl_->npu->Hidden(this, hidden);
+      hidden_ready = true;
+    }
+    return hidden.data();
+  }
+
+  Npu(std::shared_ptr<Model> m, std::uint32_t ctx)
+      : model(std::move(m)), context(ctx) {
+    logits.assign(model->config().vocab, 0.0f);
+  }
+  ~Npu() {
+    if (model->impl_->npu)
+      model->impl_->npu->Release(this);
+  }
+  void Run(std::span<const std::uint32_t> run, bool want_logits) {
+    const auto& c = model->config();
+    if (poisoned)
+      throw std::runtime_error(
+          "LFM3 session requires Reset after a device error");
+    if (run.empty() || run.size() > context - tokens.size())
+      throw std::invalid_argument(
+          "invalid LFM3 token count or context exhausted");
+    for (auto t : run)
+      if (t >= c.vocab)
+        throw std::invalid_argument("LFM3 token out of range");
+    Advance(run, want_logits);
+  }
+  // Embedding rows (hidden floats each) as inputs.
+  void RunRows(std::span<const float> r, bool want_logits) {
+    const auto H = model->config().hidden;
+    if (r.empty() || r.size() % H)
+      throw std::invalid_argument("LFM3 embedding rows must be whole");
+    const std::size_t n = r.size() / H, first = rows.size() / H;
+    if (n > context - tokens.size())
+      throw std::invalid_argument("LFM3 context exhausted");
+    rows.insert(rows.end(), r.begin(), r.end());
+    std::vector<std::uint32_t> ids(n);
+    for (std::size_t i = 0; i < n; ++i)
+      ids[i] = npu::Engine::kRowBase + std::uint32_t(first + i);
+    Advance(ids, want_logits);
+  }
+  void Advance(std::span<const std::uint32_t> run, bool want_logits) {
+    try {
+      model->impl_->npu->RunMixed(
+          this, tokens, run, rows.data(),
+          want_logits ? std::span(logits) : std::span<float>{});
+    } catch (...) {
+      poisoned = true;
+      throw;
+    }
+    tokens.insert(tokens.end(), run.begin(), run.end());
+    logits_ready = want_logits;
+    hidden_ready = false;
+  }
+  void Speculate(std::uint32_t token) {
+    if (!poisoned && tokens.size() < context)
+      model->impl_->npu->Speculate(this, tokens, token);
+  }
+  // Logits of the last row when the pass that wrote it did not ask: replay.
+  void EnsureLogits() {
+    if (logits_ready || tokens.empty())
+      return;
+    std::vector<std::uint32_t> all = std::move(tokens);
+    tokens.clear();
+    model->impl_->npu->Release(this);
+    Advance(all, true);  // rows keep their indices
+  }
+};
+[[noreturn]] void NpuUnsupported(const char* what) {
+  throw std::invalid_argument(std::string("LFM3 on the NPU does not support ") +
+                              what);
+}
+Session::Session(std::shared_ptr<Model> m, std::uint32_t context) {
+  if (m->OnNpu())
+    npu_ = std::make_unique<Npu>(std::move(m), context);
+  else
+    impl_ = std::make_unique<Impl>(std::move(m), context);
+}
 Session::~Session() {
   if (impl_)
     (void)hipStreamSynchronize(impl_->stream.value);
@@ -547,11 +666,84 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
   return ForwardDecisions(tokens, embeddings, {&prompt, 1}, vocabulary, logits,
                           error);
 }
+// d1 on the NPU: each prompt is one bidirectional prefill from position 0
+// (npu::Decider), the answer rows through the LM head on the NPU.
+bool Session::NpuDecisions(std::span<const std::uint32_t> tokens,
+                           std::span<const float> embeddings,
+                           std::span<const DecisionPrompt> prompts,
+                           std::span<const std::uint32_t> vocabulary,
+                           std::span<float> logits, std::string* error) {
+  try {
+    auto& model = *npu_->model;
+    const auto& c = model.config();
+    auto* decider = model.impl_->decider.get();
+    if (!decider)
+      throw std::invalid_argument("use the decision API for d1 models only");
+    const std::size_t H = c.hidden, columns = vocabulary.empty()
+                                                  ? c.vocab
+                                                  : vocabulary.size();
+    std::size_t rows = 0, slots = 0;
+    for (const auto& prompt : prompts)
+      rows += prompt.rows, slots += prompt.positions.size();
+    if (tokens.empty() || prompts.empty() || rows != tokens.size() ||
+        logits.size() != slots * columns ||
+        (!embeddings.empty() && embeddings.size() != tokens.size() * H))
+      throw std::invalid_argument(
+          "invalid d1 prompt, groups, slots or readout");
+    for (auto id : vocabulary)
+      if (id >= c.vocab)
+        throw std::invalid_argument("d1 vocabulary ID out of range");
+    std::size_t begin = 0, slot = 0;
+    std::vector<float> x, full;
+    for (const auto& prompt : prompts) {
+      const auto& g = prompt.groups;
+      const auto& p = prompt.positions;
+      if (!prompt.rows || p.empty() || p.size() > prompt.rows ||
+          (!g.empty() && g.size() != prompt.rows))
+        throw std::invalid_argument(
+            "invalid d1 prompt, groups, slots or readout");
+      for (std::size_t i = 0; i < p.size(); ++i)
+        if (p[i] >= prompt.rows || (i && p[i - 1] >= p[i]))
+          throw std::invalid_argument(
+              "d1 slots must be increasing prompt positions");
+      // a lone question sees the entire prompt (as the GPU path)
+      const bool packed = std::any_of(g.begin(), g.end(), [&](auto group) {
+        return group > 0 && group != g.back();
+      });
+      x.resize(prompt.rows * H);
+      for (std::size_t r = 0; r < prompt.rows; ++r) {
+        if (!embeddings.empty()) {
+          std::copy_n(embeddings.data() + (begin + r) * H, H, x.data() + r * H);
+        } else {
+          if (tokens[begin + r] >= c.vocab)
+            throw std::invalid_argument("d1 token out of range");
+          DecodeRow(model.impl_->weights.embedding, tokens[begin + r],
+                    std::span(x).subspan(r * H, H));
+        }
+      }
+      full.resize(p.size() * c.vocab);
+      decider->Decide(x, std::uint32_t(prompt.rows),
+                      packed ? g : std::span<const std::int32_t>{}, p, full);
+      for (std::size_t i = 0; i < p.size(); ++i, ++slot)
+        for (std::size_t j = 0; j < columns; ++j)
+          logits[slot * columns + j] =
+              full[i * c.vocab + (vocabulary.empty() ? j : vocabulary[j])];
+      begin += prompt.rows;
+    }
+    return true;
+  } catch (const std::exception& e) {
+    if (error)
+      *error = e.what();
+    return false;
+  }
+}
 bool Session::ForwardDecisions(std::span<const std::uint32_t> tokens,
                                std::span<const float> embeddings,
                                std::span<const DecisionPrompt> prompts,
                                std::span<const std::uint32_t> vocabulary,
                                std::span<float> logits, std::string* error) {
+  if (npu_)
+    return NpuDecisions(tokens, embeddings, prompts, vocabulary, logits, error);
   try {
     const auto& c = impl_->model->config();
     const auto columns = vocabulary.empty() ? c.vocab : vocabulary.size();
@@ -684,8 +876,29 @@ bool Session::ForwardDecisions(std::span<const std::uint32_t> tokens,
     return false;
   }
 }
+void Session::Speculate(std::uint32_t token) {
+  if (npu_)
+    npu_->Speculate(token);
+}
 bool Session::Forward(std::span<const std::uint32_t> tokens,
                       std::span<float> logits, std::string* error) {
+  if (npu_) {
+    try {
+      if (!logits.empty() && logits.size() != npu_->logits.size())
+        throw std::invalid_argument("invalid LFM3 logit count");
+      if (hooks_)
+        hooks_->BeforeWrite(Position(),
+                            Position() + std::uint32_t(tokens.size()));
+      npu_->Run(tokens, !logits.empty());
+      if (!logits.empty())
+        std::copy(npu_->logits.begin(), npu_->logits.end(), logits.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   try {
     const auto& c = impl_->model->config();
     if (c.decision)
@@ -726,6 +939,26 @@ bool Session::Forward(std::span<const std::uint32_t> tokens,
 }
 bool Session::ForwardEmbeddings(std::span<const float> rows, bool on_device,
                                 std::span<float> logits, std::string* error) {
+  if (npu_) {
+    try {
+      // NPU sessions take host rows (callers keep rows on the host for this
+      // backbone).
+      (void)on_device;
+      if (hooks_)
+        hooks_->BeforeWrite(
+            Position(),
+            Position() +
+                std::uint32_t(rows.size() / npu_->model->config().hidden));
+      npu_->RunRows(rows, !logits.empty());
+      if (!logits.empty())
+        std::copy(npu_->logits.begin(), npu_->logits.end(), logits.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   try {
     const auto& c = impl_->model->config();
     if (c.decision)
@@ -762,6 +995,42 @@ bool Session::ForwardEmbeddings(std::span<const float> rows, bool on_device,
 }
 bool Session::ForwardInputs(std::span<const Input> inputs,
                             std::span<float> logits, std::string* error) {
+  if (npu_) {
+    // One mixed prefill: token ids and embedding rows (host) in prompt order.
+    try {
+      auto& x = *npu_;
+      const auto& c = x.model->config();
+      std::vector<std::uint32_t> all;
+      for (const auto& input : inputs) {
+        for (auto t : input.tokens)
+          if (t >= c.vocab)
+            throw std::invalid_argument("LFM3 token out of range");
+        all.insert(all.end(), input.tokens.begin(), input.tokens.end());
+        if (!input.rows.empty()) {
+          if (input.rows.size() % c.hidden)
+            throw std::invalid_argument("LFM3 embedding rows must be whole");
+          const std::size_t first = x.rows.size() / c.hidden,
+                            n = input.rows.size() / c.hidden;
+          x.rows.insert(x.rows.end(), input.rows.begin(), input.rows.end());
+          for (std::size_t i = 0; i < n; ++i)
+            all.push_back(npu::Engine::kRowBase + std::uint32_t(first + i));
+        }
+      }
+      if (all.empty() || all.size() > x.context - x.tokens.size())
+        throw std::invalid_argument(
+            "invalid LFM3 input count or context exhausted");
+      if (hooks_)
+        hooks_->BeforeWrite(Position(), Position() + std::uint32_t(all.size()));
+      x.Advance(all, !logits.empty());
+      if (!logits.empty())
+        std::copy(x.logits.begin(), x.logits.end(), logits.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   try {
     auto& d = *impl_;
     const auto& w = d.model->impl_->weights;
@@ -850,6 +1119,19 @@ bool Session::ForwardInputs(std::span<const Input> inputs,
   }
 }
 bool Session::ReadHidden(std::span<float> hidden, std::string* error) const {
+  if (npu_) {
+    try {
+      const auto* h = npu_->Hidden();
+      std::copy_n(
+          h, std::min<std::size_t>(hidden.size(), npu_->model->config().hidden),
+          hidden.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   try {
     if (impl_->poisoned || !impl_->position ||
         hidden.size() != impl_->model->config().hidden)
@@ -864,15 +1146,35 @@ bool Session::ReadHidden(std::span<float> hidden, std::string* error) const {
   }
 }
 const float* Session::DeviceHidden() const {
+  if (npu_) {
+    try {
+      return npu_->Hidden();  // host memory
+    } catch (const std::exception&) {
+      return nullptr;
+    }
+  }
   return impl_->frontier.floats();
 }
 void* Session::DeviceStream() const {
-  return impl_->stream.value;
+  return npu_ ? nullptr : impl_->stream.value;
 }
 bool Session::ForwardBatch(std::span<Session* const> sessions,
                            std::span<const std::uint32_t> tokens,
                            std::span<std::span<float>> outputs,
                            std::string* error) {
+  if (!sessions.empty() && sessions.front() && sessions.front()->npu_) {
+    // One engine context: the rows run one session after another.
+    if (outputs.size() != sessions.size() || tokens.size() != sessions.size()) {
+      if (error)
+        *error = "invalid LFM3 decode batch shape";
+      return false;
+    }
+    for (std::size_t i = 0; i < sessions.size(); ++i)
+      if (!sessions[i] ||
+          !sessions[i]->Forward(tokens.subspan(i, 1), outputs[i], error))
+        return false;
+    return true;
+  }
   try {
     if (sessions.empty() || sessions.size() > kMaxBatch ||
         tokens.size() != sessions.size() || outputs.size() != sessions.size())
@@ -917,6 +1219,32 @@ bool Session::ForwardBatchInputs(std::span<Session* const> sessions,
                                  std::span<const std::uint32_t> tokens,
                                  std::span<const float* const> rows,
                                  bool logits, std::string* error) {
+  if (!sessions.empty() && sessions.front() && sessions.front()->npu_) {
+    if (tokens.size() != sessions.size()) {
+      if (error)
+        *error = "invalid LFM3 decode batch shape";
+      return false;
+    }
+    for (std::size_t i = 0; i < sessions.size(); ++i) {
+      auto* s = sessions[i];
+      if (!s || !s->npu_)
+        return false;
+      try {
+        if (s->hooks_)
+          s->hooks_->BeforeWrite(s->Position(), s->Position() + 1);
+        if (rows.size() > i && rows[i])  // a host row in place of the token
+          s->npu_->RunRows(std::span(rows[i], s->npu_->model->config().hidden),
+                           logits);
+        else
+          s->npu_->Run(tokens.subspan(i, 1), logits);
+      } catch (const std::exception& e) {
+        if (error)
+          *error = e.what();
+        return false;
+      }
+    }
+    return true;
+  }
   try {
     if (sessions.empty() || sessions.size() > kMaxBatch ||
         tokens.size() != sessions.size() || rows.size() != sessions.size())
@@ -971,6 +1299,17 @@ bool Session::ForwardBatchInputs(std::span<Session* const> sessions,
   }
 }
 bool Session::Reset(std::string* error) {
+  if (npu_) {
+    if (hooks_)
+      hooks_->BeforeReset();
+    npu_->tokens.clear();
+    npu_->rows.clear();
+    if (npu_->model->impl_->npu)
+      npu_->model->impl_->npu->Release(npu_.get());
+    npu_->logits_ready = false;
+    npu_->poisoned = false;
+    return true;
+  }
   try {
     if (hooks_)
       hooks_->BeforeReset();
@@ -993,6 +1332,8 @@ bool Session::Reset(std::string* error) {
   }
 }
 std::uint32_t Session::Position() const {
+  if (npu_)
+    return std::uint32_t(npu_->tokens.size());
   return impl_->position;
 }
 void Session::SetContinuationHooks(ContinuationHooks* hooks) {
@@ -1000,6 +1341,8 @@ void Session::SetContinuationHooks(ContinuationHooks* hooks) {
 }
 void* Session::ContinuationData(ContinuationTensor tensor,
                                 std::size_t layer) const {
+  if (npu_)
+    NpuUnsupported("continuation rows");
   switch (tensor) {
     case ContinuationTensor::kLogits:
       return impl_->logits.data;
@@ -1015,19 +1358,29 @@ void* Session::ContinuationData(ContinuationTensor tensor,
   return nullptr;
 }
 std::uint32_t Session::RingCapacity(std::size_t layer) const {
+  if (npu_)
+    NpuUnsupported("continuation rows");
   return impl_->states[layer].capacity;
 }
 bool Session::IsCoherent() const {
+  if (npu_)
+    return !npu_->poisoned;
   return !impl_->poisoned;
 }
 void Session::PrepareLogits() {
+  if (npu_)
+    return npu_->EnsureLogits();
   impl_->EnsureLogits();
 }
 void Session::BeginRestore() {
+  if (npu_)
+    NpuUnsupported("continuation restore");
   Check(hipStreamSynchronize(impl_->stream.value));
   impl_->poisoned = true;
 }
 void Session::FinishRestore(std::uint32_t position) {
+  if (npu_)
+    NpuUnsupported("continuation restore");
   impl_->position = position;
   impl_->logits_ready = true;
   impl_->poisoned = false;
@@ -1080,9 +1433,25 @@ std::size_t StateBytes(const Config& c, std::uint32_t position) {
 }
 }  // namespace
 std::size_t Session::SnapshotBytes() const {
+  if (npu_)
+    return 0;
   return StateBytes(impl_->model->config(), impl_->position);
 }
 bool Session::ReadLogits(std::span<float> output, std::string* error) const {
+  if (npu_) {
+    try {
+      if (npu_->poisoned || npu_->tokens.empty() ||
+          output.size() != npu_->logits.size())
+        throw std::invalid_argument("invalid LFM3 logit frontier");
+      npu_->EnsureLogits();
+      std::copy(npu_->logits.begin(), npu_->logits.end(), output.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   try {
     const auto& c = impl_->model->config();
     if (impl_->poisoned || !impl_->position || output.size() != c.vocab)
@@ -1098,6 +1467,8 @@ bool Session::ReadLogits(std::span<float> output, std::string* error) const {
   }
 }
 std::vector<std::uint8_t> Session::SaveSnapshot() const {
+  if (npu_)
+    NpuUnsupported("snapshots");
   if (impl_->poisoned)
     throw std::runtime_error("cannot snapshot a poisoned LFM3 session");
   const auto& c = impl_->model->config();
@@ -1144,6 +1515,11 @@ std::vector<std::uint8_t> Session::SaveSnapshot() const {
 }
 bool Session::RestoreSnapshot(std::span<const std::uint8_t> bytes,
                               std::string* error) {
+  if (npu_) {
+    if (error)
+      *error = "LFM3 on the NPU does not support snapshots";
+    return false;
+  }
   try {
     if (hooks_)
       hooks_->BeforeRestore();

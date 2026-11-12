@@ -115,8 +115,8 @@ struct Model::Impl {
 Model::Model() : impl_(std::make_unique<Impl>()) {}
 Model::~Model() = default;
 std::unique_ptr<Model> Model::Load(const std::string& path,
-                                   const std::string& mmproj,
-                                   unsigned context) {
+                                   const std::string& mmproj, unsigned context,
+                                   const std::string& npu_bundle) {
   auto model = std::unique_ptr<Model>(new Model);
   auto& m = *model->impl_;
   std::string error;
@@ -133,11 +133,12 @@ std::unique_ptr<Model> Model::Load(const std::string& path,
     throw std::invalid_argument("decision context must be 1..16384");
   m.context = context;
   if (mmproj.empty())
-    m.text = lfm3::Model::Load(path, &error);
+    m.text = lfm3::Model::Load(path, &error, 0, npu_bundle);
   else {
     // The vision tower streams from disk beside the audio backbone.
-    auto vision = std::async(std::launch::async, Vision::Load, mmproj);
-    m.audio = lfm3_audio::Model::Load(path, mmproj, &error);
+    auto vision = std::async(std::launch::async,
+                             [&] { return Vision::Load(mmproj, npu_bundle); });
+    m.audio = lfm3_audio::Model::Load(path, mmproj, &error, npu_bundle);
     m.vision = vision.get();
   }
   if (!m.audio && !m.text)

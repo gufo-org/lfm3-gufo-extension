@@ -37,6 +37,10 @@ gufo_extension_target(
   SOURCES
     engine.cpp
     upload.cpp
+    npu/d1.cpp
+    npu/dense.cpp
+    npu/engine.cpp
+    npu/runtime.cpp
   LINK_LIBRARIES
     gufo_lfm3
     gufo_ext_runtime
@@ -73,6 +77,7 @@ gufo_extension_target(
     audio/runner.cpp
     audio/speak.cpp
     audio/provider.cpp
+    npu/stack.cpp
   LINK_LIBRARIES
     roc::hipblas
     gufo_lfm3_hip

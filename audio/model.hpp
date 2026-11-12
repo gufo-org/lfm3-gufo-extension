@@ -94,6 +94,9 @@ private:
   friend class Model;
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  // NPU mode: host state, products on the NPU; pointers are host memory.
+  struct Npu;
+  std::unique_ptr<Npu> npu_;
   explicit Voice(std::shared_ptr<Model> model);
 };
 class Model : public std::enable_shared_from_this<Model> {
@@ -101,9 +104,12 @@ public:
   static constexpr std::uint32_t kSampleRate = 16000, kOutputRate = 24000,
                                  kFrameSamples = 1920;
   ~Model();
+  // npu_bundle: run on the NPU without the GPU (the backbone through
+  // lfm3::Model::Load, the towers' products through npu::Dense).
   static std::shared_ptr<Model> Load(const std::string& backbone,
                                      const std::string& mmproj,
-                                     std::string* error = nullptr);
+                                     std::string* error = nullptr,
+                                     const std::string& npu_bundle = {});
   lfm3::Model& backbone() const;
   const lfm3::Tokenizer& tokenizer() const;
   const AudioWeights& weights() const;

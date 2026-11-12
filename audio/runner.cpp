@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "../npu/bundle.hpp"
 #include "../probe.hpp"
 #include "generation.hpp"
 #include "realtime.hpp"
@@ -46,6 +47,7 @@ constexpr std::size_t kWindowSamples = 30 * Model::kSampleRate;
 
 std::shared_ptr<Model> LoadModel(const std::string& model_root,
                                  const std::string& mmproj, std::size_t context,
+                                 const ext::ParsedOptions& options,
                                  std::string* error) {
   std::string reason;
   const auto artifacts = lfm3::FindLfm3Audio(model_root, mmproj, &reason);
@@ -59,8 +61,15 @@ std::shared_ptr<Model> LoadModel(const std::string& model_root,
     *error = "invalid LFM3-Audio context capacity";
     return nullptr;
   }
+  std::string bundle;
+  try {
+    bundle = lfm3::npu::SelectedBundle(options, artifacts->backbone);
+  } catch (const std::exception& e) {
+    *error = e.what();
+    return nullptr;
+  }
   return Model::Load(artifacts->backbone.string(), artifacts->mmproj.string(),
-                     error);
+                     error, bundle);
 }
 
 class Lfm3AsrRunner final : public ext::AsrRunner {
@@ -316,7 +325,8 @@ private:
 std::unique_ptr<ext::AsrRunner> CreateLfm3AsrRunner(
     const ext::AsrRunnerOptions& options, std::string* error) {
   auto model = LoadModel(options.model_root, options.projector_path,
-                         options.maximum_context_tokens, error);
+                         options.maximum_context_tokens,
+                         options.provider_options, error);
   if (!model)
     return nullptr;
   auto generator = Generator::Create(
@@ -330,7 +340,8 @@ std::unique_ptr<ext::AsrRunner> CreateLfm3AsrRunner(
 std::unique_ptr<ext::TtsRunner> CreateLfm3TtsRunner(
     const ext::TtsRunnerOptions& options, std::string* error) {
   auto model = LoadModel(options.model_root, options.projector_path,
-                         options.maximum_context_tokens, error);
+                         options.maximum_context_tokens,
+                         options.provider_options, error);
   if (!model)
     return nullptr;
   return std::make_unique<Lfm3TtsRunner>(

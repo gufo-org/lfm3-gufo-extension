@@ -3,6 +3,8 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <gufo/ext/experimental/ggml_dequant.hpp>
 #include <gufo/ext/gguf_identity.hpp>
 #include <mutex>
@@ -12,6 +14,8 @@
 
 #include "../audio/hip/ops.hpp"
 #include "../hip/ops.hpp"
+#include "../npu/dense.hpp"
+#include "../npu/host_ops.hpp"
 #include "../upload.hpp"
 #include "hip/ops.hpp"
 namespace gufo::models::lfm3_vl {
@@ -82,8 +86,19 @@ struct Scratch {
 }  // namespace
 struct Vision::Impl {
   // Reused by one encode at a time; concurrent encodes allocate their own.
+  // Created on the first GPU encode (none in NPU mode).
   std::mutex scratch_mutex;
-  Scratch scratch;
+  std::optional<Scratch> scratch;
+  // NPU mode (the backbone's NPU bundle): products on the NPU, the rest on
+  // the host; tensors keep their mapped host data. No GPU.
+  bool npu{};
+  std::vector<float> patch_host;
+  struct NpuBlock {
+    lfm3::npu::Dense::Matrix qkv, mix, out, gateup, down;
+  };
+  std::vector<NpuBlock> npu_blocks;
+  lfm3::npu::Dense::Matrix npu_patch, npu_proj1, npu_proj2;
+  std::vector<float> EncodeNpu(const Picture& p);
   std::string identity;
   std::once_flag identity_once;
   std::unique_ptr<core::GgufReader> reader;
@@ -133,7 +148,8 @@ struct Vision::Impl {
 };
 Vision::Vision() : impl_(std::make_unique<Impl>()) {}
 Vision::~Vision() = default;
-std::unique_ptr<Vision> Vision::Load(const std::string& path) {
+std::unique_ptr<Vision> Vision::Load(const std::string& path,
+                                     const std::string& npu_bundle) {
   auto v = std::unique_ptr<Vision>(new Vision);
   auto& m = *v->impl_;
   std::string error;
@@ -161,10 +177,20 @@ std::unique_ptr<Vision> Vision::Load(const std::string& path) {
     for (int j = 0; j < 768; ++j)
       patch[i * 768 + j] = row[j] + second[j];
   }
-  m.patch_weights = Buffer(patch.size() * 4);
-  Check(hipMemcpy(m.patch_weights.data, patch.data(), patch.size() * 4,
-                  hipMemcpyHostToDevice));
-  m.patch = {m.patch_weights.data, GgmlType::kF32, 768, 1024, patch.size() * 4};
+  m.npu = !npu_bundle.empty();
+  if (m.npu)
+    lfm3::npu::Dense::Open(npu_bundle);
+  if (m.npu) {
+    m.patch_host = patch;
+    m.patch = {m.patch_host.data(), GgmlType::kF32, 768, 1024,
+               patch.size() * 4};
+  } else {
+    m.patch_weights = Buffer(patch.size() * 4);
+    Check(hipMemcpy(m.patch_weights.data, patch.data(), patch.size() * 4,
+                    hipMemcpyHostToDevice));
+    m.patch = {m.patch_weights.data, GgmlType::kF32, 768, 1024,
+               patch.size() * 4};
+  }
   m.norm = m.Norm("v.embedding_norm.weight", 1024);
   for (int i = 0; i < 14; ++i) {
     const auto prefix = "v.blk." + std::to_string(i) + ".";
@@ -196,12 +222,43 @@ std::unique_ptr<Vision> Vision::Load(const std::string& path) {
   m.bias1 = m.Norm("mm.0.bias", 4096);
   m.proj2 = m.Get("mm.2.weight", 4096, 2048);
   m.bias2 = m.Norm("mm.2.bias", 2048);
+  if (m.npu) {
+    auto& dense = lfm3::npu::Dense::Shared();
+    m.npu_patch =
+        dense.Upload(1024, 768, [&](std::uint32_t r, std::span<float> out) {
+          std::copy_n(m.patch_host.data() + std::size_t(r) * 768, 768,
+                      out.begin());
+        });
+    for (const auto& b : m.blocks) {
+      Impl::NpuBlock nb;
+      if (b.q.data) {
+        const Tensor* qkv[] = {&b.q, &b.k, &b.v};
+        nb.qkv = dense.Upload(qkv);
+      } else {
+        const Tensor* in[] = {&b.in};
+        nb.mix = dense.Upload(in);
+      }
+      const Tensor* out[] = {&b.out};
+      const Tensor* gateup[] = {&b.gate, &b.up};
+      const Tensor* down[] = {&b.down};
+      nb.out = dense.Upload(out);
+      nb.gateup = dense.Upload(gateup);
+      nb.down = dense.Upload(down);
+      m.npu_blocks.push_back(nb);
+    }
+    const Tensor* p1[] = {&m.proj1};
+    const Tensor* p2[] = {&m.proj2};
+    m.npu_proj1 = dense.Upload(p1);
+    m.npu_proj2 = dense.Upload(p2);
+    return v;
+  }
   m.device.Upload(r);
   m.Visit([&](Tensor& t) { m.device.Resolve(t); });
   return v;
 }
 std::shared_ptr<Vision> LoadMatchingVision(const std::string& backbone,
-                                           const std::string& mmproj) {
+                                           const std::string& mmproj,
+                                           const std::string& npu_bundle) {
   std::string error;
   auto reader = core::GgufReader::OpenFile(backbone, &error);
   if (!reader)
@@ -217,7 +274,7 @@ std::shared_ptr<Vision> LoadMatchingVision(const std::string& backbone,
   if (!projector ||
       projector->GetMetadataString("general.basename") != "LFM3-VL")
     throw std::invalid_argument("--mmproj does not match the LFM3-VL backbone");
-  return Vision::Load(mmproj);
+  return Vision::Load(mmproj, npu_bundle);
 }
 const std::string& Vision::Identity() const {
   std::call_once(impl_->identity_once, [&] {
@@ -232,11 +289,14 @@ std::vector<float> Vision::Encode(const Picture& p) {
     throw std::invalid_argument("invalid LFM3 picture patches");
   const int n = p.height * p.width;
   auto& m = *impl_;
+  if (m.npu)
+    return m.EncodeNpu(p);
   std::unique_lock lock(m.scratch_mutex, std::defer_lock);
   if (std::size_t(n) <= kKeptPatches)
     (void)lock.try_lock();
   std::optional<Scratch> own;
-  auto& scratch = lock ? m.scratch : own.emplace();
+  auto& scratch =
+      lock ? (m.scratch ? *m.scratch : m.scratch.emplace()) : own.emplace();
   scratch.Reserve(n);
   const auto s = scratch.stream.s;
   auto &x = scratch.x, &z = scratch.z, &o = scratch.o, &mix = scratch.mix,
@@ -304,6 +364,103 @@ std::vector<float> Vision::Encode(const Picture& p) {
   Check(hipMemcpyAsync(out.data(), o.data, out.size() * 4,
                        hipMemcpyDeviceToHost, s));
   Check(hipStreamSynchronize(s));
+  return out;
+}
+std::vector<float> Vision::Impl::EncodeNpu(const Picture& p) {
+  namespace n = lfm3::npu;
+  auto& dense = n::Dense::Shared();
+  const std::size_t N = std::size_t(p.height) * p.width, H = 1024;
+  const int w = p.width, h = p.height;
+  // Grid position of a patch row in the 2x2-merge order, and back.
+  auto grid = [&](std::size_t row, int& y, int& x) {
+    y = int(row / 4) / (w / 2) * 2 + int(row % 4) / 2;
+    x = int(row / 4) % (w / 2) * 2 + int(row % 2);
+  };
+  auto index = [&](int y, int x) {
+    return std::size_t(((y / 2) * (w / 2) + x / 2) * 4 + (y % 2) * 2 + x % 2);
+  };
+  std::vector<float> x(N * H), z(N * H), o(N * H), a(N * H);
+  dense.Run(npu_patch, p.patches, std::uint32_t(N), x);
+  n::RmsNormRows(x.data(), N, H, F(norm), 1e-5f, x.data());
+  for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
+    const auto& b = blocks[bi];
+    const auto& nb = npu_blocks[bi];
+    n::RmsNormRows(x.data(), N, H, F(b.norm), 1e-5f, z.data());
+    if (b.q.data) {
+      constexpr std::uint32_t kHeads = 16, kKv = 8, kDim = 64, kQkv = 2048;
+      std::vector<float> qkv(N * kQkv);
+      dense.Run(nb.qkv, z, std::uint32_t(N), qkv);
+      for (std::size_t r = 0; r < N; ++r) {
+        float* q = &qkv[r * kQkv];
+        float* k = q + kHeads * kDim;
+        for (std::uint32_t hh = 0; hh < kHeads; ++hh)
+          n::RmsNorm(q + hh * kDim, kDim, F(b.qn), 1e-5f);
+        for (std::uint32_t hh = 0; hh < kKv; ++hh)
+          n::RmsNorm(k + hh * kDim, kDim, F(b.kn), 1e-5f);
+        int y, xx;
+        grid(r, y, xx);
+        for (float* v : {q, k})
+          for (std::uint32_t hh = 0; hh < (v == q ? kHeads : kKv); ++hh)
+            for (int d = 0; d < 32; ++d) {
+              const float angle =
+                  float(d < 16 ? y : xx) * std::pow(1e6f, -float(d % 16) / 16);
+              float* at = v + hh * kDim + d;
+              const float c = at[0], s = at[32];
+              at[0] = c * std::cos(angle) - s * std::sin(angle);
+              at[32] = s * std::cos(angle) + c * std::sin(angle);
+            }
+      }
+      n::Attention(
+          qkv.data(), qkv.data() + kHeads * kDim,
+          qkv.data() + kHeads * kDim + kKv * kDim, a.data(), N, kHeads, kKv,
+          kDim, [](std::size_t, std::size_t) { return true; }, nullptr, 0, kQkv,
+          kQkv);
+    } else {
+      std::vector<float> mix(N * 3 * H);
+      dense.Run(nb.mix, z, std::uint32_t(N), mix);
+      const float* wc = F(b.conv);
+      lfm3::npu::Parallel(N, [&](std::size_t r0, std::size_t r1) {
+        for (std::size_t r = r0; r < r1; ++r) {
+          int y, xx;
+          grid(r, y, xx);
+          for (std::size_t c = 0; c < H; ++c) {
+            float sum = 0;
+            for (int dy = -1; dy <= 1; ++dy)
+              for (int dx = -1; dx <= 1; ++dx)
+                if (y + dy >= 0 && y + dy < h && xx + dx >= 0 && xx + dx < w) {
+                  const std::size_t at = index(y + dy, xx + dx) * H * 3 + c;
+                  sum = std::fma(mix[at] * mix[at + 2 * H],
+                                 wc[c * 9 + (dy + 1) * 3 + dx + 1], sum);
+                }
+            a[r * H + c] = mix[r * 3 * H + H + c] * sum;
+          }
+        }
+      });
+    }
+    dense.Run(nb.out, a, std::uint32_t(N), o);
+    for (std::size_t i = 0; i < N * H; ++i)
+      x[i] += o[i];
+    n::RmsNormRows(x.data(), N, H, F(b.ffn_norm), 1e-5f, z.data());
+    std::vector<float> gu(N * 5120), act(N * 2560);
+    dense.Run(nb.gateup, z, std::uint32_t(N), gu);
+    for (std::size_t r = 0; r < N; ++r)
+      for (std::size_t i = 0; i < 2560; ++i)
+        act[r * 2560 + i] = n::Silu(gu[r * 5120 + i]) * gu[r * 5120 + 2560 + i];
+    dense.Run(nb.down, act, std::uint32_t(N), o);
+    for (std::size_t i = 0; i < N * H; ++i)
+      x[i] += o[i];
+  }
+  n::LayerNormRows(x.data(), N, H, F(proj_norm), F(proj_bias), 1e-6f, z.data());
+  const std::size_t M = N / 4;
+  std::vector<float> mix(M * 4096), out(M * 2048);
+  dense.Run(npu_proj1, z, std::uint32_t(M), mix);
+  for (std::size_t r = 0; r < M; ++r)
+    for (std::size_t i = 0; i < 4096; ++i)
+      mix[r * 4096 + i] = n::Gelu(mix[r * 4096 + i] + F(bias1)[i]);
+  dense.Run(npu_proj2, mix, std::uint32_t(M), out);
+  for (std::size_t r = 0; r < M; ++r)
+    for (std::size_t i = 0; i < 2048; ++i)
+      out[r * 2048 + i] += F(bias2)[i];
   return out;
 }
 }  // namespace gufo::models::lfm3_vl
