@@ -639,14 +639,34 @@ struct Session::Npu {
 struct Session::Xrt {
   std::shared_ptr<Model> model;
   std::uint32_t context;
+  // Inputs so far: token ids, or xrt::Engine::kRowBase + k for embedding row k of `rows`.
   std::vector<std::uint32_t> tokens;
+  std::vector<float> rows;
   std::vector<float> logits;
   bool logits_ready{}, poisoned{};
+  // Final hidden state of the last row, read on demand into pinned memory the GPU
+  // (an audio voice) can address.
+  float* hidden{};
+  bool hidden_ready{};
+  const float* Hidden() {
+    const auto H = model->config().hidden;
+    if (!hidden && hipHostMalloc(reinterpret_cast<void**>(&hidden), std::size_t(H) * 4, hipHostMallocMapped) != hipSuccess)
+      throw std::runtime_error("cannot allocate the LFM3 XRT hidden row");
+    if (!hidden_ready) {
+      model->impl_->xrt->Hidden(this, std::span(hidden, H));
+      hidden_ready = true;
+    }
+    return hidden;
+  }
 
   Xrt(std::shared_ptr<Model> m, std::uint32_t ctx) : model(std::move(m)), context(ctx) {
     logits.assign(model->config().vocab, 0.0f);
   }
-  ~Xrt() { model->impl_->xrt->Release(this); }
+  ~Xrt() {
+    model->impl_->xrt->Release(this);
+    if (hidden)
+      (void)hipHostFree(hidden);
+  }
   void Run(std::span<const std::uint32_t> run, bool want_logits) {
     const auto& c = model->config();
     if (poisoned)
@@ -656,14 +676,35 @@ struct Session::Xrt {
     for (auto t : run)
       if (t >= c.vocab)
         throw std::invalid_argument("LFM3 token out of range");
+    Advance(run, want_logits);
+  }
+  // Embedding rows (hidden floats each) as inputs.
+  void RunRows(std::span<const float> r, bool want_logits) {
+    const auto H = model->config().hidden;
+    if (r.empty() || r.size() % H)
+      throw std::invalid_argument("LFM3 embedding rows must be whole");
+    if (!model->impl_->xrt->SupportsRows())
+      throw std::invalid_argument("this LFM3 XRT library takes no embedding rows");
+    const std::size_t n = r.size() / H, first = rows.size() / H;
+    if (n > context - tokens.size())
+      throw std::invalid_argument("LFM3 context exhausted");
+    rows.insert(rows.end(), r.begin(), r.end());
+    std::vector<std::uint32_t> ids(n);
+    for (std::size_t i = 0; i < n; ++i)
+      ids[i] = xrt::Engine::kRowBase + std::uint32_t(first + i);
+    Advance(ids, want_logits);
+  }
+  void Advance(std::span<const std::uint32_t> run, bool want_logits) {
     try {
-      model->impl_->xrt->Run(this, tokens, run, want_logits ? std::span(logits) : std::span<float>{});
+      model->impl_->xrt->RunMixed(this, tokens, run, rows.data(),
+                                  want_logits ? std::span(logits) : std::span<float>{});
     } catch (...) {
       poisoned = true;
       throw;
     }
     tokens.insert(tokens.end(), run.begin(), run.end());
     logits_ready = want_logits;
+    hidden_ready = false;
   }
   void Speculate(std::uint32_t token) {
     if (!poisoned && tokens.size() < context)
@@ -676,7 +717,7 @@ struct Session::Xrt {
     std::vector<std::uint32_t> all = std::move(tokens);
     tokens.clear();
     model->impl_->xrt->Release(this);
-    Run(all, true);
+    Advance(all, true);  // rows keep their indices
   }
 };
 [[noreturn]] void XrtUnsupported(const char* what) {
@@ -995,9 +1036,20 @@ bool Session::Forward(std::span<const std::uint32_t> tokens,
 bool Session::ForwardEmbeddings(std::span<const float> rows, bool on_device,
                                 std::span<float> logits, std::string* error) {
   if (xrt_) {
-    if (error)
-      *error = "LFM3 on XRT does not support embedding rows";
-    return false;
+    try {
+      // XRT sessions take host rows (callers keep rows on the host for this backbone).
+      (void)on_device;
+      if (hooks_)
+        hooks_->BeforeWrite(Position(), Position() + std::uint32_t(rows.size() / xrt_->model->config().hidden));
+      xrt_->RunRows(rows, !logits.empty());
+      if (!logits.empty())
+        std::copy(xrt_->logits.begin(), xrt_->logits.end(), logits.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
   }
   if (npu_) {
     // NPU sessions take every row from host memory.
@@ -1059,16 +1111,38 @@ bool Session::ForwardEmbeddings(std::span<const float> rows, bool on_device,
 bool Session::ForwardInputs(std::span<const Input> inputs,
                             std::span<float> logits, std::string* error) {
   if (xrt_) {
-    std::vector<std::uint32_t> all;
-    for (const auto& input : inputs) {
-      if (!input.rows.empty()) {
-        if (error)
-          *error = "LFM3 on XRT does not support embedding rows";
-        return false;
+    // One mixed prefill: token ids and embedding rows (host) in prompt order.
+    try {
+      auto& x = *xrt_;
+      const auto& c = x.model->config();
+      std::vector<std::uint32_t> all;
+      for (const auto& input : inputs) {
+        for (auto t : input.tokens)
+          if (t >= c.vocab)
+            throw std::invalid_argument("LFM3 token out of range");
+        all.insert(all.end(), input.tokens.begin(), input.tokens.end());
+        if (!input.rows.empty()) {
+          if (input.rows.size() % c.hidden)
+            throw std::invalid_argument("LFM3 embedding rows must be whole");
+          const std::size_t first = x.rows.size() / c.hidden, n = input.rows.size() / c.hidden;
+          x.rows.insert(x.rows.end(), input.rows.begin(), input.rows.end());
+          for (std::size_t i = 0; i < n; ++i)
+            all.push_back(xrt::Engine::kRowBase + std::uint32_t(first + i));
+        }
       }
-      all.insert(all.end(), input.tokens.begin(), input.tokens.end());
+      if (all.empty() || all.size() > x.context - x.tokens.size())
+        throw std::invalid_argument("invalid LFM3 input count or context exhausted");
+      if (hooks_)
+        hooks_->BeforeWrite(Position(), Position() + std::uint32_t(all.size()));
+      x.Advance(all, !logits.empty());
+      if (!logits.empty())
+        std::copy(x.logits.begin(), x.logits.end(), logits.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
     }
-    return Forward(all, logits, error);
   }
   if (npu_) {
     try {
@@ -1194,9 +1268,15 @@ bool Session::ForwardInputs(std::span<const Input> inputs,
 }
 bool Session::ReadHidden(std::span<float> hidden, std::string* error) const {
   if (xrt_) {
-    if (error)
-      *error = "LFM3 on XRT does not expose hidden states";
-    return false;
+    try {
+      const auto* h = xrt_->Hidden();
+      std::copy_n(h, std::min<std::size_t>(hidden.size(), xrt_->model->config().hidden), hidden.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
   }
   if (npu_) {
     if (npu_->poisoned || !npu_->state.position || hidden.size() != npu_->frontier.size()) {
@@ -1221,8 +1301,13 @@ bool Session::ReadHidden(std::span<float> hidden, std::string* error) const {
   }
 }
 const float* Session::DeviceHidden() const {
-  if (xrt_)
-    return nullptr;
+  if (xrt_) {
+    try {
+      return xrt_->Hidden();  // pinned host memory, addressable by the GPU
+    } catch (const std::exception&) {
+      return nullptr;
+    }
+  }
   return npu_ ? npu_->frontier.data() : impl_->frontier.floats();
 }
 void* Session::DeviceStream() const {
@@ -1312,18 +1397,16 @@ bool Session::ForwardBatchInputs(std::span<Session* const> sessions,
       return false;
     }
     for (std::size_t i = 0; i < sessions.size(); ++i) {
-      if (rows.size() > i && rows[i]) {
-        if (error)
-          *error = "LFM3 on XRT does not support embedding rows";
-        return false;
-      }
       auto* s = sessions[i];
       if (!s || !s->xrt_)
         return false;
       try {
         if (s->hooks_)
           s->hooks_->BeforeWrite(s->Position(), s->Position() + 1);
-        s->xrt_->Run(tokens.subspan(i, 1), logits);
+        if (rows.size() > i && rows[i])  // a host row in place of the token
+          s->xrt_->RunRows(std::span(rows[i], s->xrt_->model->config().hidden), logits);
+        else
+          s->xrt_->Run(tokens.subspan(i, 1), logits);
       } catch (const std::exception& e) {
         if (error)
           *error = e.what();
@@ -1402,6 +1485,7 @@ bool Session::Reset(std::string* error) {
     if (hooks_)
       hooks_->BeforeReset();
     xrt_->tokens.clear();
+    xrt_->rows.clear();
     xrt_->model->impl_->xrt->Release(xrt_.get());
     xrt_->logits_ready = false;
     xrt_->poisoned = false;

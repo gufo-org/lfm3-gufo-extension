@@ -26,6 +26,8 @@ int flm_lfm3_decode_row(flm_lfm3* m, const float* row, float* logits);
 // logits. Any other call on the engine first waits for a started decode.
 int flm_lfm3_decode_start(flm_lfm3* m, int32_t id);
 int flm_lfm3_decode_finish(flm_lfm3* m, float* logits);
+// liblfm3_xrt.so only: final-normed hidden state (hidden floats) of the last row.
+int flm_lfm3_hidden(flm_lfm3* m, float* hidden);
 void flm_lfm3_clear(flm_lfm3* m);
 #ifdef __cplusplus
 }

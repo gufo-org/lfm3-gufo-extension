@@ -24,6 +24,15 @@ public:
   // engine and writes the last row's logits when `logits` is not empty.
   void Run(const void* owner, std::span<const std::uint32_t> history, std::span<const std::uint32_t> tokens,
            std::span<float> logits);
+  // As Run, with embedding rows among the inputs: an input id i >= kRowBase stands for
+  // row i - kRowBase of `rows` (hidden floats each, owned by the caller and kept for
+  // its history). Needs liblfm3_xrt.so's mixed entry points.
+  static constexpr std::uint32_t kRowBase = 0x80000000u;
+  void RunMixed(const void* owner, std::span<const std::uint32_t> history, std::span<const std::uint32_t> inputs,
+                const float* rows, std::span<float> logits);
+  bool SupportsRows() const;
+  // Final-normed hidden state of `owner`'s last row (hidden floats).
+  void Hidden(const void* owner, std::span<float> out);
   // Forgets `owner` so its next pass replays from the start.
   void Release(const void* owner);
   // Starts decoding `token` after `history` without waiting, when the library
@@ -39,12 +48,13 @@ private:
   std::unique_ptr<Api> api_;
   void* handle_{};
   void* engine_{};
-  std::uint32_t vocab_{}, max_prefill_{4096};
+  std::uint32_t vocab_{}, max_prefill_{4096}, hidden_{2048};
   std::mutex mutex_;
   const void* owner_{};
   std::vector<std::uint32_t> resident_;  // tokens the engine context holds
   bool speculating_{};                   // resident_.back() is a started decode
   void Prefill(std::span<const std::uint32_t> tokens, std::span<float> logits);
+  const float* rows_{};  // rows of the current RunMixed
 };
 
 }  // namespace gufo::models::lfm3::xrt

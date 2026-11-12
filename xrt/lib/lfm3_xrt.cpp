@@ -19,6 +19,7 @@
 #include <xrt/xrt_kernel.h>
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -288,6 +289,7 @@ struct flm_lfm3 {
     pending_g_ = t0 - g0;
     Prepare(pos + 1);  // on the host while the NPU runs
     ++length;
+    last_prefill_ = false;
     if (wait) Finish(logits);
   }
 
@@ -308,6 +310,36 @@ struct flm_lfm3 {
     if (Timing())
       std::fprintf(stderr, "lfm3_xrt: decode pos %d %.2f ms (instructions %.2f ms, logits %.2f ms)\n", length - 1,
                    1e3 * (t1 - pending_t0_), 1e3 * pending_g_, 1e3 * (Now() - t1));
+  }
+
+  // Final-normed hidden state of the last row: after a decode from the head phase's
+  // input block, after a prefill from the last record's xn (the norm without weight).
+  bool last_prefill_ = false;
+  void Hidden(float *out) {
+    Finish(nullptr);
+    if (!length) throw std::runtime_error("no rows yet");
+    const size_t blk = meta("d.final_block");
+    char *S = d_s.map<char *>();
+    const uint16_t *wout = reinterpret_cast<const uint16_t *>(S + blk + 10 * size_t(hidden));
+    if (last_prefill_) {
+      const uint16_t *xn = p_rec.map<const uint16_t *>() + size_t(length - 1) * rec;
+      p_rec.sync(XCL_BO_SYNC_BO_FROM_DEVICE, size_t(hidden) * 2, size_t(length - 1) * rec * 2);
+      for (int i = 0; i < hidden; ++i) out[i] = FromBf16(xn[i]) * FromBf16(wout[i]);
+      return;
+    }
+    d_s.sync(XCL_BO_SYNC_BO_FROM_DEVICE, 8 * size_t(hidden), blk);
+    const float *h = reinterpret_cast<const float *>(S + blk), *o = h + hidden;
+    const uint16_t *wpost = reinterpret_cast<const uint16_t *>(S + blk + 8 * size_t(hidden));
+    double so = 0;
+    for (int i = 0; i < hidden; ++i) so += double(o[i]) * o[i];
+    const float io = float(1.0 / std::sqrt(so / hidden + 1e-5));
+    double sx = 0;
+    for (int i = 0; i < hidden; ++i) {
+      out[i] = h[i] + o[i] * io * FromBf16(wpost[i]);
+      sx += double(out[i]) * out[i];
+    }
+    const float ix = float(1.0 / std::sqrt(sx / hidden + 1e-5));
+    for (int i = 0; i < hidden; ++i) out[i] *= ix * FromBf16(wout[i]);
   }
 
   // Prefills m <= M fresh tokens (positions 0 .. m - 1), writes the last token's
@@ -340,6 +372,7 @@ struct flm_lfm3 {
     }
     Handoff(P, m);
     const double t3 = Now();
+    last_prefill_ = true;
     if (Timing())
       std::fprintf(stderr, "lfm3_xrt: prefill %d tokens (M %d): records %.2f ms, NPU %.2f ms, handoff %.2f ms\n", m,
                    P.M, 1e3 * (t1 - t0), 1e3 * (t2 - t1), 1e3 * (t3 - t2));
@@ -480,6 +513,16 @@ int flm_lfm3_length(flm_lfm3 *m) { return m->length; }
 int flm_lfm3_decode_start(flm_lfm3 *m, int32_t id) {
   try {
     m->Decode(id, nullptr, false);
+    return 0;
+  } catch (const std::exception &e) {
+    g_error = e.what();
+    return 1;
+  }
+}
+
+int flm_lfm3_hidden(flm_lfm3 *m, float *hidden) {
+  try {
+    m->Hidden(hidden);
     return 0;
   } catch (const std::exception &e) {
     g_error = e.what();

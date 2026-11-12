@@ -25,7 +25,7 @@ def write_flat(meta, path):
     """`key value...` lines for liblfm3_xrt.so (no JSON parser there)."""
     d, p = meta["decode"], meta["prefill"]
     lines = [f"vocab {meta['vocab']}", f"hidden {meta['hidden']}", f"ctx {meta['ctx']}", f"window {meta['window']}"]
-    lines += [f"d.{k} {d[k]}" for k in ("s_bytes", "w_bytes", "logits", "emb", "emb_row", "state_col")]
+    lines += [f"d.{k} {d[k]}" for k in ("s_bytes", "w_bytes", "logits", "emb", "emb_row", "state_col", "final_block")]
     lines += [f"d.kv {' '.join(map(str, d['kv']))}", f"d.state {' '.join(map(str, d['state']))}",
               f"d.attn_layers {' '.join(map(str, d['attn_layers']))}", f"d.conv_layers {' '.join(map(str, d['conv_layers']))}"]
     lines += [f"p.{k} {p[k]}" for k in ("M", "rec", "c_size", "conv_row", "state_rows", "piece", "logits", "head_rows", "head_n")]
@@ -87,6 +87,7 @@ def main():
         "decode": {
             "s_bytes": lay.s_bytes, "w_bytes": lay.w_bytes, "logits": lay.logits, "emb": lay.emb,
             "emb_row": L.EMB_ROW, "kv": lay.kv, "state": lay.state, "state_col": L.STATE_COL,
+            "final_block": lay.block(48),  # [h f32 | o f32 | post-norm w bf16 | output-norm w bf16] of the head phase
             "attn_layers": L.ATTN_LAYERS, "conv_layers": L.CONV_LAYERS, "swa_layers": sorted(L.SWA_LAYERS),
         },
         "prefill": {

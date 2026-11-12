@@ -19,6 +19,9 @@ struct Engine::Api {
   // optional (liblfm3_xrt.so): a decode that returns at once, then its wait
   int (*decode_start)(void*, std::int32_t) = nullptr;
   int (*decode_finish)(void*, float*) = nullptr;
+  int (*prefill_mixed)(void*, const std::int32_t*, const float*, int, float*) = nullptr;
+  int (*decode_row)(void*, const float*, float*) = nullptr;
+  int (*hidden)(void*, float*) = nullptr;
 };
 
 std::unique_ptr<Engine> Engine::Open(std::uint32_t context, std::uint32_t vocab, std::string* error) {
@@ -46,6 +49,10 @@ std::unique_ptr<Engine> Engine::Open(std::uint32_t context, std::uint32_t vocab,
       !bind(a.last_error, "flm_lfm3_last_error") || !bind(a.vocab, "flm_lfm3_vocab") ||
       !bind(a.prefill, "flm_lfm3_prefill") || !bind(a.decode, "flm_lfm3_decode") || !bind(a.clear, "flm_lfm3_clear"))
     return fail("the library lacks the flm_lfm3 entry points");
+  if (!bind(a.hidden, "flm_lfm3_hidden"))
+    a.hidden = nullptr;
+  if (!bind(a.prefill_mixed, "flm_lfm3_prefill_mixed") || !bind(a.decode_row, "flm_lfm3_decode_row"))
+    a.prefill_mixed = nullptr, a.decode_row = nullptr;
   if (!bind(a.decode_start, "flm_lfm3_decode_start") ||
       !bind(a.decode_finish, "flm_lfm3_decode_finish"))
     a.decode_start = nullptr, a.decode_finish = nullptr;
@@ -73,10 +80,23 @@ void Engine::Prefill(std::span<const std::uint32_t> tokens, std::span<float> log
     const std::size_t n = last_chunk ? tokens.size() - off : max_prefill_;
     float* out = last_chunk && !logits.empty() ? logits.data() : nullptr;
     int rc;
-    if (n == 1 && !resident_.empty())
-      rc = api_->decode(engine_, std::int32_t(tokens[off]), out);
-    else
+    const bool rows =
+        std::any_of(tokens.begin() + off, tokens.begin() + off + n, [](std::uint32_t t) { return t >= kRowBase; });
+    if (rows && !api_->prefill_mixed)
+      throw std::runtime_error("LFM3 XRT engine: the library takes no embedding rows");
+    if (n == 1 && !resident_.empty()) {
+      rc = rows ? api_->decode_row(engine_, rows_ + std::size_t(tokens[off] - kRowBase) * hidden_, out)
+                : api_->decode(engine_, std::int32_t(tokens[off]), out);
+    } else if (rows) {
+      // the library's mixed form: id < 0 takes row -id - 1
+      std::vector<std::int32_t> ids(n);
+      for (std::size_t i = 0; i < n; ++i)
+        ids[i] = tokens[off + i] >= kRowBase ? -std::int32_t(tokens[off + i] - kRowBase) - 1
+                                             : std::int32_t(tokens[off + i]);
+      rc = api_->prefill_mixed(engine_, ids.data(), rows_, int(n), out);
+    } else {
       rc = api_->prefill(engine_, reinterpret_cast<const std::int32_t*>(tokens.data() + off), int(n), out);
+    }
     if (rc)
       throw std::runtime_error(std::string("LFM3 XRT engine: ") + api_->last_error());
     resident_.insert(resident_.end(), tokens.begin() + off, tokens.begin() + off + n);
@@ -135,6 +155,25 @@ void Engine::Run(const void* owner, std::span<const std::uint32_t> history, std:
     }
   }
   Prefill(tokens, logits);
+}
+
+bool Engine::SupportsRows() const { return api_->prefill_mixed != nullptr; }
+
+void Engine::Hidden(const void* owner, std::span<float> out) {
+  std::lock_guard lock(mutex_);
+  if (!api_->hidden)
+    throw std::runtime_error("this LFM3 XRT library exposes no hidden states");
+  if (owner != owner_ || speculating_ || resident_.empty())
+    throw std::runtime_error("LFM3 XRT hidden state of another pass");
+  if (api_->hidden(engine_, out.data()))
+    throw std::runtime_error(std::string("LFM3 XRT engine: ") + api_->last_error());
+}
+
+void Engine::RunMixed(const void* owner, std::span<const std::uint32_t> history, std::span<const std::uint32_t> inputs,
+                      const float* rows, std::span<float> logits) {
+  rows_ = rows;
+  Run(owner, history, inputs, logits);
+  rows_ = nullptr;
 }
 
 void Engine::Release(const void* owner) {

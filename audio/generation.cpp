@@ -191,6 +191,7 @@ struct Generator::Impl {
   std::unique_ptr<Voice> voice;
   std::uint32_t context{};
   float* frame_embedding{};  // device row of backbone width (host on NPU)
+  bool pinned_row{};         // frame_embedding from hipHostMalloc (XRT backbone)
   bool host_rows{};          // NPU backbone: rows live in host memory
   // Inputs of the context in order, so Erase can recompute it: runs of
   // tokens or of embedding rows.
@@ -246,7 +247,9 @@ struct Generator::Impl {
 Generator::Generator() : impl_(std::make_unique<Impl>()) {}
 Generator::~Generator() {
   if (impl_ && impl_->frame_embedding) {
-    if (impl_->host_rows)
+    if (impl_->pinned_row)
+      (void)hipHostFree(impl_->frame_embedding);
+    else if (impl_->host_rows)
       delete[] impl_->frame_embedding;
     else
       (void)hipFree(impl_->frame_embedding);
@@ -273,8 +276,17 @@ std::unique_ptr<Generator> Generator::Create(std::shared_ptr<Model> model,
   g->impl_->voice = model->CreateVoice(error);
   if (!g->impl_->voice)
     return nullptr;
-  g->impl_->host_rows = model->backbone().OnNpu();
-  if (g->impl_->host_rows)
+  g->impl_->host_rows = model->backbone().OnNpu() || model->backbone().OnXrt();
+  g->impl_->pinned_row = model->backbone().OnXrt();  // the voice is then on the GPU (GUFO_LFM3_DEVICE=xrt)
+  if (g->impl_->pinned_row) {
+    // XRT backbone, GPU voice: one pinned row both address (unified memory).
+    if (hipHostMalloc(reinterpret_cast<void**>(&g->impl_->frame_embedding),
+                      std::size_t(model->backbone().config().hidden) * 4, hipHostMallocMapped) != hipSuccess) {
+      if (error)
+        *error = "cannot allocate frame embedding";
+      return nullptr;
+    }
+  } else if (g->impl_->host_rows)
     g->impl_->frame_embedding =
         new float[model->backbone().config().hidden]();
   else if (hipMalloc(reinterpret_cast<void**>(&g->impl_->frame_embedding),
