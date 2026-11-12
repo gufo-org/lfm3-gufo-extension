@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "lfm3",
-  "api_version": ">= 0.3.0",
+  "api_version": ">= 0.3.4",
   "version": "0.6.0",
   "depends": [],
   "platforms": ["linux"],
@@ -63,6 +63,15 @@
       "model_ids": ["d1-Omni-2B", "d1-omni-2b"],
       "target": "gufo_lfm3_d1",
       "entry": "lfm3_d1_provider_register"
+    }
+  ],
+  "options": [
+    {
+      "name": "--npu",
+      "type": "boolean",
+      "commands": ["serve", "prompt", "chat", "bench"],
+      "providers": ["lfm3", "lfm3-audio-asr", "lfm3-audio-tts"],
+      "help": "Run the LFM3 backbone on the XDNA NPU from the model's .npu bundle (npu/README.md)"
     }
   ]
 }

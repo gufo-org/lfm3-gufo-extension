@@ -101,9 +101,12 @@ public:
   static constexpr std::uint32_t kSampleRate = 16000, kOutputRate = 24000,
                                  kFrameSamples = 1920;
   ~Model();
+  // npu_bundle: run the backbone on the NPU (lfm3::Model::Load); the towers
+  // stay on the GPU.
   static std::shared_ptr<Model> Load(const std::string& backbone,
                                      const std::string& mmproj,
-                                     std::string* error = nullptr);
+                                     std::string* error = nullptr,
+                                     const std::string& npu_bundle = {});
   lfm3::Model& backbone() const;
   const lfm3::Tokenizer& tokenizer() const;
   const AudioWeights& weights() const;

@@ -15,6 +15,7 @@
 
 #include "chat_template.hpp"
 #include "continuation_adapter.hpp"
+#include "npu/bundle.hpp"
 #include "vl/prompt.hpp"
 
 namespace gufo::models::lfm3 {
@@ -131,14 +132,17 @@ public:
                              .incremental_prefill = true,
                              .final_token_advance_required = true,
                              .incremental_text_is_exact = true,
-                             .prefix_reuse = true,
-                             .partial_prefill_retention = true},
+                             // The NPU engine keeps its rows private: no
+                             // cache captures or restores.
+                             .prefix_reuse = !model_->OnNpu(),
+                             .partial_prefill_retention = !model_->OnNpu()},
             .sampling_defaults = SamplingDefaults(),
             // Each prefill pass is the engine's 512-row workspace, the
             // host's decode-active budget. A pass that short gets one layer
             // group from the host, so passes run unsplit beside decoders.
             .scheduling = TextSchedulingProfile{
-                .pass_tokens = Session::kPrefillChunk,
+                // The NPU engine prefills up to 4096 rows per call.
+                .pass_tokens = model_->OnNpu() ? 4096 : Session::kPrefillChunk,
                 .max_layer_groups = 1,
                 .max_yield_decode_width = Session::kMaxBatch}};
   }
@@ -250,7 +254,8 @@ public:
     if (offset != s.session->Position() || offset >= prompt.size())
       throw std::logic_error("LFM3 prefill frontier mismatch");
     auto count = std::min<std::size_t>(
-        {Session::kPrefillChunk, max_input_tokens, prompt.size() - offset});
+        {model_->OnNpu() ? std::size_t(4096) : Session::kPrefillChunk,
+         max_input_tokens, prompt.size() - offset});
     if (!count)
       throw std::invalid_argument("LFM3 prefill budget must be positive");
     std::string error;
@@ -301,9 +306,14 @@ public:
       s.logits_ready = true;
     }
     auto token = sampler.Sample(s.logits);
+    const bool stop = state.stop_at_eos() && model_->tokenizer().IsStop(token);
+    // On the NPU the token's decode starts now; logprobs and streaming overlap
+    // it.
+    if (!stop && model_->OnNpu())
+      s.session->Speculate(token);
     auto logprobs =
         sampling::CollectLogprobs(s.logits, token, sampler.config().logprobs);
-    if (state.stop_at_eos() && model_->tokenizer().IsStop(token))
+    if (stop)
       return {.stop = true,
               .token = token,
               .piece = {},
@@ -406,9 +416,17 @@ std::shared_ptr<ext::TextModelRunner> CreateLfm3TextRunner(
   auto loading_vision =
       std::async(std::launch::async, lfm3_vl::LoadMatchingVision,
                  options.model_path, options.vision_model_path);
+  std::string bundle;
+  try {
+    bundle = npu::SelectedBundle(options.provider_options, options.model_path);
+  } catch (const std::exception& e) {
+    if (error)
+      *error = e.what();
+    return nullptr;
+  }
   auto model = Model::Load(
       options.model_path, error,
-      options.max_context ? options.max_context : Model::kModelContext);
+      options.max_context ? options.max_context : Model::kModelContext, bundle);
   std::shared_ptr<lfm3_vl::Vision> vision;
   try {
     vision = loading_vision.get();

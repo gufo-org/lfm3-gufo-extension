@@ -191,6 +191,9 @@ struct Generator::Impl {
   std::unique_ptr<Voice> voice;
   std::uint32_t context{};
   float* frame_embedding{};  // device row of backbone width
+  // NPU backbone, GPU voice: frame_embedding is one pinned host row both
+  // address (unified memory), and the session takes host rows.
+  bool host_rows{};
   // Inputs of the context in order, so Erase can recompute it: runs of
   // tokens or of embedding rows.
   struct Run {
@@ -245,7 +248,8 @@ struct Generator::Impl {
 Generator::Generator() : impl_(std::make_unique<Impl>()) {}
 Generator::~Generator() {
   if (impl_ && impl_->frame_embedding)
-    (void)hipFree(impl_->frame_embedding);
+    (void)(impl_->host_rows ? hipHostFree(impl_->frame_embedding)
+                            : hipFree(impl_->frame_embedding));
 }
 Model& Generator::model() const {
   return *impl_->model;
@@ -268,9 +272,14 @@ std::unique_ptr<Generator> Generator::Create(std::shared_ptr<Model> model,
   g->impl_->voice = model->CreateVoice(error);
   if (!g->impl_->voice)
     return nullptr;
-  if (hipMalloc(reinterpret_cast<void**>(&g->impl_->frame_embedding),
-                std::size_t(model->backbone().config().hidden) * 4) !=
-      hipSuccess) {
+  g->impl_->host_rows = model->backbone().OnNpu();
+  const std::size_t row_bytes =
+      std::size_t(model->backbone().config().hidden) * 4;
+  if ((g->impl_->host_rows
+           ? hipHostMalloc(reinterpret_cast<void**>(&g->impl_->frame_embedding),
+                           row_bytes, hipHostMallocMapped)
+           : hipMalloc(reinterpret_cast<void**>(&g->impl_->frame_embedding),
+                       row_bytes)) != hipSuccess) {
     if (error)
       *error = "cannot allocate frame embedding";
     return nullptr;
@@ -615,12 +624,15 @@ bool Generator::Continue(const GenerateOptions& o,
             &failure));
         have_logits = false;
         // The frame embedding stays recorded for Replace.
-        if (hipMemcpyAsync(frame_row.data(), impl.frame_embedding,
-                           frame_row.size() * 4, hipMemcpyDeviceToHost,
-                           static_cast<hipStream_t>(session.DeviceStream())) !=
-                hipSuccess ||
-            hipStreamSynchronize(
-                static_cast<hipStream_t>(session.DeviceStream())) != hipSuccess)
+        if (impl.host_rows)
+          std::copy_n(impl.frame_embedding, frame_row.size(),
+                      frame_row.begin());
+        else if (hipMemcpyAsync(frame_row.data(), impl.frame_embedding,
+                                frame_row.size() * 4, hipMemcpyDeviceToHost,
+                                static_cast<hipStream_t>(
+                                    session.DeviceStream())) != hipSuccess ||
+                 hipStreamSynchronize(static_cast<hipStream_t>(
+                     session.DeviceStream())) != hipSuccess)
           throw std::runtime_error("cannot read the frame embedding");
         impl.Record(frame_row);
         impl.last_token = ids.audio_out;

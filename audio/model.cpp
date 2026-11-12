@@ -358,7 +358,8 @@ const Tokens& Model::tokens() const {
 }
 std::shared_ptr<Model> Model::Load(const std::string& backbone,
                                    const std::string& mmproj,
-                                   std::string* error) {
+                                   std::string* error,
+                                   const std::string& npu_bundle) {
   try {
     auto m = std::shared_ptr<Model>(new Model);
     auto& impl = *m->impl_;
@@ -385,7 +386,7 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
       impl.weights.Visit([&](Tensor& t) { impl.device.Resolve(t); });
       return true;
     });
-    impl.backbone = lfm3::Model::Load(backbone, error);
+    impl.backbone = lfm3::Model::Load(backbone, error, 0, npu_bundle);
     if (!impl.backbone) {
       // Report the backbone failure; the projector only waits.
       try {

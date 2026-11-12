@@ -37,6 +37,8 @@ gufo_extension_target(
   SOURCES
     engine.cpp
     upload.cpp
+    npu/engine.cpp
+    npu/runtime.cpp
   LINK_LIBRARIES
     gufo_lfm3
     gufo_ext_runtime

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "engine.hpp"
+#include "npu/bundle.hpp"
 #include "vl/prompt.hpp"
 
 namespace gufo::models::lfm3 {
@@ -42,7 +43,9 @@ int RunLfm3PromptImpl(const ext::TextPromptOptions& opt, bool interactive,
     std::string error;
     const auto load =
         load_start == Clock::time_point{} ? Clock::now() : load_start;
-    auto model = Model::Load(opt.model_path, &error);
+    auto model =
+        Model::Load(opt.model_path, &error, 0,
+                    npu::SelectedBundle(opt.provider_options, opt.model_path));
     Require(bool(model), error);
     auto vision =
         lfm3_vl::LoadMatchingVision(opt.model_path, opt.vision_model_path);
@@ -190,7 +193,9 @@ int RunLfm3Bench(const ext::TextBenchOptions& opt,
           "LFM3 bench supports C1 autoregressive timing; use lfm3_probe for "
           "logit validation");
     std::string error;
-    auto model = Model::Load(opt.model_path, &error);
+    auto model =
+        Model::Load(opt.model_path, &error, 0,
+                    npu::SelectedBundle(opt.provider_options, opt.model_path));
     Require(bool(model), error);
     auto metadata = core::GgufReader::OpenFile(opt.model_path, &error);
     Require(bool(metadata), error);
@@ -244,7 +249,12 @@ int RunLfm3Bench(const ext::TextBenchOptions& opt,
           prepare();
           auto prompt = fill(n);
           const auto start = Clock::now();
-          Require(session->Forward(prompt, {}, &error), error);
+          // The NPU defers inputs that need no logits: ask, so the pass runs.
+          Require(session->Forward(
+                      prompt,
+                      model->OnNpu() ? std::span(logits) : std::span<float>{},
+                      &error),
+                  error);
           const auto dt = Seconds(start);
           std::cout << "| " << model_name << " | pp" << n << " | " << depth
                     << " | " << r << " | " << n / dt << " | " << dt << " |\n";

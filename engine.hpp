@@ -20,13 +20,21 @@ public:
   static constexpr std::uint32_t kModelContext = ~0U;
   // A nonzero session_context (kModelContext: the model's own) allocates
   // the state of the first session of that context while weights load.
+  // npu_bundle: the directory npu/iron/bundle.py wrote for this model, to
+  // run the backbone on the NPU; empty for the GPU.
   static std::shared_ptr<Model> Load(const std::string& path,
                                      std::string* error = nullptr,
-                                     std::uint32_t session_context = 0);
+                                     std::uint32_t session_context = 0,
+                                     const std::string& npu_bundle = {});
   std::unique_ptr<Session> CreateSession(std::uint32_t context,
                                          std::string* error = nullptr);
   const Config& config() const;
   const Tokenizer& tokenizer() const;
+  // The backbone runs on the XDNA NPU (npu/engine.hpp) when Load gets an NPU
+  // bundle: sessions take tokens and embedding rows on the host, keep no
+  // continuation rows, support no snapshots or decision models, and
+  // DeviceStream is null.
+  bool OnNpu() const;
 
 private:
   Model();
@@ -73,6 +81,9 @@ public:
                         std::span<const DecisionPrompt> prompts,
                         std::span<const std::uint32_t> vocabulary,
                         std::span<float> logits, std::string* error = nullptr);
+  // Hint that `token` is the next one advanced: on the NPU its decode starts
+  // now, so host work overlaps the NPU. Correct whatever is advanced next.
+  void Speculate(std::uint32_t token);
   // Advances text tokens and optionally returns the final logits.
   // State is session-owned; device weights are shared by sessions.
   bool Forward(std::span<const std::uint32_t> tokens,
@@ -139,6 +150,8 @@ public:
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  struct Npu;
+  std::unique_ptr<Npu> npu_;
   ContinuationHooks* hooks_{};
   Session(std::shared_ptr<Model> model, std::uint32_t context);
   friend class Model;
