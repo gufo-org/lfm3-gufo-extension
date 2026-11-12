@@ -105,6 +105,54 @@ __attribute__((noinline)) float Dot(const int8_t* x, int k, const int8_t* row, c
   return aie::reduce_add(acc.to_vector<float>());
 }
 
+// Four rows of kH codes as one 4-row record (token_host.tile4): per 32-code block b
+// two 8 x 8 int8 tiles t [k][n], column n < 4 holding codes 32 b + 16 t + k of row n
+// and column n >= 4 codes 32 b + 16 t + 8 + k of row n - 4; then bf16 scales
+// [b][row]. A is x's 64 aligned bytes of blocks b, b + 1 (row m = chunk m); with
+// tile t's own accumulator, C rows 4 o + 2 t and 4 o + 2 t + 1 hold block b + o's
+// chunk partial sums at columns 0..3 and 4..7.
+alignas(64) int32_t dot4_sums[kH / 32 * 4 + 16];
+__attribute__((noinline)) void Dot4(const int8_t* x, const int8_t* w, float* out) {
+  const bfloat16* xs = reinterpret_cast<const bfloat16*>(x + kH);
+  const bfloat16* ws = reinterpret_cast<const bfloat16*>(w + 4 * kH);
+  // 512-bit loads need 64-byte alignment: one A per pair of blocks, the odd block
+  // in A rows 4..7 (C rows 4..7).
+  aie::vector<int32, 16> four = aie::zeros<int32, 16>();  // sums of 4 blocks, stored aligned
+  for (int b = 0; b < kH / 32; b += 2) {
+    const aie::vector<int8, 64> a = aie::load_v<64>(x + 32 * b);
+#pragma clang loop unroll(disable)
+    for (int o = 0; o < 2; ++o) {
+      aie::mmul<8, 8, 8, int8, int8> m0, m1;
+      m0.mul(a, aie::load_v<64>(w + 128 * (b + o)));
+      m1.mul(a, aie::load_v<64>(w + 128 * (b + o) + 64));
+      const aie::vector<int32, 16> c0 = m0.to_vector<int32>().extract<16>(2 * o);      // C rows 4 o, 4 o + 1
+      const aie::vector<int32, 16> c1 = m1.to_vector<int32>().extract<16>(2 * o + 1);  // C rows 4 o + 2, 4 o + 3
+      four = aie::shuffle_down_fill(four, aie::add(aie::add(c0, aie::shuffle_down(c0, 12)), aie::add(c1, aie::shuffle_down(c1, 12))), 4);
+    }
+    if ((b & 3) == 2) aie::store_v(dot4_sums + 4 * (b - 2), four);
+  }
+  aie::accum<accfloat, 16> acc = aie::zeros<accfloat, 16>();
+  for (int q = 0; q < kH / 32 / 16; ++q) {
+    // x scales of blocks 16 q .. 16 q + 15, each repeated for the four rows
+    const aie::vector<bfloat16, 16> v = aie::load_v<16>(xs + 16 * q);
+    const auto [z0, z1] = aie::interleave_zip(v, v, 1);
+    const auto [y0, y1] = aie::interleave_zip(z0, z0, 1);
+    const auto [y2, y3] = aie::interleave_zip(z1, z1, 1);
+    const aie::vector<bfloat16, 16> x4[4] = {y0, y1, y2, y3};
+#pragma clang loop unroll(disable)
+    for (int i = 0; i < 4; ++i) {
+      const int b0 = 16 * q + 4 * i;  // blocks b0 .. b0 + 3
+      const aie::vector<float, 16> sc = aie::mul(aie::load_v<16>(ws + 4 * b0), x4[i]).to_vector<float>();
+      acc = aie::mac(acc, aie::to_float(aie::load_v<16>(dot4_sums + 4 * b0), 0), sc);
+    }
+  }
+  // lanes 4 i + r -> row r
+  aie::vector<float, 16> a = acc.to_vector<float>();
+  a = aie::add(a, aie::shuffle_down(a, 8));
+  a = aie::add(a, aie::shuffle_down(a, 4));
+  aie::store_v(out, a.extract<4>(0));  // out is 16-byte aligned
+}
+
 alignas(64) float acc_a[16];
 alignas(64) float acc_b[16];
 alignas(64) float acc_c[16];
@@ -167,11 +215,12 @@ void dec_quant(const bfloat16* x, int8_t* q8, float* scratch, int32_t n) {
 
 // Gate rows of two channels, then their up rows.
 void dec_gate_up(const int8_t* q8, const int8_t* w) {
-  const bfloat16* s = reinterpret_cast<const bfloat16*>(w + 4 * kH);
-  for (int r = 0; r < 2; ++r) {
-    acc_a[acc_n + r] = Dot(q8, kH, w + r * kH, s + r * (kH / 32));
-    acc_b[acc_n + r] = Dot(q8, kH, w + (2 + r) * kH, s + (2 + r) * (kH / 32));
-  }
+  alignas(16) float r4[4];  // gate a, gate b, up a, up b
+  Dot4(q8, w, r4);
+  acc_a[acc_n] = r4[0];
+  acc_a[acc_n + 1] = r4[1];
+  acc_b[acc_n] = r4[2];
+  acc_b[acc_n + 1] = r4[3];
   acc_n += 2;
 }
 
@@ -197,8 +246,7 @@ void dec_row(const int8_t* q8, const int8_t* w, int32_t k) {
 
 // Four rows of H codes (out projections, head).
 void dec_rows4(const int8_t* q8, const int8_t* w) {
-  const bfloat16* s = reinterpret_cast<const bfloat16*>(w + 4 * kH);
-  for (int r = 0; r < 4; ++r) acc_a[acc_n + r] = Dot(q8, kH, w + r * kH, s + r * (kH / 32));
+  Dot4(q8, w, acc_a + acc_n);
   acc_n += 4;
 }
 
@@ -379,12 +427,22 @@ void dec_attn_finish() {
   ToBf16(att_k, att_cur, kD);
   ToBf16(att_v, att_cur + kD, kD);
   AttnRecord(reinterpret_cast<const int8_t*>(att_cur), 1);
-  const aie::vector<float, 16> half = aie::broadcast<float, 16>(0.5f);
-  aie::accum<accfloat, 16> th;
-  th.from_vector(aie::tanh<bfloat16>(aie::mul(att_gate, half).to_vector<float>()));
-  const aie::vector<float, 16> sig = aie::mul(aie::add(th.to_vector<float>(), aie::broadcast<float, 16>(1.0f)), half).to_vector<float>();
-  const aie::vector<float, 16> scale = aie::mul(aie::inv(att_l), sig).to_vector<float>();
-  for (int d = 0; d < kD; d += 16) aie::store_v(att_acc + d, aie::mul(aie::load_v<16>(att_acc + d), scale).to_vector<float>());
+  // bf16 multiplies (native; the output is bf16): sigmoid(g) = 0.5 + 0.5 tanh(g / 2)
+  const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
+  aie::accum<accfloat, 16> t;
+  t.from_vector(att_gate);
+  const aie::vector<float, 16> g2 = aie::mul(t.to_vector<bfloat16>(), half).to_vector<float>();
+  aie::accum<accfloat, 16> sig;
+  sig.from_vector(aie::broadcast<float, 16>(0.5f));
+  sig = aie::mac(sig, aie::tanh<bfloat16>(g2), half);
+  aie::accum<accfloat, 16> il;
+  il.from_vector(aie::inv(att_l));
+  const aie::vector<bfloat16, 16> scale = aie::mul(il.to_vector<bfloat16>(), sig.to_vector<bfloat16>()).to_vector<bfloat16>();
+  for (int d = 0; d < kD; d += 16) {
+    aie::accum<accfloat, 16> v;
+    v.from_vector(aie::load_v<16>(att_acc + d));
+    aie::store_v(att_acc + d, aie::mul(v.to_vector<bfloat16>(), scale).to_vector<float>());
+  }
 }
 
 // The next sixteen of this head's 128 output dims, as bf16.

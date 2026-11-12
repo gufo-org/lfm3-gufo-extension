@@ -31,10 +31,21 @@ def stream_pack(builder, records, streams=range(16), cores_of=lambda s: (s % 2 *
     return np.concatenate(out)
 
 
+def tile4(cs, ss):
+    """Four rows of H codes (int8 [4, H]) and their bf16 block scales ([4, H / 32]) as
+    decode.cc's Dot4 reads them: per 32-code block two 8 x 8 tiles t [k][n] (n < 4: row n,
+    codes 16 t + k of the block; n >= 4: row n - 4, codes 16 t + 8 + k), then scales [block][row]."""
+    c = np.asarray(cs, np.int8).reshape(4, H // 32, 2, 2, 8)        # [row][block][t][half][k]
+    t = c.transpose(1, 2, 4, 3, 0).reshape(H // 32, 2, 8, 8)         # [block][t][k][half * 4 + row]
+    return np.concatenate([t.reshape(-1), np.asarray(ss, np.uint16).T.copy().view(np.int8).reshape(-1)])
+
+
 def rows_record(codes, scales, rows):
     m = codes.shape[0]
     cs = [codes[r] if r < m else np.zeros(codes.shape[1], np.int8) for r in rows]
     ss = [bf16(scales[r]) if r < m else np.zeros(scales.shape[1], np.uint16) for r in rows]
+    if len(rows) == 4 and codes.shape[1] == H:
+        return tile4(cs, ss)
     return np.concatenate(cs + [np.concatenate(ss).view(np.int8)])
 
 
@@ -77,8 +88,7 @@ def pack(gguf, ctx=4096):
         gc, gs = T(p + "ffn_gate.weight"); uc, us = T(p + "ffn_up.weight"); dc, ds = T(p + "ffn_down.weight")
         def gu(c, j, r):
             a, b = [((c * 15 + x // 16) * 4 + j) * 16 + x % 16 for x in (2 * r, 2 * r + 1)]
-            return np.concatenate([gc[a], gc[b], uc[a], uc[b],
-                                   np.concatenate([bf16(gs[a]), bf16(gs[b]), bf16(us[a]), bf16(us[b])]).view(np.int8)])
+            return tile4([gc[a], gc[b], uc[a], uc[b]], [bf16(gs[a]), bf16(gs[b]), bf16(us[a]), bf16(us[b])])
         put((l, "gate_up"), stream_pack(gu, L.GU_RECS))
         put((l, "down"), stream_pack(lambda c, j, r: np.concatenate([dc[hrow(c, j, r)], bf16(ds[hrow(c, j, r)]).view(np.int8)]),
                                      L.DOWN_RECS))
