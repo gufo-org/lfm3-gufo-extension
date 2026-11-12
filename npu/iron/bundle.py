@@ -40,7 +40,31 @@ def write_flat(meta, path):
     Path(path).write_text("\n".join(lines) + "\n")
 
 
+def d1_main(argv):
+    """bundle.py --d1 <gguf> <out dir> <xclbin> <insts> for M = 1024, 512, 128: the
+    bidirectional prefill programs (model.py <out> d1 <M>) of a d1 decision model."""
+    gguf, out = argv[0], Path(argv[1])
+    out.mkdir(parents=True, exist_ok=True)
+    import host as PH
+    md = PH.Model(gguf)
+    E, _ = PH.pack(P.Plan(P.d1_kinds(), M=1024), md)
+    E.tofile(out / "d1_prefill_weights.bin")
+    del E
+    lines = [f"vocab {L.VOCAB}", f"hidden {L.H}", f"p.rec {P.REC}", "d1.M 1024 512 128"]
+    for i, Ms in enumerate((1024, 512, 128)):
+        plan = P.Plan(P.d1_kinds(), M=Ms)
+        _, Cs = PH.pack_scratch(plan, md)
+        Cs.tofile(out / f"d1_prefill{Ms}_scratch.bin")
+        shutil.copyfile(argv[2 + 2 * i], out / f"d1_prefill{Ms}.xclbin")
+        shutil.copyfile(argv[3 + 2 * i], out / f"d1_prefill{Ms}.insts")
+        lines += [f"d1.{Ms}.c_size {plan.c_size}", f"d1.{Ms}.meta {plan.meta}"]
+    (out / "bundle.txt").write_text("\n".join(lines) + "\n")
+    print("d1 bundle written to", out)
+
+
 def main():
+    if sys.argv[1] == "--d1":
+        return d1_main(sys.argv[2:])
     gguf, out, dxclbin, dso, pxclbin, pins0, pins512 = sys.argv[1:8]
     prefill_only = "--prefill-only" in sys.argv
     out = Path(out)

@@ -148,6 +148,11 @@ public:
   void FinishRestore(std::uint32_t position);
 
 private:
+  bool NpuDecisions(std::span<const std::uint32_t> tokens,
+                    std::span<const float> embeddings,
+                    std::span<const DecisionPrompt> prompts,
+                    std::span<const std::uint32_t> vocabulary,
+                    std::span<float> logits, std::string* error);
   struct Impl;
   std::unique_ptr<Impl> impl_;
   struct Npu;

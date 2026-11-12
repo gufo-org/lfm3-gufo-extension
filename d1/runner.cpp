@@ -3,6 +3,7 @@
 #include <exception>
 #include <utility>
 
+#include "../npu/bundle.hpp"
 #include "../probe.hpp"
 #include "model.hpp"
 
@@ -40,8 +41,10 @@ std::unique_ptr<ext::DecisionRunner> CreateD1Runner(
     return nullptr;
   }
   try {
-    auto model = Model::Load(backbone->string(), options.projector_path,
-                             unsigned(options.maximum_context_tokens));
+    auto model = Model::Load(
+        backbone->string(), options.projector_path,
+        unsigned(options.maximum_context_tokens),
+        lfm3::npu::SelectedBundle(options.provider_options, *backbone));
     return std::make_unique<D1Runner>(std::move(model),
                                       !options.projector_path.empty());
   } catch (const std::exception& e) {

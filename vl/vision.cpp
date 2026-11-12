@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <gufo/ext/experimental/ggml_dequant.hpp>
 #include <gufo/ext/gguf_identity.hpp>

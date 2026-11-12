@@ -28,6 +28,25 @@ if [ ! -f "$build/gemm/q8gemm.xclbin" ]; then
   : "${GUFO_SOURCE:?set GUFO_SOURCE to a Gufo checkout (for src/core/npu/kernels/q8gemm)}"
   (cd "$GUFO_SOURCE/src/core/npu/kernels/q8gemm" && python3 q8gemm.py "$build/gemm")
 fi
+# d1 decision models carry lfm3.decision.type in their metadata
+if head -c 8000000 "$gguf" | grep -aq "lfm3.decision.type"; then
+  d1=1
+fi
+if [ -n "${d1:-}" ]; then
+  # d1 decision models: bidirectional prefill programs, no decode
+  for m in 1024 512 128; do
+    [ -f "$build/d1_$m.xclbin" ] || (cd "$here/prefill" && python3 model.py "$build/d1_$m" d1 "$m")
+  done
+  tmp="$out.tmp"
+  rm -rf "$tmp"
+  python3 "$here/bundle.py" --d1 "$gguf" "$tmp" "$build/d1_1024.xclbin" "$build/d1_1024.bin" \
+    "$build/d1_512.xclbin" "$build/d1_512.bin" "$build/d1_128.xclbin" "$build/d1_128.bin"
+  cp -r "$build/gemm" "$tmp/gemm"
+  rm -rf "$out"
+  mv "$tmp" "$out"
+  echo "NPU bundle: $out"
+  exit 0
+fi
 # prefill programs: rows M with the LM head over the rows from `head`
 for spec in "h0 1024 0" "h512 1024 512" "s512 512 0" "s128 128 0"; do
   set -- $spec

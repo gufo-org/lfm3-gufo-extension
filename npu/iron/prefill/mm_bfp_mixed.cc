@@ -446,6 +446,13 @@ alignas(64) bfloat16 head_buf[128];
 inline int KvPos(int base, int slot, int d) { return base + (((slot >> 3) * 16 + (d >> 3)) << 6) + ((slot & 7) << 3); }
 
 int rope_kind, attn_swa, attn_round, attn_b, attn_kb, attn_k0, attn_head;
+// Bidirectional attention (attn_swa == 2, d1 prompts): the prompt length, each
+// row's question group (-1: state rows, which see and are seen by all rows; a
+// question row sees the state rows and its own group).
+// They live in the tile past the gates, which the output overwrites only at the
+// round's end (the meta object comes again every round).
+int attn_len, attn_grouped;
+constexpr int kGroups = 14336, kVis = 14848;  // bf16 slots: int8[M], int32[64]
 }  // namespace
 
 extern "C" {
@@ -538,14 +545,26 @@ void prefill_attn_round(int32_t *__restrict cnt, bfloat16 *__restrict tile, int3
     k0 = (32 * b - 255) >> 4;
     if (k0 < 0) k0 = 0;
   }
-  cnt[6] = 2 * b + 2 - k0;
+  cnt[6] = attn_swa == 2 ? 4 * PREFILL_ROUNDS : 2 * b + 2 - k0;  // bidirectional: every key block
+  cnt[10] = attn_swa == 2;
   attn_b = b;
   attn_k0 = k0;
-  attn_kb = 2 * b;  // the diagonal blocks come first, then k0 .. 2 b - 1
+  attn_kb = attn_swa == 2 ? 0 : 2 * b;  // the diagonal blocks come first, then k0 .. 2 b - 1
   attn_head = 4 * (col & 3) + part;
   float *y = F32(tile);
   for (int i = 0; i < 4096; i += 16) aie::store_v(y + i, aie::zeros<float, 16>());
   for (int i = 0; i < 256; i += 16) aie::store_v(F32(tile + kL) + i, aie::zeros<float, 16>());
+}
+
+// The round's meta object (bidirectional): int16 [length, grouped], then int8
+// groups[M] from byte 4 (-1 state rows, any other value a question group).
+void prefill_attn_meta(const bfloat16 *__restrict obj, bfloat16 *__restrict tile) {
+  const int16_t *m = reinterpret_cast<const int16_t *>(obj);
+  attn_len = m[0];
+  attn_grouped = m[1];
+  const int8_t *g = reinterpret_cast<const int8_t *>(obj) + 4;
+  int8_t *groups = reinterpret_cast<int8_t *>(tile + kGroups);
+  for (int i = 0; i < 64 * PREFILL_ROUNDS; ++i) groups[i] = g[i];
 }
 
 // Q object `which` (0..3 per round, counted here) of the round: [Q 16 x 128 | gates 16 x 16] twice; core `part` keeps object part.
@@ -575,18 +594,34 @@ void prefill_attn_kv(const bfloat16 *__restrict kv, bfloat16 *__restrict tile) {
     }
   }
   const int key0 = attn_kb * 16, q0 = attn_b * 32;
-  const bool mask = key0 + 15 > q0 || (attn_swa && key0 < q0 + 31 - 255);
-  // No running-max rescale: the round's first block (keys 32 b .. 32 b + 15) has a
-  // visible key in every row, and its row maxima stay the offset for the round.
+  const bool bidi = attn_swa == 2;
+  const int8_t *attn_groups = reinterpret_cast<const int8_t *>(tile + kGroups);
+  int32_t *attn_vis = reinterpret_cast<int32_t *>(tile + kVis);
+  // bidirectional: rows past the prompt, and other questions' rows when grouped
+  const bool mask = bidi ? (key0 + 15 >= attn_len || q0 + 31 >= attn_len || attn_grouped)
+                         : key0 + 15 > q0 || (attn_swa && key0 < q0 + 31 - 255);
+
+  // No running-max rescale: the round's first block (keys 32 b .. 32 b + 15; for
+  // bidirectional rounds keys 0 .. 15, holding the first state row every row
+  // sees) has a visible key in every row, and its row maxima stay the offset.
   // Later scores above it only make P exceed 1, far inside bf16 / f32 range.
-  const bool first = attn_kb == 2 * attn_b;
+  const bool first = attn_kb == (bidi ? 0 : 2 * attn_b);
   const aie::vector<bfloat16, 64> ones = aie::broadcast<bfloat16, 64>(1.0f);
   float *y = F32(tile);
   for (int g = 0; g < 4; ++g) {
     aie::vector<float, 64> sv[2];
+    for (int kb8 = 0; kb8 < 2; ++kb8) sv[kb8] = s[g][kb8].to_vector<float>();
     for (int kb8 = 0; kb8 < 2; ++kb8) {
-      sv[kb8] = s[g][kb8].to_vector<float>();
-      if (mask) {
+      if (mask && bidi) {
+        for (int lane = 0; lane < 64; ++lane) {
+          const int qi = q0 + 8 * g + (lane >> 3), ki = key0 + 8 * kb8 + (lane & 7);
+          const int gq = attn_groups[qi], gk = attn_groups[ki];
+          // rows past the prompt see every key (they stay finite; none sees them)
+          attn_vis[lane] = qi >= attn_len || (ki < attn_len && (gq == -1 || gk == -1 || gq == gk));
+        }
+        const aie::mask<64> drop = aie::eq(aie::load_v<64>(attn_vis), aie::zeros<int32_t, 64>());
+        sv[kb8] = aie::select(sv[kb8], aie::broadcast<float, 64>(-3e38f), drop);
+      } else if (mask) {
         // key - query = base + (lane & 7) - (lane >> 3)
         const aie::vector<int32_t, 64> diff =
             aie::add(aie::load_v<64>(kLaneDiff), aie::broadcast<int32_t, 64>(key0 - q0 + 8 * (kb8 - g)));
@@ -613,7 +648,8 @@ void prefill_attn_kv(const bfloat16 *__restrict kv, bfloat16 *__restrict tile) {
       aie::store_v(yb, acc.to_vector<float>());
     }
   }
-  attn_kb = attn_kb == 2 * attn_b + 1 ? attn_k0 : attn_kb + 1;
+  // diagonal blocks, then k0 .. 2 b - 1 (bidirectional: 0, 1, ...)
+  attn_kb = attn_kb == 2 * attn_b + 1 && !bidi ? attn_k0 : attn_kb + 1;
 }
 
 // O = Y / l * sigmoid(gate) (qkr stored the sigmoid), as 8 x 8 blocks at raw 12288 + g * 1024 + dblk * 64.

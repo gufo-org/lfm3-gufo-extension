@@ -38,6 +38,15 @@ def narrow_tiles(N):
 
 def lfm3_kinds(n=LAYERS):
     return ["swa" if l in SWA_LAYERS else "attn" if l in ATTN_LAYERS else "conv" for l in range(n)]
+
+
+def d1_kinds(n=LAYERS):
+    """d1 decision prompts: full attention bidirectional (with question groups),
+    sliding attention and convolutions causal."""
+    return ["bidi" if k == "attn" else k for k in lfm3_kinds(n)]
+
+
+META = 4608  # one B object: the prompt length and question groups of bidirectional attention
 STATE = 6
 ABLOCK = M_TILE * MTK
 
@@ -58,14 +67,16 @@ class Plan:
         if self.kinds == ["swtest"]:  # precision test: embedding norm, then layer 0's gate/up GEMM
             self.phases.append(self._gemm(H, 2 * I, "swiglu", ("rec",), ("plain", self.sw, 2 * I), (0, "gate_up")))
             self.kinds = []
+        # [length, groups[M]] as int16 words, for bidirectional attention phases
+        self.meta = self._c(META) if "bidi" in self.kinds else None
         for l, kind in enumerate(self.kinds):
-            if kind in ("attn", "swa"):
+            if kind in ("attn", "swa", "bidi"):
                 piece = self.pieces[l] = self._c(M // 16 * 4 * PIECE)
                 swa = int(kind == "swa")
                 self.phases += [
                     self._gemm(H, 4096, "plain", ("rec",), ("plain", self.qs, QKV_ROW), (l, "qkv")),
                     dict(kind="qkr", w=self._ablock((l, "qkn")), qs=self.qs, piece=piece, mode=swa),
-                    dict(kind="attn", piece=piece, ao=self.ao, mode=swa),
+                    dict(kind="attn", piece=piece, ao=self.ao, mode=2 if kind == "bidi" else swa),
                     self._gemm(H, H, "plain", ("heads", self.ao), ("o",), (l, "attn_out")),
                 ] + self._ffn(l)
                 continue

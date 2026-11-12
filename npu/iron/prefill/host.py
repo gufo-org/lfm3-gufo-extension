@@ -3,6 +3,7 @@ reference, and a pyxrt runner.
 
 Usage: host.py <xclbin> <insts> <gguf> <kinds> [tokens]
 """
+import os
 import sys
 import time
 from pathlib import Path
@@ -141,8 +142,9 @@ def rms(v, w=None):
     return v if w is None else v * w
 
 
-def reference(md, kinds, x):
-    """float32 forward of the layers; returns x after every layer."""
+def reference(md, kinds, x, groups=None):
+    """float32 forward of the layers; returns x after every layer. groups: the
+    question group of each row for "bidi" layers (-1: state rows)."""
     xs = []
     for l, kind in enumerate(kinds):
         p = f"blk.{l}."
@@ -155,7 +157,7 @@ def reference(md, kinds, x):
             conv = sum(taps[:, k] * pad[k:k + len(x)] for k in range(7))
             out = (conv * pr[:, H:2 * H]) @ md.deq(p + "shortconv.out_proj.weight").T
         else:
-            out = attention(md, l, kind, z) @ md.deq(p + "attn_output.weight").T
+            out = attention(md, l, kind, z, groups) @ md.deq(p + "attn_output.weight").T
         x = x + rms(out, md.f(p + "post_attention_norm.weight"))
         z = rms(x, md.f(p + "ffn_norm.weight"))
         g, u = z @ md.deq(p + "ffn_gate.weight").T, z @ md.deq(p + "ffn_up.weight").T
@@ -165,20 +167,23 @@ def reference(md, kinds, x):
     return xs
 
 
-def attention(md, l, kind, z):
+def attention(md, l, kind, z, groups=None):
     p = f"blk.{l}."
     n = len(z)
     q = (z @ md.deq(p + "attn_q.weight").T).reshape(n, 16, 128)
     k = (z @ md.deq(p + "attn_k.weight").T).reshape(n, 4, 128)
     v = (z @ md.deq(p + "attn_v.weight").T).reshape(n, 4, 128)
     gate = z @ md.deq(p + "attn_gate.weight").T
-    cs = rope_tables(md, n)[kind]
+    cs = rope_tables(md, n)["attn" if kind == "bidi" else kind]
     c, s = cs[:, None, :64], cs[:, None, 64:]
     rope = lambda x: np.concatenate([x[..., :64] * c - x[..., 64:] * s, x[..., 64:] * c + x[..., :64] * s], -1)
     q = rope(rms(q, md.f(p + "attn_q_norm.weight")))
     k = rope(rms(k, md.f(p + "attn_k_norm.weight")))
     t = np.arange(n)
     allowed = t[None, :] <= t[:, None]
+    if kind == "bidi":  # d1: state rows see and are seen by all, questions their own group
+        g = np.full(n, -1) if groups is None else np.asarray(groups)
+        allowed = (g[:, None] < 0) | (g[None, :] < 0) | (g[:, None] == g[None, :])
     if kind == "swa":
         allowed &= t[None, :] > t[:, None] - P.WINDOW
     a = np.zeros((n, 16, 128), np.float32)
@@ -269,7 +274,7 @@ def main():
         print(f"  y rel err {rel(Y, y):.3e}")
 
 
-if __name__ == "__main__" and sys.argv[1] not in ("debug-attn", "kl", "head"):
+if __name__ == "__main__" and sys.argv[1] not in ("debug-attn", "kl", "head", "d1"):
     main()
 
 
@@ -392,4 +397,136 @@ def head_check(argv):
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "head":
     head_check(sys.argv[2:])
+    sys.exit(0)
+
+
+def meta_block(n, groups=None):
+    """The bidirectional attention meta object: int16 [length, grouped], int8 groups[M]."""
+    m = np.zeros(P.META * 2, np.uint8)
+    m[0:2] = np.array([n], np.int16).view(np.uint8)
+    m[2:4] = np.array([int(groups is not None)], np.int16).view(np.uint8)
+    if groups is not None:
+        m[4:4 + len(groups)] = np.asarray(groups, np.int8).view(np.uint8)
+    return m.view(np.uint16)
+
+
+def d1_check(argv):
+    """host.py d1 <xclbin> <insts> <gguf> <rows> [grouped]: bidirectional prefill of
+    `rows` rows (with question groups when `grouped`) against the float32 reference."""
+    xclbin, insts, gguf, n = argv[:4]
+    n, grouped = int(n), len(argv) > 4
+    kinds = os.environ["D1_KINDS"].split(",") if os.environ.get("D1_KINDS") else P.d1_kinds()
+    md = Model(gguf)
+    plan = P.Plan(kinds, M=int(os.environ.get("PREFILL_M", "1024")))
+    E, Cs = pack(plan, md)
+    groups = None
+    if grouped:  # state rows, then four questions of equal length
+        q = (n - n // 2) // 4
+        groups = [-1] * (n - 4 * q) + sum(([i + 1] * q for i in range(4)), [])
+    emb = md.deq("token_embd.weight")
+    rng = np.random.default_rng(3)
+    x0 = np.zeros((plan.M, H), np.float32)
+    if os.environ.get("D1_ROWS"):  # a dumped prompt (GUFO_LFM3_DUMP_D1)
+        rows = np.fromfile(os.environ["D1_ROWS"], np.float32).reshape(-1, H)
+        n = len(rows)
+        big = np.linalg.norm(rows, axis=1) > 2  # the media rows
+        if os.environ.get("D1_SCALE"):
+            rows = rows * np.where(big, float(os.environ["D1_SCALE"]), 1.0)[:, None]
+        if os.environ.get("D1_REPLACE"):
+            rows[big] = emb[rng.integers(0, emb.shape[0], int(big.sum()))]
+        if os.environ.get("D1_KEEP"):  # random tokens except the rows listed
+            keep = [int(k) for k in os.environ["D1_KEEP"].split(",") if k]
+            mask = np.ones(n, bool); mask[keep] = False
+            rows[mask] = emb[rng.integers(0, emb.shape[0], int(mask.sum()))]
+        x0[:n] = from_bf16(bf16(rows)).reshape(n, H)
+    else:
+        x0[:n] = from_bf16(bf16(emb[rng.integers(0, emb.shape[0], n)])).reshape(n, H)
+    x0[n:] = x0[0]  # rows past the prompt stay finite: masked keys weigh 0, and 0 * NaN is NaN
+    md.drop()
+    if plan.meta is not None:  # after n is final (D1_ROWS sets it)
+        Cs[plan.meta:plan.meta + P.META] = meta_block(n, groups)
+    run = Runner(xclbin, insts, plan, E, Cs)
+    G, dt = run.run(x0)
+    dts = [run.run(x0)[1] for _ in range(4)]
+    print(f"d1 prefill {n} rows (M {plan.M}{', grouped' if grouped else ''}): {min(dts) * 1e3:.1f} ms")
+    bad = np.isnan(G[:, H:2 * H]).any(1)
+    if bad.any():
+        print(f"  NaN rows: {int(bad.sum())}, first {int(np.argmax(bad))}, within the prompt {int(bad[:n].sum())}")
+    xs = reference(md, kinds, x0[:n], groups)
+    rel = lambda p, q: np.linalg.norm(p - q) / np.linalg.norm(q)
+    print(f"  x rel err {rel(G[:n, H:2 * H], xs[-1]):.3e}, xn rel err {rel(G[:n, :H], rms(xs[-1])):.3e}")
+    if os.environ.get("D1_ROWS"):  # the last row's logits: NPU vs reference
+        wo = md.f("output_norm.weight")
+        ln = from_bf16(bf16(G[n - 1, :H])) * wo @ emb.T
+        lr = rms(xs[-1][n - 1], wo) @ emb.T
+        top = np.argsort(-lr)[:8]
+        if os.environ.get("D1_KINDS"):
+            if kinds[-1] in ("bidi", "attn"):  # the last layer's attention output against the reference
+                S = from_bf16(run.scratch())
+                l = len(kinds) - 1
+                z = rms(xs[-2] if len(xs) > 1 else x0[:n], md.f(f"blk.{l}.attn_norm.weight"))
+                a = attention(md, l, kinds[-1], z, groups).reshape(n, 16, 128)
+                O = S[plan.ao:plan.ao + plan.oh].reshape(16, plan.M, 128).transpose(1, 0, 2)[:n]
+                print(f"  attention out rel err {rel(O, a):.3e}")
+                pt = np.linalg.norm(O - a, axis=(1, 2)) / np.linalg.norm(a, axis=(1, 2))
+                print("  worst rows", np.argsort(pt)[-6:].tolist(), pt[np.argsort(pt)[-6:]].round(3).tolist(), "median", float(np.median(pt)))
+                print("  row 0 per head:", np.round(np.linalg.norm(O[0] - a[0], axis=1) / np.linalg.norm(a[0], axis=1), 2).tolist())
+                # score spread: max over keys minus the block-0 maximum, in log2 units
+                p_ = f"blk.{l}."
+                q = (z @ md.deq(p_ + "attn_q.weight").T).reshape(n, 16, 128)
+                k = (z @ md.deq(p_ + "attn_k.weight").T).reshape(n, 4, 128)
+                cs = rope_tables(md, n)["attn"]
+                c_, s_ = cs[:, None, :64], cs[:, None, 64:]
+                rope = lambda x: np.concatenate([x[..., :64] * c_ - x[..., 64:] * s_, x[..., 64:] * c_ + x[..., :64] * s_], -1)
+                q0_ = q
+                q = rope(rms(q, md.f(p_ + "attn_q_norm.weight"))); k = rope(rms(k, md.f(p_ + "attn_k_norm.weight")))
+                sc = np.einsum("qhd,khd->hqk", q, np.repeat(k, 4, 1)) / np.sqrt(128) * 1.4426950408889634
+                spread = sc.max(2) - sc[:, :, :16].max(2)
+                print(f"  log2 score above block 0's max: median {float(np.median(spread)):.1f}, max {float(spread.max()):.1f}")
+                Qs = S[plan.qs:plan.qs + n * P.QKV_ROW].reshape(n, P.QKV_ROW)
+                qref = z @ md.deq(f"blk.{l}.attn_q.weight").T
+                qe = np.linalg.norm(Qs[:, :2048] - qref, axis=1) / np.linalg.norm(qref, axis=1)
+                print("  qkv GEMM q rows rel err: row 0", round(float(qe[0]), 4), "rows 1..4", np.round(qe[1:5], 4).tolist(), "median", round(float(np.median(qe)), 4))
+                # qkr output: PIECE objects [16-token block][core], raw layout; q head 4 core + hl at p = hl 2304 + slot 128 + d
+                def raw(pp):
+                    R, c_ = pp >> 7, pp & 127
+                    return ((R >> 3) << 10) + ((c_ >> 3) << 6) + ((R & 7) << 3) + (c_ & 7)
+                base = plan.pieces[l]
+                qn = np.zeros((n, 16, 128), np.float32)
+                for t in range(n):
+                    for core in range(4):
+                        obj = base + ((t // 16) * 4 + core) * P.PIECE
+                        for hl in range(4):
+                            pp = hl * 2304 + (t % 16) * 128 + np.arange(128)
+                            qn[t, 4 * core + hl] = S[obj + np.array([raw(int(x)) for x in pp])]
+                qr = q / np.sqrt(128) * 1.4426950408889634
+                qe2 = np.linalg.norm(qn - qr, axis=2) / np.linalg.norm(qr, axis=2)
+                print("  qkr q per row (median over heads): row 0", round(float(np.median(qe2[0])), 3), "rows 1..4", np.round(np.median(qe2[1:5], 1), 3).tolist(), "median", round(float(np.median(qe2)), 3))
+                vv = (z @ md.deq(f"blk.{l}.attn_v.weight").T).reshape(n, 4, 128)
+                gt = z @ md.deq(f"blk.{l}.attn_gate.weight").T
+                v0 = np.repeat(vv[0], 4, 0) / (1 + np.exp(-gt[0]))[:, None]
+                print("  row 0 vs v0 (sees only itself) per head:", np.round(np.linalg.norm(O[0] - v0, axis=1) / np.linalg.norm(v0, axis=1), 2).tolist())
+                cos = lambda u, v_: float(u @ v_ / (np.linalg.norm(u) * np.linalg.norm(v_) + 1e-30))
+                pc = S[base:base + 4 * 2304 * 1]
+                for t_ in (0, 1, 2):
+                    seg = S[base + t_ * 128: base + t_ * 128 + 128]
+                    print(f"  piece[{t_}*128:+128]: cos with q[{t_}] head 0 {cos(seg, qr[t_, 0]):.3f}, with k[0] {cos(seg, k[0, 0]):.3f}, with k[{t_}] {cos(seg, k[t_, 0]):.3f}, norm {np.linalg.norm(seg):.2f} vs q {np.linalg.norm(qr[t_, 0]):.2f}")
+                print("  row 0 O[0, 0, :6]", np.round(O[0, 0, :6], 3).tolist(), "ref", np.round(a[0, 0, :6], 3).tolist())
+            return
+        print("  top reference tokens", top.tolist(), "logits ref", np.round(lr[top], 2).tolist(), "npu", np.round(ln[top], 2).tolist())
+        print(f"  last-row x rel err {rel(G[n - 1, H:2 * H], xs[-1][n - 1]):.3e}")
+        norms = np.linalg.norm(rows, axis=1)
+        err = np.linalg.norm(G[:n, H:2 * H] - xs[-1], axis=1) / np.linalg.norm(xs[-1], axis=1)
+        print("  input row norms (first, median, max):", np.round(norms[:3], 1).tolist(), float(np.median(norms)), float(norms.max()))
+        print("  input absmax per row (median, max):", float(np.median(np.abs(rows).max(1))), float(np.abs(rows).max()))
+        print("  error per row: first 8", np.round(err[:8], 3).tolist(), "median", float(np.median(err)), "last 8", np.round(err[-8:], 3).tolist())
+        for l in (0, 1, 2, 5, 11, 23):
+            print(f"   ref layer {l}: x absmax {float(np.abs(xs[l]).max()):.1f} median row norm {float(np.median(np.linalg.norm(xs[l], axis=1))):.1f}")
+    if not os.environ.get("D1_KINDS"):
+        causal = reference(md, P.lfm3_kinds(), x0[:n])
+        print(f"  (causal reference differs by {rel(causal[-1], xs[-1]):.3e})")
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "d1":
+    d1_check(sys.argv[2:])
     sys.exit(0)

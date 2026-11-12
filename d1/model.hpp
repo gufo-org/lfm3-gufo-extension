@@ -44,9 +44,11 @@ json::Value ReadAnswer(const Question& question, std::span<const float> logits);
 class Model {
 public:
   ~Model();
+  // npu_bundle: the whole model on the NPU (backbone, audio and vision towers).
   static std::unique_ptr<Model> Load(const std::string& path,
                                      const std::string& mmproj,
-                                     unsigned context = 8192);
+                                     unsigned context = 8192,
+                                     const std::string& npu_bundle = {});
   // Same request/response shape as the official GGUF /v1/systemone interface.
   // Media are data URLs or public HTTPS; filesystem paths are never read here.
   json::Value Decide(const json::Value& request);

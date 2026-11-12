@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <future>
@@ -14,6 +15,7 @@
 
 #include "continuation_hooks.hpp"
 #include "hip/ops.hpp"
+#include "npu/d1.hpp"
 #include "npu/engine.hpp"
 #include "upload.hpp"
 namespace gufo::models::lfm3 {
@@ -91,6 +93,7 @@ void Visit(Weights& w, F f) {
 struct Model::Impl {
   std::unique_ptr<core::GgufReader> reader;
   std::unique_ptr<npu::Engine> npu;
+  std::unique_ptr<npu::Decider> decider;  // d1 on the NPU
   std::unique_ptr<Tokenizer> tokenizer;
   Weights weights;
   DeviceWeights device;
@@ -125,11 +128,14 @@ std::shared_ptr<Model> Model::Load(const std::string& path, std::string* error,
     m->impl_->weights = *w;
     if (!npu_bundle.empty()) {
       const auto& c = m->impl_->weights.config;
-      if (c.decision)
-        throw std::invalid_argument("LFM3 on the NPU runs chat models only");
       m->impl_->tokenizer = Tokenizer::Load(*m->impl_->reader, error);
       if (!m->impl_->tokenizer)
         return nullptr;
+      if (c.decision) {
+        m->impl_->decider =
+            std::make_unique<npu::Decider>(npu_bundle, m->impl_->weights);
+        return m;
+      }
       m->impl_->npu = npu::Engine::Open(npu_bundle, c.context, c.vocab, error);
       if (!m->impl_->npu)
         return nullptr;
@@ -170,7 +176,7 @@ const Tokenizer& Model::tokenizer() const {
   return *impl_->tokenizer;
 }
 bool Model::OnNpu() const {
-  return impl_->npu != nullptr;
+  return impl_->npu != nullptr || impl_->decider != nullptr;
 }
 struct Session::Impl {
   static constexpr std::size_t kChunk = Session::kPrefillChunk;
@@ -549,7 +555,10 @@ struct Session::Npu {
       : model(std::move(m)), context(ctx) {
     logits.assign(model->config().vocab, 0.0f);
   }
-  ~Npu() { model->impl_->npu->Release(this); }
+  ~Npu() {
+    if (model->impl_->npu)
+      model->impl_->npu->Release(this);
+  }
   void Run(std::span<const std::uint32_t> run, bool want_logits) {
     const auto& c = model->config();
     if (poisoned)
@@ -657,11 +666,84 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
   return ForwardDecisions(tokens, embeddings, {&prompt, 1}, vocabulary, logits,
                           error);
 }
+// d1 on the NPU: each prompt is one bidirectional prefill from position 0
+// (npu::Decider), the answer rows through the LM head on the NPU.
+bool Session::NpuDecisions(std::span<const std::uint32_t> tokens,
+                           std::span<const float> embeddings,
+                           std::span<const DecisionPrompt> prompts,
+                           std::span<const std::uint32_t> vocabulary,
+                           std::span<float> logits, std::string* error) {
+  try {
+    auto& model = *npu_->model;
+    const auto& c = model.config();
+    auto* decider = model.impl_->decider.get();
+    if (!decider)
+      throw std::invalid_argument("use the decision API for d1 models only");
+    const std::size_t H = c.hidden, columns = vocabulary.empty()
+                                                  ? c.vocab
+                                                  : vocabulary.size();
+    std::size_t rows = 0, slots = 0;
+    for (const auto& prompt : prompts)
+      rows += prompt.rows, slots += prompt.positions.size();
+    if (tokens.empty() || prompts.empty() || rows != tokens.size() ||
+        logits.size() != slots * columns ||
+        (!embeddings.empty() && embeddings.size() != tokens.size() * H))
+      throw std::invalid_argument(
+          "invalid d1 prompt, groups, slots or readout");
+    for (auto id : vocabulary)
+      if (id >= c.vocab)
+        throw std::invalid_argument("d1 vocabulary ID out of range");
+    std::size_t begin = 0, slot = 0;
+    std::vector<float> x, full;
+    for (const auto& prompt : prompts) {
+      const auto& g = prompt.groups;
+      const auto& p = prompt.positions;
+      if (!prompt.rows || p.empty() || p.size() > prompt.rows ||
+          (!g.empty() && g.size() != prompt.rows))
+        throw std::invalid_argument(
+            "invalid d1 prompt, groups, slots or readout");
+      for (std::size_t i = 0; i < p.size(); ++i)
+        if (p[i] >= prompt.rows || (i && p[i - 1] >= p[i]))
+          throw std::invalid_argument(
+              "d1 slots must be increasing prompt positions");
+      // a lone question sees the entire prompt (as the GPU path)
+      const bool packed = std::any_of(g.begin(), g.end(), [&](auto group) {
+        return group > 0 && group != g.back();
+      });
+      x.resize(prompt.rows * H);
+      for (std::size_t r = 0; r < prompt.rows; ++r) {
+        if (!embeddings.empty()) {
+          std::copy_n(embeddings.data() + (begin + r) * H, H, x.data() + r * H);
+        } else {
+          if (tokens[begin + r] >= c.vocab)
+            throw std::invalid_argument("d1 token out of range");
+          DecodeRow(model.impl_->weights.embedding, tokens[begin + r],
+                    std::span(x).subspan(r * H, H));
+        }
+      }
+      full.resize(p.size() * c.vocab);
+      decider->Decide(x, std::uint32_t(prompt.rows),
+                      packed ? g : std::span<const std::int32_t>{}, p, full);
+      for (std::size_t i = 0; i < p.size(); ++i, ++slot)
+        for (std::size_t j = 0; j < columns; ++j)
+          logits[slot * columns + j] =
+              full[i * c.vocab + (vocabulary.empty() ? j : vocabulary[j])];
+      begin += prompt.rows;
+    }
+    return true;
+  } catch (const std::exception& e) {
+    if (error)
+      *error = e.what();
+    return false;
+  }
+}
 bool Session::ForwardDecisions(std::span<const std::uint32_t> tokens,
                                std::span<const float> embeddings,
                                std::span<const DecisionPrompt> prompts,
                                std::span<const std::uint32_t> vocabulary,
                                std::span<float> logits, std::string* error) {
+  if (npu_)
+    return NpuDecisions(tokens, embeddings, prompts, vocabulary, logits, error);
   try {
     const auto& c = impl_->model->config();
     const auto columns = vocabulary.empty() ? c.vocab : vocabulary.size();
@@ -1222,7 +1304,8 @@ bool Session::Reset(std::string* error) {
       hooks_->BeforeReset();
     npu_->tokens.clear();
     npu_->rows.clear();
-    npu_->model->impl_->npu->Release(npu_.get());
+    if (npu_->model->impl_->npu)
+      npu_->model->impl_->npu->Release(npu_.get());
     npu_->logits_ready = false;
     npu_->poisoned = false;
     return true;

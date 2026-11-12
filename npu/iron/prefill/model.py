@@ -68,6 +68,7 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
     aq_k = ext("prefill_attn_q", [B_l1_ty, C_l1_ty, np.int32])
     akv_k = ext("prefill_attn_kv", [B_l1_ty, C_l1_ty])
     aout_k = ext("prefill_attn_out", [C_l1_ty])
+    ameta_k = ext("prefill_attn_meta", [B_l1_ty, C_l1_ty])
 
     a_l3l2_dims = TensorAccessPattern.full((mtk // k, m, k)).permute((1, 0, 2))
     a_l2l1_in = TensorAccessPattern.full((mtk // k * 4, m // 4, k // s, s)).permute((0, 2, 1, 3))
@@ -98,7 +99,7 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
     rounds = M // 32 // 2
 
     def make_core(q, col):
-        def core_fn(in_a, in_b, out_c, cnt, zero, matmul, nxt, epi, norm, taps, conv, cgrp, rnd, aq, akv, aout):
+        def core_fn(in_a, in_b, out_c, cnt, zero, matmul, nxt, epi, norm, taps, conv, cgrp, rnd, aq, akv, aout, ameta):
             def skip_a(nobj):
                 for _ in range_(nobj):
                     in_a.acquire(1)
@@ -160,11 +161,16 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                             conv(row, o, q)
                             in_b.release(1)
                         out_c.release(1)
-                # Attention: per round, the group's four Q objects, then the round's KV objects.
+                # Attention: per round, the meta object (bidirectional), the group's four Q
+                # objects, then the round's KV objects.
                 for _ in range_(cnt[5]):
                     for _ in range_(rounds):
                         o = out_c.acquire(1)
                         rnd(cnt, o, q, col)
+                        for _ in range_(cnt[10]):
+                            mo = in_b.acquire(1)
+                            ameta(mo, o)
+                            in_b.release(1)
                         for _ in range_(4):
                             qo = in_b.acquire(1)
                             aq(qo, o, q)
@@ -179,7 +185,7 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
 
     workers = [Worker(make_core(row, col), [A_l2l1[row].cons(), B_l2l1[col].cons(), C_l1l2[row][col].prod(),
                                             Buffer(cnt_ty, name=f"cnt_{row}_{col}"), zero_k, matmul_k, next_k, epi_k,
-                                            norm_k, taps_k, conv_k, cgrp_k, rnd_k, aq_k, akv_k, aout_k], stack_size=0x1100)
+                                            norm_k, taps_k, conv_k, cgrp_k, rnd_k, aq_k, akv_k, aout_k, ameta_k], stack_size=0x1140)
                for row in range(ROWS) for col in range(COLS)]
 
     a_size, b_size, c_size = M * P.REC, plan.b_size, plan.c_size
@@ -282,17 +288,22 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                 continue
             if ph["kind"] == "attn":
                 oh = plan.oh
+                bidi = ph["mode"] == 2
                 for r_ in range(rounds):
                     tg = TaskGroup()
                     for col in range(COLS):
                         g, b_ = col % 4, 2 * r_ + col // 4
-                        k0 = max(0, (32 * b_ - 255) // 16) if ph["mode"] else 0
-                        nkb = 2 * b_ + 2 - k0
+                        k0 = max(0, (32 * b_ - 255) // 16) if ph["mode"] == 1 else 0
+                        if bidi:  # the prompt length and groups first
+                            B_prods[col].fill(c, tap=TAP((c_size,), plan.meta, [1, 1, 9, 512], [0, 0, 512, 1]), group=tg,
+                                              wait=False)
                         # the group's four heads: [Q 16 tokens | gates] for both 16-token halves
                         B_prods[col].fill(c, tap=TAP((c_size,), ph["piece"] + (2 * b_ * 4 + g) * P.PIECE, [4, 2, 9, 256],
                                                      [2304, 4 * P.PIECE, 256, 1]), group=tg, wait=False)
                         # KV objects: the two diagonal blocks first (they set the softmax offset), then k0 .. 2 b - 1
-                        for kb0, n_ in ((2 * b_, 2), (k0, 2 * b_ - k0)):
+                        # (bidirectional: every block in order, the first holding the first state row)
+                        spans = ((0, M // 16),) if bidi else ((2 * b_, 2), (k0, 2 * b_ - k0))
+                        for kb0, n_ in spans:
                             if n_:
                                 B_prods[col].fill(c, tap=TAP((c_size,), ph["piece"] + (kb0 * 4 + g) * P.PIECE + 9216, [1, n_, 9, 512],
                                                              [0, 4 * P.PIECE, 512, 1]), group=tg, wait=False)
@@ -364,6 +375,8 @@ if __name__ == "__main__":
     kinds = sys.argv[2] if len(sys.argv) > 2 else "conv"
     if kinds.isdigit():
         kinds = ",".join(P.lfm3_kinds(int(kinds)))
+    elif kinds == "d1":  # d1 decision prompts (bidirectional full attention)
+        kinds = ",".join(P.d1_kinds())
     M = int(sys.argv[3]) if len(sys.argv) > 3 else 1024
     head_row0 = int(sys.argv[4]) if len(sys.argv) > 4 else -1
     iron.set_current_device(from_name("npu2", n_cols=None))
