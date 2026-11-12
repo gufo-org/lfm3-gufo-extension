@@ -74,8 +74,9 @@ class Layout:
     # ---- transfers
 
     def head_records(self, offset, records):
-        """`records` records of the same bytes for both of a stream's cores."""
-        return t(self.s_bytes, offset, [records, 2, REC // 512, 512], [REC, 0, 512, 1])
+        """`records` records of the same bytes for both of a stream's cores (one copy: broadcast)."""
+        # streams broadcast to both of their cores: one copy
+        return t(self.s_bytes, offset, [1, records, REC // 512, 512], [0, REC, 512, 1])
 
     def weights(self, name, s, records):
         n = 2 * records * REC
@@ -97,7 +98,7 @@ class Layout:
     def phases(self, d):
         """Phases of one token; d holds the dispatch-time scalars."""
         yield Phase(heads={s: [("S", t(self.s_bytes, self.emb + d["tok"] * EMB_ROW,
-                                       [2, 1, REC // 512, 512], [0, 0, 512, 1]))] for s in range(16)},
+                                       [1, 1, REC // 512, 512], [0, 0, 512, 1]))] for s in range(16)},
                     drains=lambda c: [self.hidden(self.block(0), c)])
         for l in range(LAYERS):
             op_in, ffn_in, nxt = self.block(2 * l), self.block(2 * l + 1), self.block(2 * l + 2)
@@ -120,7 +121,7 @@ class Layout:
                         t(self.s_bytes, self.vec + c * 1024, [1, 1, 32, 32], [0, 0, 32, 1]),
                         t(self.s_bytes, st + c * STATE_COL, [1, 1, STATE_CHUNKS * ROWS * 32 // 64, 64], [0, 0, 64, 1])])
                 yield Phase(
-                    heads={s: [("S", t(self.s_bytes, self.vec + 64, [2, 1, 136, 64], [0, 0, 128, 1]))] for s in range(16)},
+                    heads={s: [("S", t(self.s_bytes, self.vec + 64, [1, 1, 136, 64], [0, 0, 128, 1]))] for s in range(16)},
                     stream={s: [("W", self.weights((l, "conv_out"), s, OUT_RECS))] for s in range(16)},
                     drains=lambda c, ffn_in=ffn_in: [self.hidden(ffn_in + 4 * H, c)])
             else:
@@ -138,12 +139,12 @@ class Layout:
                         t(self.s_bytes, q + c * 1664, [1, 1, 26, 64], [0, 0, 64, 1])])
                 yield Phase(
                     heads={s: [("S", self.head_records(q, 2)),
-                               ("S", t(self.s_bytes, rope + d["pos"] * 512, [2, 1, REC // 512, 512], [0, 0, 512, 1]))]
+                               ("S", t(self.s_bytes, rope + d["pos"] * 512, [1, 1, REC // 512, 512], [0, 0, 512, 1]))]
                            for s in range(0, 16, 2)},
                     stream={s: ([("S", t(self.s_bytes, kv + (s // 2) * ROWS * self.ctx * 512 + first * 512,
-                                         [recs, 2, REC // 512, 512], [16 * 512, self.ctx * 512, 512, 1]))] if swa else
+                                         [1, recs, REC // 512, 512], [0, 16 * 512, 512, 1]))] if swa else
                                 [("S", t(self.s_bytes, kv + (s // 2) * ROWS * self.ctx * 512 + at * 16 * 512,
-                                         [n, 2, REC // 512, 512], [16 * 512, self.ctx * 512, 512, 1]))
+                                         [1, n, REC // 512, 512], [0, 16 * 512, 512, 1]))
                                  for at, n in ((0, d["global_a"]), (d["global_a"], d["global_b"]))])
                             for s in range(0, 16, 2)},
                     drains=lambda c, kv=kv: [
@@ -152,7 +153,7 @@ class Layout:
                         t(self.s_bytes, kv + c * ROWS * self.ctx * 512 + d["pos"] * 512,
                           [1, 16, 4, 32], [0, 32, self.ctx * 512, 1])])
                 yield Phase(
-                    heads={s: [("S", t(self.s_bytes, self.att, [2, 1, 17, 512], [0, 0, 1024, 1]))] for s in range(16)},
+                    heads={s: [("S", t(self.s_bytes, self.att, [1, 1, 17, 512], [0, 0, 1024, 1]))] for s in range(16)},
                     stream={s: [("W", self.weights((l, "attn_out"), s, OUT_RECS))] for s in range(16)},
                     drains=lambda c, ffn_in=ffn_in: [self.hidden(ffn_in + 4 * H, c)])
             yield Phase(

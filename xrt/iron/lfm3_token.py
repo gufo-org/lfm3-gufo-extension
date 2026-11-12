@@ -65,9 +65,13 @@ def token(S: InOut, W: In, *, tok: DispatchTime[np.int32], pos: DispatchTime[np.
     for c in range(COLS):
         col = []
         for half in range(2):
-            f = ObjectFifo(rec2_ty, name=f"wl3_{c}_{half}", depth=2)
+            # A stream broadcasts to both of its cores: shared inputs and KV cross DDR once;
+            # each core keeps its own records of a weight stream (alternating) and skips the rest.
+            # deep memtile buffering: the stream keeps running through a phase's prologue
+            f = ObjectFifo(rec_ty, name=f"wl3_{c}_{half}", depth=int(os.environ.get("DECODE_L2_DEPTH", "16")))
             w_fifos.append(f)
-            col += f.cons().split([0, REC], obj_types=[rec_ty] * 2, names=[f"w{c}_{2 * half + i}" for i in range(2)])
+            fwd = f.cons().forward(obj_type=rec_ty, name=f"w{c}_{half}", depth=2)  # L1 depth
+            col += [fwd, fwd]
         w_l2l1.append(col)
         o = ObjectFifo(out4_ty, name=f"y{c}", depth=2)
         y_fifos.append(o)

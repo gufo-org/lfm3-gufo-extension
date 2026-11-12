@@ -498,6 +498,7 @@ constexpr int kLayers = 24, kHeadRows = 128000;
 bool Attends(int l) { return l >= 2 && l % 2 == 0; }
 
 int ph, ph_layer, ph_step, ph_kind, ph_cached, core_c, core_j;
+int rec_i, own_i;  // objects of the phase so far: a stream's records alternate between its cores
 const int32_t* ph_rtp;
 alignas(64) float zeros16[16];
 
@@ -507,19 +508,21 @@ Counts Plan(int kind, int j, const int32_t* rtp, int attn_index) {
   const bool attn_role = j < 2;
   switch (kind) {
     case kEmbed: return {1, 0, 8, 0, 0, 0, kind, 0};
-    case kConvIn: return {3, 0, 8, 24, 2, 0, kind, 0};     // 192 of the 6144 B/C/x rows: 48 records x 4
+    // Streams broadcast to both of their cores: weight phases see both cores' records
+    // (inner counts doubled, every other one skipped); per-core records come in pairs.
+    case kConvIn: return {3, 0, 8, 24, 4, 0, kind, 0};     // 192 of the 6144 B/C/x rows: 48 records x 4
     case kConvMix:  // the convolution: rows 4-5 own 128 channels each; no weights
-      return attn_role ? Counts{0, 0, 0, 8, 0, 96, kIdle, 0} : Counts{1, 1, 0, 8, 0, 96, kind, 0};
-    case kConv2: return {1, 0, 0, 8, 2, 0, kind, 0};       // 64 out rows: 16 records x 4
-    case kAttn1: return {3, 0, 8, 13, 2, 0, kind, 0};      // 104 q/k/v/gate rows
+      return attn_role ? Counts{0, 0, 0, 8, 0, 96, kIdle, 0} : Counts{2, 2, 0, 8, 0, 96, kind, 0};
+    case kConv2: return {1, 0, 0, 8, 4, 0, kind, 0};       // 64 out rows: 16 records x 4
+    case kAttn1: return {3, 0, 8, 13, 4, 0, kind, 0};      // 104 q/k/v/gate rows
     case kAttn2: {
       const int cached = rtp[2 * attn_index], recs = rtp[2 * attn_index + 1];
       return attn_role ? Counts{3, 0, 0, 1, recs, 24, kind, cached} : Counts{0, 0, 0, 1, 0, 24, kIdle, 0};
     }
-    case kAttn3: return {1, 0, 0, 8, 2, 0, kind, 0};
-    case kFfn1: return {3, 0, 8, 15, 8, 0, kind, 0};
-    case kFfn2: return {2, 0, 0, 8, 8, 0, kind, 0};
-    case kHead: return {3, 0, 0, 500, 2, 0, kind, 0};      // 4000 rows: 1000 records x 4
+    case kAttn3: return {1, 0, 0, 8, 4, 0, kind, 0};
+    case kFfn1: return {3, 0, 8, 15, 16, 0, kind, 0};
+    case kFfn2: return {2, 0, 0, 8, 16, 0, kind, 0};
+    case kHead: return {3, 0, 0, 500, 4, 0, kind, 0};      // 4000 rows: 1000 records x 4
   }
   return {0, 0, 0, 0, 0, 0, kIdle, 0};
 }
@@ -547,13 +550,14 @@ void ROLE(next)(int32_t* counts, const int32_t* rtp, int32_t c, int32_t j) {
   ph_cached = k.extra;
   if (++ph_step == StepsAt(ph_layer)) { ph_step = 0; ++ph_layer; }
   ph = ph_layer > kLayers ? 0 : ph + 1;
+  rec_i = own_i = 0;
   counts[0] = k.heads; counts[1] = k.own; counts[2] = k.pre; counts[3] = k.outer;
   counts[4] = k.inner; counts[5] = k.post; counts[6] = k.kind; counts[7] = 0;
 }
 
 void ROLE(own)(const int8_t* rec) {
 #ifndef DECODE_ATTN_ROLE
-  if (ph_kind == kConvMix) dec_conv_load(rec);
+  if (ph_kind == kConvMix && (own_i++ & 1) == (core_j & 1)) dec_conv_load(rec);
 #endif
 }
 
@@ -568,7 +572,7 @@ void ROLE(begin)(int8_t* x, int8_t* q8, float* scratch) {
       break;
 #ifndef DECODE_ATTN_ROLE
     case kConvMix:
-      conv_x = xf;
+      conv_x = xf + (core_j & 1) * (kRec / 4);  // the second copied record is core 3's
       conv_l = conv_k = acc_n = 0;
       break;
 #endif
@@ -586,6 +590,7 @@ void ROLE(pre_out)(const int8_t* x, int8_t* out) {
 }
 
 void ROLE(rec)(const int8_t* q8, const int8_t* w) {
+  if (ph_kind != kAttn2 && (rec_i++ & 1) != (core_j & 1)) return;  // the other core's record
   switch (ph_kind) {
 #ifndef DECODE_ATTN_ROLE
 #else
