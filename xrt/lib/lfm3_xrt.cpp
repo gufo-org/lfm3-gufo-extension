@@ -413,6 +413,7 @@ int flm_lfm3_vocab(const flm_lfm3 *m) { return m->vocab; }
 
 int flm_lfm3_prefill(flm_lfm3 *m, const int32_t *ids, int count, float *logits) {
   try {
+    if (Timing()) std::fprintf(stderr, "lfm3_xrt: prefill call: %d tokens at length %d, logits %s\n", count, m->length, logits ? "yes" : "no");
     if (count <= 0) return 0;
     int done = 0;
     if (m->length == 0 && count >= 2) {
