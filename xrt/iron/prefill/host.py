@@ -99,6 +99,8 @@ def ablock(md, what):
 def pack(plan, md):
     """Returns (weights bytes, scratch init bf16)."""
     E = []
+    if not plan.kinds:  # swtest
+        E.append(enc(gemm_weight(md, (0, "gate_up"))))
     for l in range(len(plan.kinds)):
         for ph in plan.phases:
             if ph["kind"] == "gemm" and ph["what"][0] == l:

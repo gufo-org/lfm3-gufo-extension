@@ -62,7 +62,8 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
     epi_k = ext("prefill_epilogue", [C_l1_ty])
     norm_k = ext("prefill_row", [A_l1_ty, B_l1_ty, C_l1_ty, np.int32])
     taps_k = ext("prefill_conv_taps", [A_l1_ty, C_l1_ty])
-    conv_k = ext("prefill_conv_row", [B_l1_ty, C_l1_ty, np.int32, np.int32])
+    conv_k = ext("prefill_conv_row", [B_l1_ty, C_l1_ty, np.int32])
+    cgrp_k = ext("prefill_conv_group", [cnt_ty])
     rnd_k = ext("prefill_attn_round", [cnt_ty, C_l1_ty, np.int32, np.int32])
     aq_k = ext("prefill_attn_q", [B_l1_ty, C_l1_ty, np.int32])
     akv_k = ext("prefill_attn_kv", [B_l1_ty, C_l1_ty])
@@ -97,7 +98,7 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
     rounds = M // 32 // 2
 
     def make_core(q, col):
-        def core_fn(in_a, in_b, out_c, cnt, zero, matmul, nxt, epi, norm, taps, conv, rnd, aq, akv, aout):
+        def core_fn(in_a, in_b, out_c, cnt, zero, matmul, nxt, epi, norm, taps, conv, cgrp, rnd, aq, akv, aout):
             def skip_a(nobj):
                 for _ in range_(nobj):
                     in_a.acquire(1)
@@ -136,23 +137,20 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
                         out_c.release(1)
                     in_a.release(1)
                     skip_a(mtk // k * 4 - 1)
-                # Conv: taps from two A objects into the tile, 6 state rows, then the tokens.
+                # Conv, per C object of 16 tokens: the first also takes the taps block (the
+                # kernel copies its first two A objects) and the 6 state rows.
                 for _ in range_(cnt[3]):
-                    o = out_c.acquire(1)
-                    for _ in range_(2):
-                        tp = in_a.acquire(1)
-                        taps(tp, o)
-                        in_a.release(1)
-                    skip_a(mtk // k * 4 - 2)
-                    for _ in range_(P.STATE):
-                        row = in_b.acquire(1)
-                        conv(row, o, q, 0)
-                        in_b.release(1)
-                    rows16(o, lambda row, o: conv(row, o, q, 1))
-                    out_c.release(1)
-                    for _ in range_(groups - 1):
+                    for _ in range_(groups):
                         o = out_c.acquire(1)
-                        rows16(o, lambda row, o: conv(row, o, q, 1))
+                        cgrp(cnt)
+                        for _ in range_(cnt[7]):
+                            tp = in_a.acquire(1)
+                            taps(tp, o)
+                            in_a.release(1)
+                        for _ in range_(cnt[6]):
+                            row = in_b.acquire(1)
+                            conv(row, o, q)
+                            in_b.release(1)
                         out_c.release(1)
                 # Attention: per round, the group's four Q objects, then the round's KV objects.
                 for _ in range_(cnt[5]):
@@ -173,7 +171,7 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
 
     workers = [Worker(make_core(row, col), [A_l2l1[row].cons(), B_l2l1[col].cons(), C_l1l2[row][col].prod(),
                                             Buffer(cnt_ty, name=f"cnt_{row}_{col}"), zero_k, matmul_k, next_k, epi_k,
-                                            norm_k, taps_k, conv_k, rnd_k, aq_k, akv_k, aout_k], stack_size=0x1100)
+                                            norm_k, taps_k, conv_k, cgrp_k, rnd_k, aq_k, akv_k, aout_k], stack_size=0x1100)
                for row in range(ROWS) for col in range(COLS)]
 
     a_size, b_size, c_size = M * P.REC, plan.b_size, plan.c_size

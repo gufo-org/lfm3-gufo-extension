@@ -163,6 +163,22 @@ void matmul_vectorized_different_datatypes(bfloat16 *__restrict pA_in,
 // ---- LFM3 prefill epilogues (Gufo).
 
 namespace {
+}  // namespace
+#include "common/exp2_bf16.h"
+namespace {
+#ifdef SIGMOID_EXP2
+// sigmoid(x) = 1 / (1 + 2^(-x log2 e)) with the native exp2 and invsqrt
+__attribute__((noinline)) aie::vector<bfloat16, 16> Sigmoid(aie::vector<bfloat16, 16> x) {
+  aie::accum<accfloat, 16> t = aie::mul(x, aie::broadcast<bfloat16, 16>(-1.4426950408889634f));
+  aie::accum<accfloat, 16> d;
+  d.from_vector(aie::exp2<bfloat16>(t.to_vector<float>()));
+  d = aie::add(d, aie::broadcast<float, 16>(1.0f));
+  aie::accum<accfloat, 16> r;
+  r.from_vector(aie::invsqrt(d.to_vector<float>()));  // 1 / d = invsqrt(d)^2: no emulated divide
+  const aie::vector<bfloat16, 16> rb = r.to_vector<bfloat16>();
+  return aie::mul(rb, rb).to_vector<bfloat16>();
+}
+#else
 // sigmoid(x) = (1 + tanh(x / 2)) / 2, with bf16 multiplies (native) only.
 inline aie::vector<bfloat16, 16> Sigmoid(aie::vector<bfloat16, 16> x) {
   const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
@@ -171,6 +187,7 @@ inline aie::vector<bfloat16, 16> Sigmoid(aie::vector<bfloat16, 16> x) {
   s.from_vector(aie::broadcast<float, 16>(0.5f));
   return aie::mac(s, aie::tanh<bfloat16>(h.to_vector<float>()), half).to_vector<bfloat16>();
 }
+#endif
 }  // namespace
 // Program memory is 16 KB per core: everything below the matmul is optimized for size.
 #pragma clang attribute push(__attribute__((minsize)), apply_to = function)
@@ -328,17 +345,26 @@ extern "C" {
 // Copies taps [which * 2048, which * 2048 + 2048) (only 1536 for which = 1)
 // from an A object into the tile and restarts the history ring; which
 // alternates 0, 1 per call.
-int taps_which;
+int taps_which, conv_rows, conv_group;
+// cnt[7]: A objects of this C object (the whole taps block with the first), cnt[6]: rows
+// (the 6 state rows, then 16 tokens, with the first; 16 after).
+void prefill_conv_group(int32_t *__restrict cnt) {
+  cnt[7] = conv_group == 0 ? 32 : 0;
+  cnt[6] = conv_group == 0 ? 22 : 16;
+  ++conv_group;
+}
+// Copies taps from the first two A objects of the block; the others are skipped.
 void prefill_conv_taps(const bfloat16 *__restrict a, bfloat16 *__restrict tile) {
-  const int which = taps_which;
-  taps_which ^= 1;
+  const int which = taps_which++;
+  if (which >= 2) return;
   conv_ring = 0;
   const int n = which ? 1536 : 2048;
   for (int i = 0; i < n; i += 16) aie::store_v(Spare(tile, which * 2048 + i), aie::load_v<16>(a + i));
 }
 
 // One token row for core part q. With out = 0 it only enters the history.
-void prefill_conv_row(const bfloat16 *__restrict row, bfloat16 *__restrict tile, int32_t part, int32_t out) {
+void prefill_conv_row(const bfloat16 *__restrict row, bfloat16 *__restrict tile, int32_t part) {
+  const int out = conv_rows++ >= 6;  // the first 6 rows of a phase are state
   const int ring = conv_ring;
   const int slot = row_slot;
   if (out) row_slot = (slot + 1) & 15;
@@ -637,6 +663,7 @@ void prefill_next(int32_t *__restrict cnt) {
   row_qkr = kind == 3;
   cnt[5] = kind == 4;
   rope_kind = mode;
+  taps_which = conv_rows = conv_group = 0;
   attn_swa = mode;
   attn_round = 0;
 }

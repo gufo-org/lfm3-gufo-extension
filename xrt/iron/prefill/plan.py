@@ -47,6 +47,9 @@ class Plan:
         self.ao = self._c(4 * self.oh) + 3 * self.oh  # three junk copies first
         self.ablocks = []          # (c offset, what) for the host to fill
         self.phases = [self._norm(("embed",))]
+        if self.kinds == ["swtest"]:  # precision test: embedding norm, then layer 0's gate/up GEMM
+            self.phases.append(self._gemm(H, 2 * I, "swiglu", ("rec",), ("plain", self.sw, 2 * I), (0, "gate_up")))
+            self.kinds = []
         for l, kind in enumerate(self.kinds):
             if kind in ("attn", "swa"):
                 piece = self.pieces[l] = self._c(M // 16 * 4 * PIECE)
