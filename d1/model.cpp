@@ -136,7 +136,8 @@ std::unique_ptr<Model> Model::Load(const std::string& path,
     m.text = lfm3::Model::Load(path, &error);
   else {
     // The vision tower streams from disk beside the audio backbone.
-    auto vision = std::async(std::launch::async, Vision::Load, mmproj);
+    auto vision =
+        std::async(std::launch::async, [&] { return Vision::Load(mmproj); });
     m.audio = lfm3_audio::Model::Load(path, mmproj, &error);
     m.vision = vision.get();
   }

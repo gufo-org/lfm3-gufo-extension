@@ -75,6 +75,8 @@ gufo_extension_target(
     audio/runner.cpp
     audio/speak.cpp
     audio/provider.cpp
+    npu/dense.cpp
+    npu/stack.cpp
   LINK_LIBRARIES
     roc::hipblas
     gufo_lfm3_hip

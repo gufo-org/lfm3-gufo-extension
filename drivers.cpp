@@ -47,8 +47,9 @@ int RunLfm3PromptImpl(const ext::TextPromptOptions& opt, bool interactive,
         Model::Load(opt.model_path, &error, 0,
                     npu::SelectedBundle(opt.provider_options, opt.model_path));
     Require(bool(model), error);
-    auto vision =
-        lfm3_vl::LoadMatchingVision(opt.model_path, opt.vision_model_path);
+    auto vision = lfm3_vl::LoadMatchingVision(
+        opt.model_path, opt.vision_model_path,
+        npu::SelectedBundle(opt.provider_options, opt.model_path));
     if (!vision && !opt.image_paths.empty())
       throw std::invalid_argument(
           "image input requires an LFM3-VL backbone and matching --mmproj");

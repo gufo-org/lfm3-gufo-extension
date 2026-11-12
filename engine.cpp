@@ -532,32 +532,24 @@ struct Session::Npu {
   std::vector<float> rows;
   std::vector<float> logits;
   bool logits_ready{}, poisoned{};
-  // Final hidden state of the last row, read on demand into pinned memory the
-  // GPU (an audio voice) can address.
-  float* hidden{};
+  // Final hidden state of the last row, read on demand (host memory: the
+  // audio voice runs on the host too).
+  std::vector<float> hidden;
   bool hidden_ready{};
   const float* Hidden() {
-    const auto H = model->config().hidden;
-    if (!hidden &&
-        hipHostMalloc(reinterpret_cast<void**>(&hidden), std::size_t(H) * 4,
-                      hipHostMallocMapped) != hipSuccess)
-      throw std::runtime_error("cannot allocate the LFM3 NPU hidden row");
+    hidden.resize(model->config().hidden);
     if (!hidden_ready) {
-      model->impl_->npu->Hidden(this, std::span(hidden, H));
+      model->impl_->npu->Hidden(this, hidden);
       hidden_ready = true;
     }
-    return hidden;
+    return hidden.data();
   }
 
   Npu(std::shared_ptr<Model> m, std::uint32_t ctx)
       : model(std::move(m)), context(ctx) {
     logits.assign(model->config().vocab, 0.0f);
   }
-  ~Npu() {
-    model->impl_->npu->Release(this);
-    if (hidden)
-      (void)hipHostFree(hidden);
-  }
+  ~Npu() { model->impl_->npu->Release(this); }
   void Run(std::span<const std::uint32_t> run, bool want_logits) {
     const auto& c = model->config();
     if (poisoned)
@@ -1074,7 +1066,7 @@ bool Session::ReadHidden(std::span<float> hidden, std::string* error) const {
 const float* Session::DeviceHidden() const {
   if (npu_) {
     try {
-      return npu_->Hidden();  // pinned host memory, addressable by the GPU
+      return npu_->Hidden();  // host memory
     } catch (const std::exception&) {
       return nullptr;
     }

@@ -14,7 +14,9 @@ Picture ProcessImage(const core::Image& image, unsigned max_pixels = 16777216);
 class Vision {
 public:
   ~Vision();
-  static std::unique_ptr<Vision> Load(const std::string& path);
+  // npu_bundle: products on the NPU (npu::Dense), the rest on the host.
+  static std::unique_ptr<Vision> Load(const std::string& path,
+                                      const std::string& npu_bundle = {});
   std::vector<float> Encode(const Picture& picture);
   const std::string& Identity() const;
 
@@ -26,6 +28,7 @@ private:
 // The projector for a backbone: null for an LFM3 text backbone without one;
 // an LFM3-VL backbone requires its LFM3-VL mmproj. Mismatches throw.
 std::shared_ptr<Vision> LoadMatchingVision(const std::string& backbone,
-                                           const std::string& mmproj);
+                                           const std::string& mmproj,
+                                           const std::string& npu_bundle = {});
 }  // namespace gufo::models::lfm3_vl
 #endif

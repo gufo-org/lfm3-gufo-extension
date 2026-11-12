@@ -190,10 +190,8 @@ struct Generator::Impl {
   std::unique_ptr<lfm3::Session> session;
   std::unique_ptr<Voice> voice;
   std::uint32_t context{};
-  float* frame_embedding{};  // device row of backbone width
-  // NPU backbone, GPU voice: frame_embedding is one pinned host row both
-  // address (unified memory), and the session takes host rows.
-  bool host_rows{};
+  float* frame_embedding{};  // device row of backbone width (host on NPU)
+  bool host_rows{};          // NPU: rows live in host memory
   // Inputs of the context in order, so Erase can recompute it: runs of
   // tokens or of embedding rows.
   struct Run {
@@ -247,9 +245,12 @@ struct Generator::Impl {
 };
 Generator::Generator() : impl_(std::make_unique<Impl>()) {}
 Generator::~Generator() {
-  if (impl_ && impl_->frame_embedding)
-    (void)(impl_->host_rows ? hipHostFree(impl_->frame_embedding)
-                            : hipFree(impl_->frame_embedding));
+  if (impl_ && impl_->frame_embedding) {
+    if (impl_->host_rows)
+      delete[] impl_->frame_embedding;
+    else
+      (void)hipFree(impl_->frame_embedding);
+  }
 }
 Model& Generator::model() const {
   return *impl_->model;
@@ -273,13 +274,11 @@ std::unique_ptr<Generator> Generator::Create(std::shared_ptr<Model> model,
   if (!g->impl_->voice)
     return nullptr;
   g->impl_->host_rows = model->backbone().OnNpu();
-  const std::size_t row_bytes =
-      std::size_t(model->backbone().config().hidden) * 4;
-  if ((g->impl_->host_rows
-           ? hipHostMalloc(reinterpret_cast<void**>(&g->impl_->frame_embedding),
-                           row_bytes, hipHostMallocMapped)
-           : hipMalloc(reinterpret_cast<void**>(&g->impl_->frame_embedding),
-                       row_bytes)) != hipSuccess) {
+  if (g->impl_->host_rows)
+    g->impl_->frame_embedding = new float[model->backbone().config().hidden]();
+  else if (hipMalloc(reinterpret_cast<void**>(&g->impl_->frame_embedding),
+                     std::size_t(model->backbone().config().hidden) * 4) !=
+           hipSuccess) {
     if (error)
       *error = "cannot allocate frame embedding";
     return nullptr;

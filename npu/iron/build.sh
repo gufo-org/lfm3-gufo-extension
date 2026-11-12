@@ -2,7 +2,10 @@
 # Writes the NPU bundle `--npu` loads for an LFM3-family GGUF (LFM3-1.7B,
 # LFM3-VL-2B, LFM3-Audio-2B backbones): <model>.npu beside the GGUF.
 #
-# Usage: npu/iron/build.sh <model.gguf> [build dir]
+# Usage: GUFO_SOURCE=<gufo checkout> npu/iron/build.sh <model.gguf> [build dir]
+#
+# The audio towers' products use Gufo's Q8_0 GEMM program
+# (src/core/npu/kernels/q8gemm in GUFO_SOURCE), copied into <model>.npu/gemm.
 #
 # Needs an mlir-aie (IRON) Python with Peano, and XRT's Python bindings
 # (pyxrt) on PYTHONPATH. The programs (xclbins) depend only on the LFM3
@@ -21,6 +24,10 @@ if [ ! -f "$build/decode.xclbin" ]; then
   so=$(sed -n 's/^dispatch library: //p' "$build/decode.log" | tail -1)
   cp "$so" "$build/decode_dispatch.so"
 fi
+if [ ! -f "$build/gemm/q8gemm.xclbin" ]; then
+  : "${GUFO_SOURCE:?set GUFO_SOURCE to a Gufo checkout (for src/core/npu/kernels/q8gemm)}"
+  (cd "$GUFO_SOURCE/src/core/npu/kernels/q8gemm" && python3 q8gemm.py "$build/gemm")
+fi
 # prefill programs: rows M with the LM head over the rows from `head`
 for spec in "h0 1024 0" "h512 1024 512" "s512 512 0" "s128 128 0"; do
   set -- $spec
@@ -32,6 +39,7 @@ rm -rf "$tmp"
 python3 "$here/bundle.py" "$gguf" "$tmp" "$build/decode.xclbin" "$build/decode_dispatch.so" \
   "$build/h0.xclbin" "$build/h0.bin" "$build/h512.bin" \
   --small "$build/s512.xclbin" "$build/s512.bin" --tiny "$build/s128.xclbin" "$build/s128.bin"
+cp -r "$build/gemm" "$tmp/gemm"
 rm -rf "$out"
 mv "$tmp" "$out"
 echo "NPU bundle: $out"

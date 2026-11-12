@@ -1,13 +1,21 @@
 # LFM3 on the XDNA NPU
 
-`--npu` runs the LFM3 backbone on the Strix Halo XDNA NPU through Gufo's NPU
-runtime (`gufo/ext/experimental/npu.hpp`) with our own IRON kernels. It applies
-to LFM3-1.7B and LFM3-VL-2B (`serve`, `prompt`, `chat`, `bench`) and to the
-LFM3-Audio-2B backbone (`serve asr`, `serve tts`). Vision and audio towers stay
-on the GPU. The NPU runs chat models only, not d1 decision models.
+`--npu` runs LFM3 on the Strix Halo XDNA NPU through Gufo's NPU runtime
+(`gufo/ext/experimental/npu.hpp`) with our own IRON kernels. It applies to
+LFM3-1.7B and LFM3-VL-2B (`serve`, `prompt`, `chat`, `bench`) and to
+LFM3-Audio-2B (`serve asr`, `serve tts`). The NPU runs chat models only, not d1
+decision models.
+
+The GPU stays off for every supported model:
+
+- **Backbone:** runs on the NPU programs below.
+- **Towers:** the audio encoder, depth decoder and codec, and the VL vision encoder, do their matrix products on Gufo's `npu::Q8Gemm` (`npu/dense.cpp`, `npu/stack.cpp`).
+  - Q8_0 weights keep their codes.
+  - Other weights (the BF16 vision projector) are two Q8_0 planes, a code and its residual, about 2^-15 of each block's largest weight.
+  - Norms, attention, convolutions, sampling and mel/iSTFT run on the CPU (`npu/host_ops.hpp` and the `npu` paths of `audio/model.cpp` and `vl/vision.cpp`).
 
 ```sh
-npu/iron/build.sh /models/LFM3-1.7B/LFM3-1.7B-Q8_0.gguf  # writes LFM3-1.7B-Q8_0.npu
+GUFO_SOURCE=~/gufo npu/iron/build.sh /models/LFM3-1.7B/LFM3-1.7B-Q8_0.gguf  # writes LFM3-1.7B-Q8_0.npu
 gufo serve --model /models/LFM3-1.7B/LFM3-1.7B-Q8_0.gguf --npu
 gufo serve tts --model /models/LFM3-Audio-2B --npu
 ```
@@ -26,6 +34,7 @@ model's weights.
 | `prefill{,512,128}.xclbin`, `*.insts` | Prefill of up to 1024, 512 or 128 rows (`prefill/model.py`): bf16 × bfp16 GEMMs, norms, convolutions and attention as phases of one dispatch. |
 | `decode_*.bin`, `prefill_*.bin` | The repacked Q8_0 weights and the initial state (`bundle.py`). |
 | `bundle.txt` | The offsets the runtime needs (`npu/runtime.cpp`). |
+| `gemm/` | Gufo's Q8_0 GEMM program (`src/core/npu/kernels/q8gemm`), for the audio towers. |
 
 ## Runtime
 
@@ -42,3 +51,15 @@ Measured on LFM3-1.7B Q8_0:
 | Decode | 27.4 tok/s |
 
 Against the GPU Q8 model, teacher-forced top-5 KL is 3.2e-2, and the top token matches in 163 of 185 positions.
+
+LFM3-Audio-2B with the GPU off (`HIP_VISIBLE_DEVICES=-1`):
+
+| Workload | Time |
+|---|---:|
+| TTS first audio | 96–108 ms |
+| TTS real-time factor | 0.82 |
+| ASR, 3.5 s clip | 397 ms (encoder 86 ms) |
+| Live transcription, first text | ~430 ms |
+| Voice, first audio | ~860 ms |
+
+The limits are about 84 µs per GEMM dispatch, the CPU row operations between dispatches, and a ~3 ms switch between the backbone and GEMM programs at each audio frame.
