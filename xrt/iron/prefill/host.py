@@ -96,17 +96,22 @@ def ablock(md, what):
     raise KeyError(what)
 
 
-def pack(plan, md):
+def pack_scratch(plan, md):
+    """Scratch init of a plan alone (the weights do not depend on M)."""
+    return pack(plan, md, weights=False)
+
+
+def pack(plan, md, weights=True):
     """Returns (weights bytes, scratch init bf16)."""
     E = []
     if not plan.kinds:  # swtest
         E.append(enc(gemm_weight(md, (0, "gate_up"))))
-    for l in range(len(plan.kinds)):
+    for l in range(len(plan.kinds) if weights else 0):
         for ph in plan.phases:
             if ph["kind"] == "gemm" and ph["what"][0] == l:
                 E.append(enc(gemm_weight(md, ph["what"])))
         md.drop()
-    if hasattr(plan, "logits"):
+    if hasattr(plan, "logits") and weights:
         E.append(enc(gemm_weight(md, ("head",))))
         md.drop()
     Cs = np.zeros(plan.c_size, np.uint16)
@@ -116,7 +121,7 @@ def pack(plan, md):
     rope = rope_tables(md, plan.M)
     tails = Cs[plan.qs:plan.qs + plan.M * P.QKV_ROW].reshape(plan.M, P.QKV_ROW)
     tails[:, 4096:4352] = bf16(np.concatenate([rope["attn"], rope["swa"]], 1))
-    return np.concatenate(E), Cs
+    return (np.concatenate(E) if E else None), Cs
 
 
 def rope_tables(md, n, start=0):
@@ -342,7 +347,8 @@ def head_check(argv):
     import json
     kinds = P.lfm3_kinds()
     md = Model(gguf)
-    plan = P.Plan(kinds, head_row0=0)
+    import os
+    plan = P.Plan(kinds, M=int(os.environ.get("PREFILL_M", "1024")), head_row0=0)
     E, Cs = pack(plan, md)
     ids_all = np.array([1] + json.load(open(ids_path)))
     emb = md.deq("token_embd.weight")

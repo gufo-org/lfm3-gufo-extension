@@ -2,7 +2,8 @@
 lfm3_token.py's xclbin, the prefill weights and scratch for prefill/model.py's
 xclbin, and the offsets the library needs to hand a prefill over to decode.
 
-Usage: bundle.py <gguf> <out dir> <decode xclbin> <dispatch.so> <prefill xclbin> <insts head rows 0> <insts head rows 512> [--prefill-only]
+Usage: bundle.py <gguf> <out dir> <decode xclbin> <dispatch.so> <prefill xclbin> <insts head rows 0> <insts head rows 512>
+                 [--small <M=512 xclbin> <its insts>] [--prefill-only]
 (the prefill instruction streams come from model.py ... 1024 0 and ... 1024 512; both run on one xclbin)
 """
 import json
@@ -30,6 +31,11 @@ def write_flat(meta, path):
     lines += [f"p.{k} {p[k]}" for k in ("M", "rec", "c_size", "conv_row", "state_rows", "piece", "logits", "head_rows")]
     lines += [f"p.cs {' '.join(str(p['cs'][str(l)]) for l in d['conv_layers'])}",
               f"p.pieces {' '.join(str(p['pieces'][str(l)]) for l in d['attn_layers'])}"]
+    if "prefill512" in meta:
+        q = meta["prefill512"]
+        lines += [f"q.{k} {q[k]}" for k in ("M", "c_size", "logits")]
+        lines += [f"q.cs {' '.join(str(q['cs'][str(l)]) for l in d['conv_layers'])}",
+                  f"q.pieces {' '.join(str(q['pieces'][str(l)]) for l in d['attn_layers'])}"]
     Path(path).write_text("\n".join(lines) + "\n")
 
 
@@ -58,6 +64,15 @@ def main():
     else:
         lay = L.Layout(ctx)
 
+    small = sys.argv.index("--small") if "--small" in sys.argv else None
+    if small:
+        sp = P.Plan(P.lfm3_kinds(), M=512, head_row0=0)
+        _, Cs512 = PH.pack_scratch(sp, md)
+        Cs512.tofile(out / "prefill512_scratch.bin")
+        shutil.copyfile(sys.argv[small + 1], out / "prefill512.xclbin")
+        shutil.copyfile(sys.argv[small + 2], out / "prefill512_head0.insts")
+        meta_small = dict(M=sp.M, c_size=sp.c_size, logits=sp.logits, cs={str(l): v for l, v in sp.cs.items()},
+                          pieces={str(l): v for l, v in sp.pieces.items()})
     for src, name in ((dxclbin, "decode.xclbin"), (dso, "decode_dispatch.so"), (pxclbin, "prefill.xclbin"),
                       (pins0, "prefill_head0.insts"), (pins512, "prefill_head512.insts")):
         shutil.copyfile(src, out / name)
@@ -75,6 +90,8 @@ def main():
             "cs": {str(l): v for l, v in plan.cs.items()}, "pieces": {str(l): v for l, v in plan.pieces.items()},
         },
     }
+    if small:
+        meta["prefill512"] = meta_small
     (out / "bundle.json").write_text(json.dumps(meta, indent=1))
     write_flat(meta, out / "bundle.txt")
     print("bundle written to", out, {f.name: os.path.getsize(f) for f in out.iterdir()})

@@ -1,3 +1,6 @@
+#ifndef PREFILL_ROUNDS
+#define PREFILL_ROUNDS 16  // attention rounds per column of the prefill: M / 64
+#endif
 //===- mm_bfp_mixed.cc ------------------------------------------*- C++ -*-===//
 //
 // Copyright (C) 2026 Advanced Micro Devices, Inc.
@@ -529,7 +532,7 @@ extern "C" {
 // cnt[6] = KV objects of this round; resets the running state.
 void prefill_attn_round(int32_t *__restrict cnt, bfloat16 *__restrict tile, int32_t part, int32_t col) {
   const int b = 2 * attn_round + (col >> 2);
-  attn_round = attn_round == 15 ? 0 : attn_round + 1;
+  attn_round = attn_round == PREFILL_ROUNDS - 1 ? 0 : attn_round + 1;
   int k0 = 0;
   if (attn_swa) {
     k0 = (32 * b - 255) >> 4;

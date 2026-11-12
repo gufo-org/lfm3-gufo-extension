@@ -117,12 +117,23 @@ double Now() { return std::chrono::duration<double>(std::chrono::steady_clock::n
 
 }  // namespace
 
+// One prefill xclbin for M rows: its instruction streams (the LM head over rows 0
+// or 512) and its scratch. bundle.txt keys: "p." for M = 1024, "q." for M = 512.
+struct Variant {
+  std::string key;
+  int M{};
+  Xclbin x;
+  xrt::bo ins[2], c;
+  uint32_t ins_n[2]{};
+  int streams{};
+};
+
 struct flm_lfm3 {
   Meta meta;
   xrt::device dev{0};
-  Xclbin pre, dec;
-  xrt::bo p_ins[2], p_rec, p_w, p_c, d_s, d_w, d_ins;
-  uint32_t p_ins_n[2]{};
+  Xclbin dec;
+  std::vector<Variant> pre;  // ascending M
+  xrt::bo p_rec, p_w, d_s, d_w, d_ins;
   void *dl{};
   Dispatch gen{};
   int vocab{}, hidden{}, ctx{}, window{}, M{}, rec{}, max_length{};
@@ -138,28 +149,41 @@ struct flm_lfm3 {
     rec = meta("p.rec");
     max_length = std::min(max_len, ctx);
 
-    pre = Load(dev, dir + "/prefill.xclbin");
     dec = Load(dev, dir + "/decode.xclbin");
-
-    for (int v = 0; v < 2; ++v) {
-      const std::string ins_path = dir + (v ? "/prefill_head512.insts" : "/prefill_head0.insts");
-      const size_t ins_bytes = FileSize(ins_path);
-      p_ins_n[v] = ins_bytes / 4;
-      p_ins[v] = xrt::bo(dev, ins_bytes, xrt::bo::flags::cacheable, pre.kernel.group_id(1));
-      ReadInto(ins_path, p_ins[v].map<void *>(), ins_bytes);
-      p_ins[v].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    struct Spec { const char *key, *xclbin, *ins0, *ins512, *scratch; };
+    std::vector<Spec> specs;
+    if (meta.v.count("q.M")) specs.push_back({"q", "/prefill512.xclbin", "/prefill512_head0.insts", nullptr, "/prefill512_scratch.bin"});
+    specs.push_back({"p", "/prefill.xclbin", "/prefill_head0.insts", "/prefill_head512.insts", "/prefill_scratch.bin"});
+    for (const Spec &sp : specs) {
+      Variant v;
+      v.key = sp.key;
+      v.M = meta(v.key + ".M");
+      v.x = Load(dev, dir + sp.xclbin);
+      const char *ins[2] = {sp.ins0, sp.ins512};
+      for (int i = 0; i < 2 && ins[i]; ++i) {
+        const std::string path = dir + ins[i];
+        const size_t bytes = FileSize(path);
+        v.ins_n[i] = bytes / 4;
+        v.ins[i] = xrt::bo(dev, bytes, xrt::bo::flags::cacheable, v.x.kernel.group_id(1));
+        ReadInto(path, v.ins[i].map<void *>(), bytes);
+        v.ins[i].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        v.streams = i + 1;
+      }
+      v.c = xrt::bo(dev, FileSize(dir + sp.scratch), xrt::bo::flags::host_only, v.x.kernel.group_id(5));
+      ReadInto(dir + sp.scratch, v.c.map<void *>(), v.c.size());
+      v.c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      pre.push_back(std::move(v));
     }
-    p_rec = xrt::bo(dev, size_t(M) * rec * 2, xrt::bo::flags::host_only, pre.kernel.group_id(3));
+    // records and weights are shared by the variants (the weights do not depend on M)
+    p_rec = xrt::bo(dev, size_t(M) * rec * 2, xrt::bo::flags::host_only, pre.back().x.kernel.group_id(3));
     std::memset(p_rec.map<void *>(), 0, p_rec.size());
-    const std::string pw = dir + "/prefill_weights.bin", pc = dir + "/prefill_scratch.bin";
-    p_w = xrt::bo(dev, FileSize(pw), xrt::bo::flags::host_only, pre.kernel.group_id(4));
+    const std::string pw = dir + "/prefill_weights.bin";
+    p_w = xrt::bo(dev, FileSize(pw), xrt::bo::flags::host_only, pre.back().x.kernel.group_id(4));
     ReadInto(pw, p_w.map<void *>(), p_w.size());
     p_w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    p_c = xrt::bo(dev, FileSize(pc), xrt::bo::flags::host_only, pre.kernel.group_id(5));
-    ReadInto(pc, p_c.map<void *>(), p_c.size());
-    p_c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     const std::string ds = dir + "/decode_state.bin", dw = dir + "/decode_weights.bin";
+    // (decode xclbin loaded above)
     d_s = xrt::bo(dev, FileSize(ds), xrt::bo::flags::host_only, dec.kernel.group_id(3));
     ReadInto(ds, d_s.map<void *>(), d_s.size());
     d_s.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -217,23 +241,26 @@ struct flm_lfm3 {
       uint16_t *x = R + size_t(t) * rec + hidden;
       for (int i = 0; i < hidden; ++i) x[i] = Bf16(e[i]);
     }
-    p_rec.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    p_rec.sync(XCL_BO_SYNC_BO_TO_DEVICE, size_t(m) * rec * 2, 0);
     const double t1 = Now();
+    size_t vi = 0;
+    while (pre[vi].M < m) ++vi;
+    Variant &P = pre[vi];
     const int head_rows = meta("p.head_rows"), v = m - 1 >= head_rows;
-    auto run = pre.kernel(3u, p_ins[v], p_ins_n[v], p_rec, p_w, p_c);
+    auto run = P.x.kernel(3u, P.ins[v], P.ins_n[v], p_rec, p_w, P.c);
     run.wait();
     const double t2 = Now();
     if (logits) {
-      const size_t at = meta("p.logits") + size_t(m - 1 - v * head_rows) * vocab;
-      p_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE, size_t(vocab) * 2, at * 2);
-      const uint16_t *lg = p_c.map<const uint16_t *>() + at;
+      const size_t at = meta(P.key + ".logits") + size_t(m - 1 - v * head_rows) * vocab;
+      P.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE, size_t(vocab) * 2, at * 2);
+      const uint16_t *lg = P.c.map<const uint16_t *>() + at;
       for (int i = 0; i < vocab; ++i) logits[i] = FromBf16(lg[i]);
     }
-    Handoff(m);
+    Handoff(P, m);
     const double t3 = Now();
     if (Timing())
-      std::fprintf(stderr, "lfm3_xrt: prefill %d tokens: records %.2f ms, NPU %.2f ms, handoff %.2f ms\n", m,
-                   1e3 * (t1 - t0), 1e3 * (t2 - t1), 1e3 * (t3 - t2));
+      std::fprintf(stderr, "lfm3_xrt: prefill %d tokens (M %d): records %.2f ms, NPU %.2f ms, handoff %.2f ms\n", m,
+                   P.M, 1e3 * (t1 - t0), 1e3 * (t2 - t1), 1e3 * (t3 - t2));
     length = m;
   }
 
@@ -243,9 +270,10 @@ struct flm_lfm3 {
   // Convolution states: per column c and conv core j in {2, 3}, 96 chunks of 8 f32 at
   // (4 k + j) * 32 bytes, f32 index f = 8 k + e holding tap f / 128 (oldest first) of
   // channel ((8 c + lane / 16) * 2 + j - 2) * 16 + lane % 16, lane = f % 128.
-  void Handoff(int m) {
-    const auto &kv = meta.list("d.kv"), &state = meta.list("d.state"), &pieces = meta.list("p.pieces"),
-               &cs = meta.list("p.cs");
+  void Handoff(Variant &P, int m) {
+    xrt::bo &p_c = P.c;
+    const auto &kv = meta.list("d.kv"), &state = meta.list("d.state"), &pieces = meta.list(P.key + ".pieces"),
+               &cs = meta.list(P.key + ".cs");
     const size_t piece = meta("p.piece"), conv_row = meta("p.conv_row"), state_rows = meta("p.state_rows"),
                  state_col = meta("d.state_col");
     char *S = d_s.map<char *>();

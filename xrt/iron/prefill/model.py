@@ -49,7 +49,7 @@ def prefill(A: InOut, B: In, C: InOut, *, kinds: CompileTime[str] = "conv", M: C
     B_l1_ty = np.ndarray[(k, n // 8), np.dtype[v8bfp16ebs8]]
     C_l1_ty = np.ndarray[(m, n), np.dtype[bfloat16]]
 
-    flags = [f"-I{_AIE_KERNELS_INC}", f"-DPREFILL_PLAN={','.join(map(str, plan.codes()))}"]
+    flags = [f"-I{_AIE_KERNELS_INC}", f"-DPREFILL_PLAN={','.join(map(str, plan.codes()))}", f"-DPREFILL_ROUNDS={M // 64}"]
     flags += os.environ.get("PREFILL_FLAGS", "").split()
     obj = "mm_prefill.o"
     def ext(name, args):
