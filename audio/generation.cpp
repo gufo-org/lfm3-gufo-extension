@@ -277,7 +277,7 @@ std::unique_ptr<Generator> Generator::Create(std::shared_ptr<Model> model,
   if (!g->impl_->voice)
     return nullptr;
   g->impl_->host_rows = model->backbone().OnNpu() || model->backbone().OnXrt();
-  g->impl_->pinned_row = model->backbone().OnXrt();  // the voice is then on the GPU (GUFO_LFM3_DEVICE=xrt)
+  g->impl_->pinned_row = model->backbone().OnXrt();  // one row for the XRT backbone and the voice
   if (g->impl_->pinned_row) {
     // XRT backbone, GPU voice: one pinned row both address (unified memory).
     if (hipHostMalloc(reinterpret_cast<void**>(&g->impl_->frame_embedding),

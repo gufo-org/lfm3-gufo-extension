@@ -6,6 +6,13 @@
 #include <stdexcept>
 #include <tuple>
 
+#include <cmath>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <memory>
+#include <string>
+
+#include "../xrt/gufo_xrt_gemm.h"
 #include "host/bfp.hpp"
 #include "host/npu_runtime.hpp"
 
@@ -23,9 +30,48 @@ std::uint32_t DispatchBlocks(std::uint32_t blocks) {
 }
 }  // namespace
 
+// GUFO_LFM3_DEVICE=xrt: the products run on q8gemm.xclbin through XRT
+// (gufo_xrt_gemm.h in LFM3_XRT_LIBRARY, xclbin from LFM3_XRT_GEMM or
+// LFM3_XRT_MODEL/gemm) and HRX is never loaded.
+struct XrtGemm {
+  void* lib{};
+  gufo_xrt_gemm* g{};
+  decltype(&gufo_xrt_gemm_create) create{};
+  decltype(&gufo_xrt_gemm_last_error) error{};
+  decltype(&gufo_xrt_gemm_upload) upload{};
+  decltype(&gufo_xrt_gemm_run) run{};
+  XrtGemm() {
+    const char* path = std::getenv("LFM3_XRT_LIBRARY");
+    lib = dlopen(path ? path : "liblfm3_xrt.so", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) throw std::runtime_error(std::string("XRT GEMM library: ") + dlerror());
+    auto sym = [&](auto& f, const char* name) {
+      f = reinterpret_cast<std::remove_reference_t<decltype(f)>>(dlsym(lib, name));
+      if (!f) throw std::runtime_error(std::string("XRT GEMM library lacks ") + name);
+    };
+    sym(create, "gufo_xrt_gemm_create"), sym(error, "gufo_xrt_gemm_last_error");
+    sym(upload, "gufo_xrt_gemm_upload"), sym(run, "gufo_xrt_gemm_run");
+    std::string dir;
+    if (const char* d = std::getenv("LFM3_XRT_GEMM")) dir = d;
+    else if (const char* m = std::getenv("LFM3_XRT_MODEL")) dir = std::string(m) + "/gemm";
+    else throw std::runtime_error("XRT GEMM: set LFM3_XRT_GEMM or LFM3_XRT_MODEL");
+    g = create(dir.c_str());
+    if (!g) throw std::runtime_error(std::string("XRT GEMM: ") + error());
+  }
+};
+
+bool OnXrt() {
+  const char* d = std::getenv("GUFO_LFM3_DEVICE");
+  return d && std::string_view(d) == "xrt";
+}
+
 struct Dense::Impl {
   std::mutex mutex;
-  ::lfm3::npu::Runtime npu;
+  std::unique_ptr<::lfm3::npu::Runtime> hrx;
+  std::unique_ptr<XrtGemm> xrt;
+  ::lfm3::npu::Runtime& npu_runtime() {
+    if (!hrx) hrx = std::make_unique<::lfm3::npu::Runtime>();
+    return *hrx;
+  }
   std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, int>, int> kernels;
   std::map<std::uint64_t, int> buffers;  // byte size -> scratch buffer
   std::vector<std::uint16_t> xb;
@@ -40,9 +86,9 @@ struct Dense::Impl {
     // Long prompt passes use two matrix cores per column (faster from about
     // 12 blocks; below that the single-core chain wins).
     const bool dual = chain && s.blocks >= 12 && DualBlocksPerCore(s) > 0;
-    const int id = dual    ? npu.Compile(ProjectionDualProgram(s), "projection.loom", ProjectionRoot(s) + "_kdual")
-                   : chain ? npu.Compile(ProjectionKMultiProgram(s, true), "projection.loom", ProjectionRoot(s) + "_kchain")
-                           : npu.Compile(ProjectionProgram(s), "projection.loom", ProjectionRoot(s));
+    const int id = dual    ? npu_runtime().Compile(ProjectionDualProgram(s), "projection.loom", ProjectionRoot(s) + "_kdual")
+                   : chain ? npu_runtime().Compile(ProjectionKMultiProgram(s, true), "projection.loom", ProjectionRoot(s) + "_kchain")
+                           : npu_runtime().Compile(ProjectionProgram(s), "projection.loom", ProjectionRoot(s));
     kernels.emplace(key, id);
     return id;
   }
@@ -51,13 +97,15 @@ struct Dense::Impl {
     bytes = (bytes + 65535) / 65536 * 65536;
     const std::uint64_t key = bytes * 4 + std::uint64_t(role);
     if (auto it = buffers.find(key); it != buffers.end()) return it->second;
-    const int id = npu.Alloc(bytes);
+    const int id = npu_runtime().Alloc(bytes);
     buffers.emplace(key, id);
     return id;
   }
 };
 
-Dense::Dense() : impl_(std::make_unique<Impl>()) {}
+Dense::Dense() : impl_(std::make_unique<Impl>()) {
+  if (OnXrt()) impl_->xrt = std::make_unique<XrtGemm>();
+}
 Dense::~Dense() = default;
 
 Dense& Dense::Shared() {
@@ -75,6 +123,30 @@ Dense::Matrix Dense::Upload(std::uint32_t rows, std::uint32_t cols, const RowFn&
     w.shape.k = (cols + 511) / 512 * 512;
     w.shape.m = (rows + 7) / 8 * 8;
   }
+  if (impl_->xrt) {
+    // Q8_0 of the rows: the codes and scales of Q8_0 tensors come back exactly.
+    const std::uint32_t kp = (cols + 31) / 32 * 32;
+    std::vector<std::int8_t> codes(std::size_t(rows) * kp, 0);
+    std::vector<float> scales(std::size_t(rows) * (kp / 32), 0.0f), buf(kp);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      std::fill(buf.begin(), buf.end(), 0.0f);
+      row(r, std::span<float>(buf.data(), cols));
+      for (std::uint32_t b = 0; b < kp / 32; ++b) {
+        float top = 0;
+        for (int i = 0; i < 32; ++i) top = std::max(top, std::fabs(buf[b * 32 + i]));
+        const float d = float(_Float16(top / 127.0f));
+        scales[std::size_t(r) * (kp / 32) + b] = d;
+        for (int i = 0; i < 32; ++i)
+          codes[std::size_t(r) * kp + b * 32 + i] =
+              d > 0 ? std::int8_t(std::clamp(std::lround(buf[b * 32 + i] / d), -127l, 127l)) : 0;
+      }
+    }
+    std::lock_guard lock(impl_->mutex);
+    w.weights = impl_->xrt->upload(impl_->xrt->g, int(rows), int(kp), codes.data(), scales.data());
+    if (w.weights < 0) throw std::runtime_error(std::string("XRT GEMM upload: ") + impl_->xrt->error());
+    w.shape.k = kp;
+    return w;
+  }
   const auto split = w.shape.split == Split::kRows ? ::lfm3::npu::Split::kRows
                                                    : ::lfm3::npu::Split::kColumns;
   const std::uint32_t kp = w.shape.k;
@@ -83,10 +155,10 @@ Dense::Matrix Dense::Upload(std::uint32_t rows, std::uint32_t cols, const RowFn&
     std::fill(out.begin() + cols, out.end(), 0.0f);
   });
   std::lock_guard lock(impl_->mutex);
-  w.weights = impl_->npu.Alloc(bytes.size());
+  w.weights = impl_->npu_runtime().Alloc(bytes.size());
   constexpr std::size_t kChunk = 64u << 20;
   for (std::size_t off = 0; off < bytes.size(); off += kChunk)
-    impl_->npu.Write(w.weights, off, bytes.data() + off, std::min(kChunk, bytes.size() - off));
+    impl_->npu_runtime().Write(w.weights, off, bytes.data() + off, std::min(kChunk, bytes.size() - off));
   return w;
 }
 
@@ -109,6 +181,19 @@ void Dense::Run(const Matrix& w, std::span<const float> x, std::uint32_t rows, s
     throw std::invalid_argument("NPU projection buffers too small");
   auto& m = *impl_;
   std::lock_guard lock(m.mutex);
+  if (m.xrt) {
+    const float* xs = x.data();
+    std::vector<float> padded;
+    if (w.shape.k != w.k) {  // columns padded to a multiple of 32
+      padded.assign(std::size_t(rows) * w.shape.k, 0.0f);
+      for (std::uint32_t r = 0; r < rows; ++r)
+        std::copy_n(x.data() + std::size_t(r) * w.k, w.k, padded.data() + std::size_t(r) * w.shape.k);
+      xs = padded.data();
+    }
+    if (m.xrt->run(m.xrt->g, w.weights, xs, int(rows), y.data()))
+      throw std::runtime_error(std::string("XRT GEMM: ") + m.xrt->error());
+    return;
+  }
   const std::uint32_t kp = w.shape.k, mp = w.shape.m;
   const std::uint32_t parts = 1;  // K-split matrices sum their columns on chip
   for (std::uint32_t row0 = 0; row0 < rows;) {
@@ -130,12 +215,12 @@ void Dense::Run(const Matrix& w, std::span<const float> x, std::uint32_t rows, s
     const std::size_t block_out = std::size_t(parts) * mp * 8;
     const int xbuf = m.Scratch(0, m.xb.size() * 2);
     const int ybuf = m.Scratch(1, block_out * blocks * 4);
-    m.npu.Write(xbuf, 0, m.xb.data(), m.xb.size() * 2);
+    m.npu_runtime().Write(xbuf, 0, m.xb.data(), m.xb.size() * 2);
     const int bind[] = {xbuf, w.weights, ybuf};
-    m.npu.Dispatch(kernel, bind);
+    m.npu_runtime().Dispatch(kernel, bind);
     const std::uint32_t used = (take + 7) / 8;
     m.yb.resize(block_out * used);
-    m.npu.Read(ybuf, 0, m.yb.data(), m.yb.size() * 4);
+    m.npu_runtime().Read(ybuf, 0, m.yb.data(), m.yb.size() * 4);
     for (std::uint32_t r = 0; r < take; ++r) {
       const float* block = m.yb.data() + std::size_t(r / 8) * block_out;
       const std::uint32_t b = r % 8;
@@ -151,7 +236,7 @@ void Dense::Run(const Matrix& w, std::span<const float> x, std::uint32_t rows, s
   }
 }
 
-::lfm3::npu::Runtime& Dense::runtime() { return impl_->npu; }
+::lfm3::npu::Runtime& Dense::runtime() { return impl_->npu_runtime(); }
 
 void Dense::Enqueue(const Matrix& w, int xb, int y, std::uint32_t blocks) {
   auto& m = *impl_;
@@ -161,16 +246,16 @@ void Dense::Enqueue(const Matrix& w, int xb, int y, std::uint32_t blocks) {
   ProjectionShape s = w.shape;
   s.blocks = blocks;
   const int bind[] = {xb, w.weights, y};
-  m.npu.Enqueue(m.Kernel(s), bind);
+  m.npu_runtime().Enqueue(m.Kernel(s), bind);
 }
 
 int Dense::Zeros(std::uint64_t bytes) {
   auto& m = *impl_;
   std::lock_guard lock(m.mutex);
-  const int id = m.npu.Alloc(bytes);
+  const int id = m.npu_runtime().Alloc(bytes);
   std::vector<std::uint8_t> zero(std::min<std::uint64_t>(bytes, 64u << 20), 0);
   for (std::uint64_t off = 0; off < bytes; off += zero.size())
-    m.npu.Write(id, off, zero.data(), std::min<std::uint64_t>(zero.size(), bytes - off));
+    m.npu_runtime().Write(id, off, zero.data(), std::min<std::uint64_t>(zero.size(), bytes - off));
   return id;
 }
 
