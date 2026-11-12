@@ -1,5 +1,7 @@
 #include "engine.hpp"
 
+#include "xrt/engine.hpp"
+
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -91,6 +93,7 @@ void Visit(Weights& w, F f) {
 struct Model::Impl {
   std::unique_ptr<core::GgufReader> reader;
   std::unique_ptr<npu::Backbone> npu;
+  std::unique_ptr<xrt::Engine> xrt;
   std::unique_ptr<Tokenizer> tokenizer;
   Weights weights;
   DeviceWeights device;
@@ -133,6 +136,19 @@ std::shared_ptr<Model> Model::Load(const std::string& path, std::string* error,
         return nullptr;
       return m;
     }
+    if (const char* device = std::getenv("GUFO_LFM3_DEVICE");
+        device && std::string_view(device) == "xrt") {
+      const auto& c = m->impl_->weights.config;
+      if (c.decision)
+        throw std::invalid_argument("LFM3 XRT runs chat models only");
+      m->impl_->tokenizer = Tokenizer::Load(*m->impl_->reader, error);
+      if (!m->impl_->tokenizer)
+        return nullptr;
+      m->impl_->xrt = xrt::Engine::Open(c.context, c.vocab, error);
+      if (!m->impl_->xrt)
+        return nullptr;
+      return m;
+    }
     // Copy packed weights verbatim so quantization and mapped-file lifetime
     // never depend on a session; tied embeddings share one copy. The
     // tokenizer parses on this thread meanwhile.
@@ -169,6 +185,9 @@ const Tokenizer& Model::tokenizer() const {
 }
 bool Model::OnNpu() const {
   return impl_->npu != nullptr;
+}
+bool Model::OnXrt() const {
+  return impl_->xrt != nullptr;
 }
 struct Session::Impl {
   static constexpr std::size_t kChunk = Session::kPrefillChunk;
@@ -616,8 +635,98 @@ struct Session::Npu {
     }
   }
 };
+// XRT sessions: token history over the model's shared xrt::Engine.
+struct Session::Xrt {
+  std::shared_ptr<Model> model;
+  std::uint32_t context;
+  // Inputs so far: token ids, or xrt::Engine::kRowBase + k for embedding row k of `rows`.
+  std::vector<std::uint32_t> tokens;
+  std::vector<float> rows;
+  std::vector<float> logits;
+  bool logits_ready{}, poisoned{};
+  // Final hidden state of the last row, read on demand into pinned memory the GPU
+  // (an audio voice) can address.
+  float* hidden{};
+  bool hidden_ready{};
+  const float* Hidden() {
+    const auto H = model->config().hidden;
+    if (!hidden && hipHostMalloc(reinterpret_cast<void**>(&hidden), std::size_t(H) * 4, hipHostMallocMapped) != hipSuccess)
+      throw std::runtime_error("cannot allocate the LFM3 XRT hidden row");
+    if (!hidden_ready) {
+      model->impl_->xrt->Hidden(this, std::span(hidden, H));
+      hidden_ready = true;
+    }
+    return hidden;
+  }
+
+  Xrt(std::shared_ptr<Model> m, std::uint32_t ctx) : model(std::move(m)), context(ctx) {
+    logits.assign(model->config().vocab, 0.0f);
+  }
+  ~Xrt() {
+    model->impl_->xrt->Release(this);
+    if (hidden)
+      (void)hipHostFree(hidden);
+  }
+  void Run(std::span<const std::uint32_t> run, bool want_logits) {
+    const auto& c = model->config();
+    if (poisoned)
+      throw std::runtime_error("LFM3 session requires Reset after a device error");
+    if (run.empty() || run.size() > context - tokens.size())
+      throw std::invalid_argument("invalid LFM3 token count or context exhausted");
+    for (auto t : run)
+      if (t >= c.vocab)
+        throw std::invalid_argument("LFM3 token out of range");
+    Advance(run, want_logits);
+  }
+  // Embedding rows (hidden floats each) as inputs.
+  void RunRows(std::span<const float> r, bool want_logits) {
+    const auto H = model->config().hidden;
+    if (r.empty() || r.size() % H)
+      throw std::invalid_argument("LFM3 embedding rows must be whole");
+    if (!model->impl_->xrt->SupportsRows())
+      throw std::invalid_argument("this LFM3 XRT library takes no embedding rows");
+    const std::size_t n = r.size() / H, first = rows.size() / H;
+    if (n > context - tokens.size())
+      throw std::invalid_argument("LFM3 context exhausted");
+    rows.insert(rows.end(), r.begin(), r.end());
+    std::vector<std::uint32_t> ids(n);
+    for (std::size_t i = 0; i < n; ++i)
+      ids[i] = xrt::Engine::kRowBase + std::uint32_t(first + i);
+    Advance(ids, want_logits);
+  }
+  void Advance(std::span<const std::uint32_t> run, bool want_logits) {
+    try {
+      model->impl_->xrt->RunMixed(this, tokens, run, rows.data(),
+                                  want_logits ? std::span(logits) : std::span<float>{});
+    } catch (...) {
+      poisoned = true;
+      throw;
+    }
+    tokens.insert(tokens.end(), run.begin(), run.end());
+    logits_ready = want_logits;
+    hidden_ready = false;
+  }
+  void Speculate(std::uint32_t token) {
+    if (!poisoned && tokens.size() < context)
+      model->impl_->xrt->Speculate(this, tokens, token);
+  }
+  // Logits of the last row when the pass that wrote it did not ask: replay.
+  void EnsureLogits() {
+    if (logits_ready || tokens.empty())
+      return;
+    std::vector<std::uint32_t> all = std::move(tokens);
+    tokens.clear();
+    model->impl_->xrt->Release(this);
+    Advance(all, true);  // rows keep their indices
+  }
+};
+[[noreturn]] void XrtUnsupported(const char* what) {
+  throw std::invalid_argument(std::string("LFM3 on XRT does not support ") + what);
+}
 Session::Session(std::shared_ptr<Model> m, std::uint32_t context) {
-  if (m->OnNpu())
+  if (m->OnXrt())
+    xrt_ = std::make_unique<Xrt>(std::move(m), context);
+  else if (m->OnNpu())
     npu_ = std::make_unique<Npu>(std::move(m), context);
   else
     impl_ = std::make_unique<Impl>(std::move(m), context);
@@ -645,6 +754,11 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t context,
 bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
                               std::span<const float> embeddings,
                               std::span<float> logits, std::string* error) {
+  if (xrt_) {
+    if (error)
+      *error = "LFM3 on XRT does not support decision models";
+    return false;
+  }
   if (npu_) {
     try {
       auto& n = *npu_;
@@ -699,6 +813,11 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
                               std::span<const std::uint32_t> positions,
                               std::span<const std::uint32_t> vocabulary,
                               std::span<float> logits, std::string* error) {
+  if (xrt_) {
+    if (error)
+      *error = "LFM3 on XRT does not support decision models";
+    return false;
+  }
   if (npu_) {
     try {
       auto& n = *npu_;
@@ -835,8 +954,28 @@ bool Session::ForwardDecision(std::span<const std::uint32_t> tokens,
     return false;
   }
 }
+void Session::Speculate(std::uint32_t token) {
+  if (xrt_)
+    xrt_->Speculate(token);
+}
 bool Session::Forward(std::span<const std::uint32_t> tokens,
                       std::span<float> logits, std::string* error) {
+  if (xrt_) {
+    try {
+      if (!logits.empty() && logits.size() != xrt_->logits.size())
+        throw std::invalid_argument("invalid LFM3 logit count");
+      if (hooks_)
+        hooks_->BeforeWrite(Position(), Position() + std::uint32_t(tokens.size()));
+      xrt_->Run(tokens, !logits.empty());
+      if (!logits.empty())
+        std::copy(xrt_->logits.begin(), xrt_->logits.end(), logits.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   if (npu_) {
     try {
       auto& n = *npu_;
@@ -896,6 +1035,22 @@ bool Session::Forward(std::span<const std::uint32_t> tokens,
 }
 bool Session::ForwardEmbeddings(std::span<const float> rows, bool on_device,
                                 std::span<float> logits, std::string* error) {
+  if (xrt_) {
+    try {
+      // XRT sessions take host rows (callers keep rows on the host for this backbone).
+      (void)on_device;
+      if (hooks_)
+        hooks_->BeforeWrite(Position(), Position() + std::uint32_t(rows.size() / xrt_->model->config().hidden));
+      xrt_->RunRows(rows, !logits.empty());
+      if (!logits.empty())
+        std::copy(xrt_->logits.begin(), xrt_->logits.end(), logits.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   if (npu_) {
     // NPU sessions take every row from host memory.
     try {
@@ -955,6 +1110,40 @@ bool Session::ForwardEmbeddings(std::span<const float> rows, bool on_device,
 }
 bool Session::ForwardInputs(std::span<const Input> inputs,
                             std::span<float> logits, std::string* error) {
+  if (xrt_) {
+    // One mixed prefill: token ids and embedding rows (host) in prompt order.
+    try {
+      auto& x = *xrt_;
+      const auto& c = x.model->config();
+      std::vector<std::uint32_t> all;
+      for (const auto& input : inputs) {
+        for (auto t : input.tokens)
+          if (t >= c.vocab)
+            throw std::invalid_argument("LFM3 token out of range");
+        all.insert(all.end(), input.tokens.begin(), input.tokens.end());
+        if (!input.rows.empty()) {
+          if (input.rows.size() % c.hidden)
+            throw std::invalid_argument("LFM3 embedding rows must be whole");
+          const std::size_t first = x.rows.size() / c.hidden, n = input.rows.size() / c.hidden;
+          x.rows.insert(x.rows.end(), input.rows.begin(), input.rows.end());
+          for (std::size_t i = 0; i < n; ++i)
+            all.push_back(xrt::Engine::kRowBase + std::uint32_t(first + i));
+        }
+      }
+      if (all.empty() || all.size() > x.context - x.tokens.size())
+        throw std::invalid_argument("invalid LFM3 input count or context exhausted");
+      if (hooks_)
+        hooks_->BeforeWrite(Position(), Position() + std::uint32_t(all.size()));
+      x.Advance(all, !logits.empty());
+      if (!logits.empty())
+        std::copy(x.logits.begin(), x.logits.end(), logits.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   if (npu_) {
     try {
       auto& n = *npu_;
@@ -1078,6 +1267,17 @@ bool Session::ForwardInputs(std::span<const Input> inputs,
   }
 }
 bool Session::ReadHidden(std::span<float> hidden, std::string* error) const {
+  if (xrt_) {
+    try {
+      const auto* h = xrt_->Hidden();
+      std::copy_n(h, std::min<std::size_t>(hidden.size(), xrt_->model->config().hidden), hidden.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   if (npu_) {
     if (npu_->poisoned || !npu_->state.position || hidden.size() != npu_->frontier.size()) {
       if (error)
@@ -1101,15 +1301,34 @@ bool Session::ReadHidden(std::span<float> hidden, std::string* error) const {
   }
 }
 const float* Session::DeviceHidden() const {
+  if (xrt_) {
+    try {
+      return xrt_->Hidden();  // pinned host memory, addressable by the GPU
+    } catch (const std::exception&) {
+      return nullptr;
+    }
+  }
   return npu_ ? npu_->frontier.data() : impl_->frontier.floats();
 }
 void* Session::DeviceStream() const {
-  return npu_ ? nullptr : impl_->stream.value;
+  return npu_ || xrt_ ? nullptr : impl_->stream.value;
 }
 bool Session::ForwardBatch(std::span<Session* const> sessions,
                            std::span<const std::uint32_t> tokens,
                            std::span<std::span<float>> outputs,
                            std::string* error) {
+  if (!sessions.empty() && sessions.front() && sessions.front()->xrt_) {
+    // One engine context: the rows run one session after another.
+    if (outputs.size() != sessions.size() || tokens.size() != sessions.size()) {
+      if (error)
+        *error = "invalid LFM3 decode batch shape";
+      return false;
+    }
+    for (std::size_t i = 0; i < sessions.size(); ++i)
+      if (!sessions[i] || !sessions[i]->Forward(tokens.subspan(i, 1), outputs[i], error))
+        return false;
+    return true;
+  }
   if (!sessions.empty() && sessions.front() && sessions.front()->npu_) {
     try {
       if (outputs.size() != sessions.size())
@@ -1171,6 +1390,31 @@ bool Session::ForwardBatchInputs(std::span<Session* const> sessions,
                                  std::span<const std::uint32_t> tokens,
                                  std::span<const float* const> rows,
                                  bool logits, std::string* error) {
+  if (!sessions.empty() && sessions.front() && sessions.front()->xrt_) {
+    if (tokens.size() != sessions.size()) {
+      if (error)
+        *error = "invalid LFM3 decode batch shape";
+      return false;
+    }
+    for (std::size_t i = 0; i < sessions.size(); ++i) {
+      auto* s = sessions[i];
+      if (!s || !s->xrt_)
+        return false;
+      try {
+        if (s->hooks_)
+          s->hooks_->BeforeWrite(s->Position(), s->Position() + 1);
+        if (rows.size() > i && rows[i])  // a host row in place of the token
+          s->xrt_->RunRows(std::span(rows[i], s->xrt_->model->config().hidden), logits);
+        else
+          s->xrt_->Run(tokens.subspan(i, 1), logits);
+      } catch (const std::exception& e) {
+        if (error)
+          *error = e.what();
+        return false;
+      }
+    }
+    return true;
+  }
   if (!sessions.empty() && sessions.front() && sessions.front()->npu_) {
     try {
       if (rows.size() != sessions.size())
@@ -1237,6 +1481,16 @@ bool Session::ForwardBatchInputs(std::span<Session* const> sessions,
   }
 }
 bool Session::Reset(std::string* error) {
+  if (xrt_) {
+    if (hooks_)
+      hooks_->BeforeReset();
+    xrt_->tokens.clear();
+    xrt_->rows.clear();
+    xrt_->model->impl_->xrt->Release(xrt_.get());
+    xrt_->logits_ready = false;
+    xrt_->poisoned = false;
+    return true;
+  }
   if (npu_) {
     if (hooks_)
       hooks_->BeforeReset();
@@ -1269,6 +1523,8 @@ bool Session::Reset(std::string* error) {
   }
 }
 std::uint32_t Session::Position() const {
+  if (xrt_)
+    return std::uint32_t(xrt_->tokens.size());
   return npu_ ? npu_->state.position : impl_->position;
 }
 void Session::SetContinuationHooks(ContinuationHooks* hooks) {
@@ -1276,6 +1532,8 @@ void Session::SetContinuationHooks(ContinuationHooks* hooks) {
 }
 void* Session::ContinuationData(ContinuationTensor tensor,
                                 std::size_t layer) const {
+  if (xrt_)
+    XrtUnsupported("continuation rows");
   if (npu_) {
     auto& n = *npu_;
     n.backbone().SyncToHost(n.state);
@@ -1308,17 +1566,25 @@ void* Session::ContinuationData(ContinuationTensor tensor,
   return nullptr;
 }
 std::uint32_t Session::RingCapacity(std::size_t layer) const {
+  if (xrt_)
+    XrtUnsupported("continuation rows");
   return npu_ ? npu_->state.layers[layer].capacity : impl_->states[layer].capacity;
 }
 bool Session::IsCoherent() const {
+  if (xrt_)
+    return !xrt_->poisoned;
   return npu_ ? !npu_->poisoned : !impl_->poisoned;
 }
 void Session::PrepareLogits() {
+  if (xrt_)
+    return xrt_->EnsureLogits();
   if (npu_)
     return npu_->EnsureLogits();
   impl_->EnsureLogits();
 }
 void Session::BeginRestore() {
+  if (xrt_)
+    XrtUnsupported("continuation restore");
   if (npu_) {
     npu_->poisoned = true;
     return;
@@ -1327,6 +1593,8 @@ void Session::BeginRestore() {
   impl_->poisoned = true;
 }
 void Session::FinishRestore(std::uint32_t position) {
+  if (xrt_)
+    XrtUnsupported("continuation restore");
   if (npu_) {
     npu_->state.position = position;
     npu_->backbone().SyncToDevice(npu_->state);
@@ -1386,10 +1654,25 @@ std::size_t StateBytes(const Config& c, std::uint32_t position) {
 }
 }  // namespace
 std::size_t Session::SnapshotBytes() const {
+  if (xrt_)
+    return 0;
   return npu_ ? StateBytes(npu_->model->config(), npu_->state.position)
               : StateBytes(impl_->model->config(), impl_->position);
 }
 bool Session::ReadLogits(std::span<float> output, std::string* error) const {
+  if (xrt_) {
+    try {
+      if (xrt_->poisoned || xrt_->tokens.empty() || output.size() != xrt_->logits.size())
+        throw std::invalid_argument("invalid LFM3 logit frontier");
+      xrt_->EnsureLogits();
+      std::copy(xrt_->logits.begin(), xrt_->logits.end(), output.begin());
+      return true;
+    } catch (const std::exception& e) {
+      if (error)
+        *error = e.what();
+      return false;
+    }
+  }
   if (npu_) {
     try {
       auto& n = *npu_;
@@ -1419,6 +1702,8 @@ bool Session::ReadLogits(std::span<float> output, std::string* error) const {
   }
 }
 std::vector<std::uint8_t> Session::SaveSnapshot() const {
+  if (xrt_)
+    XrtUnsupported("snapshots");
   if (npu_) {
     auto& n = *npu_;
     if (n.poisoned)
@@ -1502,6 +1787,11 @@ std::vector<std::uint8_t> Session::SaveSnapshot() const {
 }
 bool Session::RestoreSnapshot(std::span<const std::uint8_t> bytes,
                               std::string* error) {
+  if (xrt_) {
+    if (error)
+      *error = "LFM3 on XRT does not support snapshots";
+    return false;
+  }
   try {
     if (hooks_)
       hooks_->BeforeRestore();

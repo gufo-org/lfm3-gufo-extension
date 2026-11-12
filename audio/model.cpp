@@ -307,7 +307,7 @@ struct GraphExec {
 struct Model::Impl {
   // NPU mode (GUFO_LFM3_DEVICE=npu): tower projections on the NPU, the rest
   // on the host; tensors keep their mapped host data.
-  bool npu{};
+  bool npu{}, xrt{};
   std::unique_ptr<lfm3::npu::Stack> npu_encoder, npu_depth, npu_codec;
   // The codec stack on the NPU device path (every operation on the NPU).
   std::unique_ptr<lfm3::Weights> codec_weights, depth_weights, encoder_weights;
@@ -413,9 +413,13 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
   try {
     auto m = std::shared_ptr<Model>(new Model);
     auto& impl = *m->impl_;
+    // GUFO_LFM3_DEVICE=xrt runs the towers like npu, with their projections
+    // on q8gemm.xclbin through XRT (npu::Dense) and the rest on the host.
     if (const char* device = std::getenv("GUFO_LFM3_DEVICE");
-        device && std::string_view(device) == "npu")
+        device && (std::string_view(device) == "npu" || std::string_view(device) == "xrt")) {
       impl.npu = true;
+      impl.xrt = std::string_view(device) == "xrt";
+    }
     // The projector streams from disk beside the backbone, binding against
     // the backbone geometry read from its metadata.
     std::string projector_error;
@@ -543,7 +547,7 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
       impl.npu_encoder = std::make_unique<lfm3::npu::Stack>(w.encoder);
         // The encoder stack runs on the NPU device path (GUFO_LFM3_ENCODER_DEVICE=0:
         // host-glue stack; =check: both, with their largest difference).
-        if (const char* e = std::getenv("GUFO_LFM3_ENCODER_DEVICE"); !(e && std::string_view(e) == "0")) {
+        if (const char* e = std::getenv("GUFO_LFM3_ENCODER_DEVICE"); !impl.xrt && !(e && std::string_view(e) == "0")) {
           impl.encoder_weights = std::make_unique<lfm3::Weights>(StackWeights(w.encoder, w.encoder_window));
           std::string error;
           impl.encoder_device = lfm3::npu::Backbone::Load(*impl.encoder_weights, &error);
@@ -560,7 +564,7 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
         // The depth decoder runs on the NPU device path, bidirectional over
         // its codebook rows (GUFO_LFM3_DEPTH_DEVICE=0: host-glue stack;
         // =check: both, with their largest difference).
-        if (const char* e = std::getenv("GUFO_LFM3_DEPTH_DEVICE"); !(e && std::string_view(e) == "0")) {
+        if (const char* e = std::getenv("GUFO_LFM3_DEPTH_DEVICE"); !impl.xrt && !(e && std::string_view(e) == "0")) {
           impl.depth_weights = std::make_unique<lfm3::Weights>(StackWeights(w.depth, 0));
           std::string error;
           impl.depth_device = lfm3::npu::Backbone::Load(*impl.depth_weights, &error);
@@ -580,7 +584,7 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
         impl.npu_codec = std::make_unique<lfm3::npu::Stack>(w.codec);
         // The codec runs on the NPU device path (GUFO_LFM3_CODEC_DEVICE=0: the
         // host-glue stack; =check: both, with their largest difference).
-        if (const char* e = std::getenv("GUFO_LFM3_CODEC_DEVICE"); !(e && std::string_view(e) == "0")) {
+        if (const char* e = std::getenv("GUFO_LFM3_CODEC_DEVICE"); !impl.xrt && !(e && std::string_view(e) == "0")) {
           impl.codec_weights = std::make_unique<lfm3::Weights>(StackWeights(w.codec, w.codec_window));
           std::string error;
           impl.codec_device = lfm3::npu::Backbone::Load(*impl.codec_weights, &error);
@@ -774,6 +778,8 @@ void Model::Impl::EncodeTokensNpu(std::span<const float> mel, int mel_first,
     const int W2 = (W1 + 1) / 2, H2 = (H1 + 1) / 2;
     const int W3 = (W2 + 1) / 2, H3 = (H2 + 1) / 2;
     std::vector<float> c1, c2, c3(std::size_t(W2) * H2 * C), flat;
+    static const bool timing = std::getenv("GUFO_LFM3_NPU_TIMING") != nullptr;
+    const auto front0 = std::chrono::steady_clock::now();
     conv(window, T, B, w.conv_weight[0], w.conv_bias[0], true, c1);
     conv(c1.data(), W1, H1, w.conv_weight[1], w.conv_bias[1], false, c2);
     lfm3::npu::HostGemm(c2.data(), F(w.conv_weight[2]), F(w.conv_bias[2]),
@@ -787,6 +793,9 @@ void Model::Impl::EncodeTokensNpu(std::span<const float> mel, int mel_first,
       const int c = int(i % C), h = int((i / C) % H3), tt = int(i / (std::size_t(C) * H3));
       flat[std::size_t(tt) * C * H3 + std::size_t(c) * H3 + h] = c3[i];
     }
+    if (timing)
+      std::fprintf(stderr, "npu encoder front end: %d mel frames %.3f ms\n", T,
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front0).count());
     const int skip = t0 - f0 / 8;
     std::vector<float> x(std::size_t(n) * e.hidden), z(x.size()), o(x.size());
     dense.Run(npu_pre_out, std::span(flat).subspan(std::size_t(skip) * H3 * C),

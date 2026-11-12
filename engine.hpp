@@ -31,6 +31,10 @@ public:
   // NPU sessions keep their state in host memory: DeviceHidden and
   // ContinuationData return host pointers and DeviceStream is null.
   bool OnNpu() const;
+  // The whole model runs on the XDNA NPU through XRT when
+  // GUFO_LFM3_DEVICE=xrt at load (xrt/engine.hpp): sessions take tokens,
+  // keep no continuation rows and support no snapshots or embeddings.
+  bool OnXrt() const;
 
 private:
   Model();
@@ -60,6 +64,9 @@ public:
                        std::span<const std::uint32_t> positions,
                        std::span<const std::uint32_t> vocabulary,
                        std::span<float> logits, std::string* error = nullptr);
+  // Hint that `token` is the next one advanced: on XRT its decode starts now,
+  // so host work overlaps the NPU. Correct whatever is advanced next.
+  void Speculate(std::uint32_t token);
   // Advances text tokens and optionally returns the final logits.
   // State is session-owned; device weights are shared by sessions.
   bool Forward(std::span<const std::uint32_t> tokens,
@@ -130,6 +137,8 @@ private:
   std::unique_ptr<Impl> impl_;
   struct Npu;
   std::unique_ptr<Npu> npu_;
+  struct Xrt;
+  std::unique_ptr<Xrt> xrt_;
   ContinuationHooks* hooks_{};
   Session(std::shared_ptr<Model> model, std::uint32_t context);
   friend class Model;
