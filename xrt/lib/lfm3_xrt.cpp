@@ -196,6 +196,7 @@ struct flm_lfm3 {
     if (!dl) throw std::runtime_error(std::string("dlopen decode_dispatch.so: ") + dlerror());
     gen = reinterpret_cast<Dispatch>(dlsym(dl, "dispatch_generate"));
     if (!gen) throw std::runtime_error("decode_dispatch.so lacks dispatch_generate");
+    FindTokenPatch();
   }
 
   ~flm_lfm3() {
@@ -211,6 +212,46 @@ struct flm_lfm3 {
                                            size_t(id) * meta("d.emb_row"));
   }
 
+  // Instruction streams depend on the token id only through a few address words: the
+  // next position's stream is generated (with id 0) while the NPU runs the current
+  // token, then patched with words[i] += id * delta[i].
+  std::vector<uint32_t> next_ins_;
+  int next_pos_ = -1;
+  std::vector<std::pair<uint32_t, uint32_t>> tok_patch_;  // (index, delta)
+  bool patch_ok_ = false;
+
+  int64_t Generate(int id, int pos, uint32_t **ins) {
+    const int first = std::max(0, pos - window + 1), cached_swa = pos - first;
+    const int recs = std::max(2, (pos + 15) / 16), b = std::max(1, recs - 64);
+    if (recs - b > 64 || b > 64) throw std::runtime_error("decode beyond 2048 positions is not supported yet");
+    return gen(id, pos, first, cached_swa, recs, std::max(1, (cached_swa + 15) / 16), recs - b, b, ins);
+  }
+  void FindTokenPatch() {
+    uint32_t *p;
+    const int64_t n = Generate(0, 40, &p);
+    std::vector<uint32_t> a(p, p + n);
+    if (Generate(1, 40, &p) != n) return;
+    std::vector<uint32_t> b(p, p + n);
+    for (int64_t i = 0; i < n; ++i)
+      if (a[i] != b[i]) tok_patch_.push_back({uint32_t(i), b[i] - a[i]});
+    const int big = vocab;  // the largest id (the spare row)
+    if (Generate(big, 40, &p) != n) return;
+    for (int64_t i = 0; i < n; ++i) {
+      uint32_t v = a[i];
+      for (auto [j, d] : tok_patch_)
+        if (j == i) v += uint32_t(big) * d;
+      if (v != p[i]) return;
+    }
+    patch_ok_ = true;
+  }
+  void Prepare(int pos) {
+    if (!patch_ok_ || pos >= max_length) return;
+    uint32_t *p;
+    const int64_t n = Generate(0, pos, &p);
+    next_ins_.assign(p, p + n);
+    next_pos_ = pos;
+  }
+
   // Decodes `id` at position `length` and appends it. A row id (< 0) goes through
   // the spare embedding-table row after the vocabulary, as token `vocab`.
   void Decode(int32_t id, float *logits) {
@@ -222,23 +263,34 @@ struct flm_lfm3 {
     }
     if (length >= max_length) throw std::runtime_error("context is full");
     const int pos = length;
-    const int first = std::max(0, pos - window + 1), cached_swa = pos - first;
-    const int recs = std::max(2, (pos + 15) / 16), b = std::max(1, recs - 64);
-    if (recs - b > 64 || b > 64) throw std::runtime_error("decode beyond 2048 positions is not supported yet");
-    uint32_t *ins = nullptr;
-    const int64_t n = gen(id, pos, first, cached_swa, recs, std::max(1, (cached_swa + 15) / 16), recs - b, b, &ins);
-    if (n <= 0 || size_t(n) * 4 > d_ins.size()) throw std::runtime_error("dispatch_generate failed");
-    std::memcpy(d_ins.map<void *>(), ins, size_t(n) * 4);
+    const double g0 = Now();
+    int64_t n;
+    uint32_t *dst = d_ins.map<uint32_t *>();
+    if (next_pos_ == pos) {  // prepared during the previous token: patch in the id
+      n = int64_t(next_ins_.size());
+      if (size_t(n) * 4 > d_ins.size()) throw std::runtime_error("instruction stream too large");
+      std::memcpy(dst, next_ins_.data(), size_t(n) * 4);
+      for (auto [i, d] : tok_patch_) dst[i] += uint32_t(id) * d;
+    } else {
+      uint32_t *ins = nullptr;
+      n = Generate(id, pos, &ins);
+      if (n <= 0 || size_t(n) * 4 > d_ins.size()) throw std::runtime_error("dispatch_generate failed");
+      std::memcpy(dst, ins, size_t(n) * 4);
+    }
     d_ins.sync(XCL_BO_SYNC_BO_TO_DEVICE, size_t(n) * 4, 0);
     const double t0 = Now();
     auto run = dec.kernel(3u, d_ins, uint32_t(n), d_s, d_w);
+    Prepare(pos + 1);  // on the host while the NPU runs
     run.wait();
-    if (Timing()) std::fprintf(stderr, "lfm3_xrt: decode pos %d %.2f ms\n", pos, 1e3 * (Now() - t0));
+    const double t1 = Now();
     if (logits) {
       const size_t off = meta("d.logits");
       d_s.sync(XCL_BO_SYNC_BO_FROM_DEVICE, size_t(vocab) * 4, off);
       std::memcpy(logits, d_s.map<const char *>() + off, size_t(vocab) * 4);
     }
+    if (Timing())
+      std::fprintf(stderr, "lfm3_xrt: decode pos %d %.2f ms (instructions %.2f ms, logits %.2f ms)\n", pos,
+                   1e3 * (t1 - t0), 1e3 * (t0 - g0), 1e3 * (Now() - t1));
     ++length;
   }
 

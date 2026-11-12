@@ -62,7 +62,10 @@ def handoff(meta, S, C, n):
                 tok = n - 6 + tap + p["state_rows"]                  # scratch row of token n - 6 + tap
                 vals = from_bf16(C[rows + tok * p["conv_row"] + (ch // 64) * 128 + ch % 64])
                 st[c, :, j, :] = vals.reshape(96, 8)
-        S[d["state"][i]:d["state"][i] + st.nbytes] = st.view(np.int8).reshape(-1)
+        # per column: the state chunks; the taps follow within the column's STATE_COL bytes
+        for c in range(8):
+            at = d["state"][i] + c * d["state_col"]
+            S[at:at + st[c].nbytes] = st[c].view(np.int8).reshape(-1)
 
 
 def main():
@@ -77,7 +80,7 @@ def main():
     dev = pyxrt.device(0)
     pctx, pk = kernel_of(dev, bundle / "prefill.xclbin")
     dctx, dk = kernel_of(dev, bundle / "decode.xclbin")
-    pins = np.fromfile(bundle / "prefill.insts", np.uint32)
+    pins = np.fromfile(bundle / ("prefill_head512.insts" if n - 2 >= 512 else "prefill_head0.insts"), np.uint32)
     E = np.fromfile(bundle / "prefill_weights.bin", np.uint8)
     Cs = np.fromfile(bundle / "prefill_scratch.bin", np.uint16)
     M, REC, H = meta["prefill"]["M"], meta["prefill"]["rec"], meta["hidden"]
