@@ -137,6 +137,9 @@ gufo_extension_target(
     gufo_lfm3_hip
     gufo_lfm3
     gufo_ext_cache
+    # runner.cpp hashes with <gufo/ext/sha256.hpp>, whose header includes
+    # <openssl/evp.h>; gufo_ext_core carries OpenSSL::Crypto and the hasher.
+    gufo_ext_core
     gufo_ext_runtime
     hip::host
     Threads::Threads
