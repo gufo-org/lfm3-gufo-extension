@@ -4,7 +4,7 @@
   "api_version": ">= 0.3.4",
   "version": "0.6.0",
   "depends": [],
-  "platforms": ["linux"],
+  "platforms": ["linux", "windows"],
   "entry": "lfm3_register",
   "registration_target": "gufo_lfm3",
   "targets": {
