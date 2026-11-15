@@ -133,10 +133,10 @@ std::shared_ptr<Model> Model::Load(const std::string& path, std::string* error,
         return nullptr;
       if (c.decision) {
         m->impl_->decider =
-            std::make_unique<npu::Decider>(npu_bundle, m->impl_->weights);
+            std::make_unique<npu::Decider>(m->impl_->weights);
         return m;
       }
-      m->impl_->npu = npu::Engine::Open(npu_bundle, c.context, c.vocab, error);
+      m->impl_->npu = npu::Engine::Open(m->impl_->weights, c.context, error);
       if (!m->impl_->npu)
         return nullptr;
       return m;

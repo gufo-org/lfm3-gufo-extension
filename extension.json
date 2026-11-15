@@ -71,7 +71,7 @@
       "type": "boolean",
       "commands": ["serve", "prompt", "chat", "bench", "decide"],
       "providers": ["lfm3", "lfm3-audio-asr", "lfm3-audio-tts", "d1"],
-      "help": "Run the LFM3 backbone on the XDNA NPU from the model's .npu bundle (npu/README.md)"
+      "help": "Run the LFM3 backbone on the XDNA NPU (npu/README.md)"
     }
   ]
 }

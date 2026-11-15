@@ -37,6 +37,7 @@ gufo_extension_target(
   SOURCES
     engine.cpp
     upload.cpp
+    npu/backbone.cpp
     npu/d1.cpp
     npu/dense.cpp
     npu/engine.cpp

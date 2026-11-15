@@ -2,16 +2,16 @@
 // Sessions over the one NPU runtime (npu/runtime.hpp). The runtime holds one
 // context; the owner of the next pass replays its history when another
 // session used it since. Inputs that need no logits wait for the next pass
-// that does, and a long continuation prefills the whole history again when
-// that is cheaper than decoding it row by row.
+// that does; a continuation of several rows prefills at its position.
 
 #include <cstdint>
-#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
 #include <vector>
+
+#include "../weights.hpp"
 
 namespace gufo::models::lfm3::npu {
 
@@ -19,11 +19,10 @@ class Runtime;
 
 class Engine {
 public:
-  // Opens the bundle directory written by npu/iron/bundle.py. Returns nullptr
-  // with *error set on failure.
-  static std::unique_ptr<Engine> Open(const std::filesystem::path& bundle,
-                                      std::uint32_t context,
-                                      std::uint32_t vocab, std::string* error);
+  // Uploads `weights` (borrowed) to the NPU. Returns nullptr with *error set
+  // on failure.
+  static std::unique_ptr<Engine> Open(const Weights& weights,
+                                      std::uint32_t context, std::string* error);
   ~Engine();
   // Appends `tokens` to `history` (the caller's inputs so far) and writes the
   // last row's logits when `logits` is not empty.
@@ -57,7 +56,7 @@ private:
   bool speculating_{};                   // resident_.back() is a started decode
   std::size_t pending_{};  // the last pending_ of resident_ wait for a pass
   static constexpr std::size_t kFreshPrefill =
-      1024;  // rows of the largest prefill
+      4096;  // pending rows that wait for the next pass
   void Flush(std::span<const std::uint32_t> tokens, std::span<float> logits);
   void Prefill(std::span<const std::uint32_t> tokens, std::span<float> logits);
   const float* rows_{};       // rows of the current RunMixed

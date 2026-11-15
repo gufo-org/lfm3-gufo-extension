@@ -1,24 +1,20 @@
 #pragma once
-// The LFM3 backbone on the XDNA NPU through gufo::npu: our IRON kernels
-// (npu/iron) in one prefill program per row count (M = 128, 512, 1024) and one
-// decode program per token. A bundle directory written by npu/iron/bundle.py
-// holds the programs, their instruction streams and the repacked weights.
-//
-// A fresh prompt of up to M tokens prefills, then its KV caches and
-// convolution states are copied into the decode state; anything else decodes
-// token by token. Embedding rows (audio, vision) go in place of token ids.
+// The LFM3 backbone on the XDNA NPU (npu::Backbone): prompts of any length
+// prefill as one forward pass, at any position; single rows decode. Embedding
+// rows (audio, vision) go in place of token ids.
 
 #include <cstdint>
-#include <filesystem>
 #include <memory>
 #include <span>
+
+#include "../weights.hpp"
 
 namespace gufo::models::lfm3::npu {
 
 class Runtime {
 public:
-  // Throws gufo::npu::Error or std::runtime_error.
-  Runtime(const std::filesystem::path& bundle, int max_length);
+  // Borrows `weights`. Throws gufo::npu::Error or std::runtime_error.
+  Runtime(const Weights& weights, int max_length);
   ~Runtime();
   Runtime(const Runtime&) = delete;
   Runtime& operator=(const Runtime&) = delete;

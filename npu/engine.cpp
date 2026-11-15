@@ -7,22 +7,18 @@
 
 namespace gufo::models::lfm3::npu {
 
-std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& bundle,
-                                     std::uint32_t context, std::uint32_t vocab,
+std::unique_ptr<Engine> Engine::Open(const Weights& weights,
+                                     std::uint32_t context,
                                      std::string* error) {
   try {
     std::unique_ptr<Engine> e(new Engine);
-    e->npu_ = std::make_unique<Runtime>(bundle, int(context));
+    e->npu_ = std::make_unique<Runtime>(weights, int(context));
     e->vocab_ = std::uint32_t(e->npu_->vocab());
     e->hidden_ = std::uint32_t(e->npu_->hidden());
-    if (e->vocab_ != vocab)
-      throw std::runtime_error(
-          "bundle vocabulary " + std::to_string(e->vocab_) +
-          " differs from the model's " + std::to_string(vocab));
     return e;
   } catch (const std::exception& ex) {
     if (error)
-      *error = "LFM3 NPU (" + bundle.string() + "): " + ex.what();
+      *error = std::string("LFM3 NPU: ") + ex.what();
     return nullptr;
   }
 }
@@ -106,32 +102,16 @@ void Engine::Run(const void* owner, std::span<const std::uint32_t> history,
   Flush(tokens, logits);
 }
 
-// Runs the pending inputs and `tokens`. A continuation runs as one decode step
-// per row; when that costs more than prefilling the whole history again (a
-// fresh prefill takes up to kFreshPrefill rows), the history prefills again.
+// Runs the pending inputs and `tokens` from the first pending position.
 void Engine::Flush(std::span<const std::uint32_t> tokens,
                    std::span<float> logits) {
-  const std::size_t base = resident_.size() - pending_,
-                    total = resident_.size() + tokens.size();
+  const std::size_t base = resident_.size() - pending_;
   std::vector<std::uint32_t> work(resident_.begin() + std::ptrdiff_t(base),
                                   resident_.end());
   work.insert(work.end(), tokens.begin(), tokens.end());
   pending_ = 0;
   if (work.empty())
     return;
-  // measured: prefill of 128 / 512 / 1024 rows, and 37 ms per decoded row
-  const double prefill_ms = total <= 128             ? 62
-                            : total <= 512           ? 125
-                            : total <= kFreshPrefill ? 246
-                                                     : 1e30;
-  if (base > 0 && work.size() > 1 && prefill_ms < 37.0 * double(work.size())) {
-    std::vector<std::uint32_t> all(resident_.begin(), resident_.end());
-    all.insert(all.end(), tokens.begin(), tokens.end());
-    npu_->Clear();
-    resident_.clear();
-    Prefill(all, logits);
-    return;
-  }
   resident_.resize(base);
   Prefill(work, logits);
 }
