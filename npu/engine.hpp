@@ -22,7 +22,8 @@ public:
   // Uploads `weights` (borrowed) to the NPU. Returns nullptr with *error set
   // on failure.
   static std::unique_ptr<Engine> Open(const Weights& weights,
-                                      std::uint32_t context, std::string* error);
+                                      std::uint32_t context,
+                                      std::string* error);
   ~Engine();
   // Appends `tokens` to `history` (the caller's inputs so far) and writes the
   // last row's logits when `logits` is not empty.

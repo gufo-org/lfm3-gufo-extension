@@ -3,15 +3,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <future>
-#include <mutex>
 #include <gufo/ext/experimental/npu.hpp>
+#include <mutex>
 #include <stdexcept>
 
 #include "npu/dense.hpp"
+#include "npu/grouped_attention.hpp"
 #include "npu/host_ops.hpp"
 
 namespace gufo::models::lfm3::npu {
@@ -236,8 +237,8 @@ void Backbone::Forward(float* x, int n, std::span<const std::int32_t> groups) {
 }
 
 Backbone::Times Backbone::Rows(float* x, int n, int start,
-                               std::span<const std::int32_t> groups,
-                               Sync* sync, int chunk) {
+                               std::span<const std::int32_t> groups, Sync* sync,
+                               int chunk) {
   const auto& c = w_.config;
   const std::size_t H = c.hidden, D = c.head_dim, I = c.intermediate,
                     Q = std::size_t(c.heads) * D, L = c.conv_width;
@@ -327,38 +328,33 @@ Backbone::Times Backbone::Rows(float* x, int n, int start,
       });
       if (sync)
         sync->Wait(li, chunk);  // earlier chunks' K/V
+      const float scale = 1.0f / std::sqrt(float(D));
       if (!groups.empty() && !swa) {
-        Attention(
-            p.data(), l.k.data(), l.v.data(), a.data(), rows, c.heads,
-            l.kv_heads, std::uint32_t(D),
-            [&](std::size_t i, std::size_t t) {
-              return groups[i] < 0 || groups[t] < 0 || groups[i] == groups[t];
-            },
-            p.data() + Q + 2 * KV, width, width, KV);
+        GroupedAttention(p.data(), width, l.k.data(), l.v.data(), KV, a.data(),
+                         Q, groups, c.heads, l.kv_heads, D, scale);
       } else {
         const std::size_t window = c.window;
-        host::AttentionArgs args{p.data(), width,   l.k.data(), KV,
-                                 l.v.data(), KV,    a.data(),   Q,
-                                 rows,       c.heads, l.kv_heads, D,
-                                 D,          1.0f / std::sqrt(float(D))};
-        host::Attention(args, [&](std::size_t i, std::size_t* b,
-                                  std::size_t* e) {
-          const std::size_t pos = std::size_t(start) + i;
-          *b = swa && pos + 1 > window ? pos + 1 - window : 0;
-          *e = pos + 1;
-        });
-        host::ParallelFor(rows, 4, [&](std::size_t r0, std::size_t r1) {
-          for (std::size_t t = r0; t < r1; ++t) {
-            const float* gate = p.data() + t * width + Q + 2 * KV;
-            for (std::size_t h = 0; h < c.heads; ++h) {
-              const float g = Sigmoid(gate[h]);
-              float* row = a.data() + t * Q + h * D;
-              for (std::size_t d = 0; d < D; ++d)
-                row[d] *= g;
-            }
-          }
-        });
+        host::AttentionArgs args{
+            p.data(), width, l.k.data(), KV,         l.v.data(), KV, a.data(),
+            Q,        rows,  c.heads,    l.kv_heads, D,          D,  scale};
+        host::Attention(args,
+                        [&](std::size_t i, std::size_t* b, std::size_t* e) {
+                          const std::size_t pos = std::size_t(start) + i;
+                          *b = swa && pos + 1 > window ? pos + 1 - window : 0;
+                          *e = pos + 1;
+                        });
       }
+      host::ParallelFor(rows, 4, [&](std::size_t r0, std::size_t r1) {
+        for (std::size_t t = r0; t < r1; ++t) {
+          const float* gate = p.data() + t * width + Q + 2 * KV;
+          for (std::size_t h = 0; h < c.heads; ++h) {
+            const float g = Sigmoid(gate[h]);
+            float* row = a.data() + t * Q + h * D;
+            for (std::size_t d = 0; d < D; ++d)
+              row[d] *= g;
+          }
+        }
+      });
       times.attention += ms(ta);
       if (sync)
         sync->Done(li);
@@ -371,12 +367,11 @@ Backbone::Times Backbone::Rows(float* x, int n, int start,
         x[i] += o[i];
     host::RmsNormRows(x, z.data(), rows, H, F(lw.ffn_norm), c.eps);
     project(l, kGateUp, z.data(), gu.data());
-    host::GatedRows(gu.data(), 2 * I, gu.data() + I, 2 * I, act.data(), I,
-                    rows, I, host::Activation::kSilu);
+    host::GatedRows(gu.data(), 2 * I, gu.data() + I, 2 * I, act.data(), I, rows,
+                    I, host::Activation::kSilu);
     project(l, kDown, act.data(), o.data());
     if (lw.post_ffn_norm.data)
-      host::AddNormRows(x, o.data(), rows, H, F(lw.post_ffn_norm), c.eps,
-                        1.0f);
+      host::AddNormRows(x, o.data(), rows, H, F(lw.post_ffn_norm), c.eps, 1.0f);
     else
       for (std::size_t i = 0; i < rows * H; ++i)
         x[i] += o[i];

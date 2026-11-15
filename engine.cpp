@@ -132,8 +132,7 @@ std::shared_ptr<Model> Model::Load(const std::string& path, std::string* error,
       if (!m->impl_->tokenizer)
         return nullptr;
       if (c.decision) {
-        m->impl_->decider =
-            std::make_unique<npu::Decider>(m->impl_->weights);
+        m->impl_->decider = std::make_unique<npu::Decider>(m->impl_->weights);
         return m;
       }
       m->impl_->npu = npu::Engine::Open(m->impl_->weights, c.context, error);

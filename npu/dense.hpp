@@ -7,10 +7,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <gufo/ext/experimental/npu.hpp>
 #include <memory>
 #include <span>
-
-#include <gufo/ext/experimental/npu.hpp>
 
 #include "../weights.hpp"
 
