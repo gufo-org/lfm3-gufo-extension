@@ -383,7 +383,7 @@ std::shared_ptr<Model> Model::Load(const std::string& backbone,
     auto& impl = *m->impl_;
     impl.npu = !npu_bundle.empty();
     if (impl.npu)
-      lfm3::npu::Dense::Open(npu_bundle);
+      lfm3::npu::Dense::Open();
     // The projector streams from disk beside the backbone, binding against
     // the backbone geometry read from its metadata.
     std::string projector_error;

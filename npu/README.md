@@ -1,78 +1,71 @@
 # LFM3 on the XDNA NPU
 
-`--npu` runs LFM3 on the Strix Halo XDNA NPU through Gufo's NPU runtime
-(`gufo/ext/experimental/npu.hpp`) with our own IRON kernels. It applies to
-LFM3-1.7B and LFM3-VL-2B (`serve`, `prompt`, `chat`, `bench`), LFM3-Audio-2B
-(`serve asr`, `serve tts`) and d1-Omni-2B (`serve decision`, `decide`).
-
-The GPU stays off for every supported model:
-
-- **Backbone:** runs on the NPU programs below.
-- **Towers:** the audio encoder, depth decoder and codec, and the VL vision encoder, do their matrix products on Gufo's `npu::Q8Gemm` (`npu/dense.cpp`, `npu/stack.cpp`).
-  - Q8_0 weights keep their codes.
-  - Other weights (the BF16 vision projector) are two Q8_0 planes, a code and its residual, about 2^-15 of each block's largest weight.
-  - Norms, attention, convolutions, sampling and mel/iSTFT run on the CPU (`npu/host_ops.hpp` and the `npu` paths of `audio/model.cpp` and `vl/vision.cpp`).
+`--npu` runs LFM3 on the Strix Halo XDNA NPU with Gufo's installed NPU
+programs (`gufo/ext/experimental/npu.hpp`). It needs nothing beside the GGUF:
+no build step and no per-model bundle. It applies to LFM3-1.7B and LFM3-VL-2B
+(`serve`, `prompt`, `chat`, `bench`), LFM3-Audio-2B (`serve asr`,
+`serve tts`) and d1-Omni-2B (`serve decision`, `decide`).
 
 ```sh
-GUFO_SOURCE=~/gufo npu/iron/build.sh /models/LFM3-1.7B/LFM3-1.7B-Q8_0.gguf  # writes LFM3-1.7B-Q8_0.npu
 gufo serve --model /models/LFM3-1.7B/LFM3-1.7B-Q8_0.gguf --npu
 gufo serve tts --model /models/LFM3-Audio-2B --npu
 ```
 
-## d1 decision models
+The GPU stays off for every supported model. Every matrix product runs on the
+NPU; norms, short convolutions, rotary embeddings, attention, sampling and
+mel/iSTFT run on the CPU.
 
-Each d1 prompt is one bidirectional prefill from position 0 (`npu/d1.cpp`).
+## Backbone
 
-- **Prefill programs:** `prefill/model.py <out> d1 <M>`, for M = 128, 512 and 1024.
-  - Full-attention layers see the whole prompt, with question groups: state rows see and are seen by all rows; a question row sees the state rows and its own group.
-  - Convolutions and sliding attention stay causal.
-  - A per-round meta object carries the prompt length and the groups.
-  - Every key block streams, block 0 first: the first state row it holds sets a finite softmax offset for every row.
-- **Readout:** the answer rows' final hidden states go through the LM head on `npu::Q8Gemm`.
-- **Limits:** prompts of up to 1024 rows; a packed prompt must start with a state row.
-- **Quality:** against the f32 reference, the hidden state is within about 4%, as for text prefill. In `tests/functional/d1.py` against the GPU, every case passes the 0.02 probability gate except one audio question, which differs by 0.04.
+`npu/backbone.cpp` reads the GGUF's weights at load time (about 1.2 s with a
+warm page cache) into two of Gufo's programs:
 
-## Bundle
+- **`Q8Gemm`** (`q8gemm`): the Q8_0 codes as they are. It runs products of up
+  to 16 rows: decode, short continuations and the LM head. A layer is four
+  dispatches: the convolution's or attention's input projection (q, k, v and
+  the gate stacked), its output projection, the FFN's gate and up (stacked),
+  and down.
+- **`BfpGemm`** (`bfpgemm`): bfp16 copies of the same matrices, for prompts
+  of more than 16 rows. A prompt of more than 512 rows splits into chunks of
+  about 512 rows, each on its own thread one step behind the previous one, so
+  one chunk's CPU work overlaps another's NPU products. A chunk's convolution
+  and attention wait for the previous chunk's state and keys of that layer.
 
-`--npu` loads `<model>.npu`, the directory beside the GGUF that
-`npu/iron/build.sh` writes (about 6 GB). `build.sh` needs an mlir-aie (IRON)
-Python with Peano and XRT's `pyxrt`. It compiles the programs once per machine
-into `~/.cache/gufo/lfm3-npu`, which takes about 15 minutes, then repacks the
-model's weights.
+The state is one sequence: convolution histories and F32 keys and values. A
+prompt or continuation of any length prefills at its position. `npu/engine.cpp`
+shares the backbone between sessions; a session whose history is not resident
+replays it.
 
-| File | Content |
-|---|---|
-| `decode.xclbin`, `decode_dispatch.so` | One decode token on all 32 cores (`lfm3_token.py`, `decode.cc`). The dispatch library writes each token's instruction stream. |
-| `prefill{,512,128}.xclbin`, `*.insts` | Prefill of up to 1024, 512 or 128 rows (`prefill/model.py`): bf16 × bfp16 GEMMs, norms, convolutions and attention as phases of one dispatch. |
-| `decode_*.bin`, `prefill_*.bin` | The repacked Q8_0 weights and the initial state (`bundle.py`). |
-| `bundle.txt` | The offsets the runtime needs (`npu/runtime.cpp`). |
-| `gemm/` | Gufo's Q8_0 GEMM program (`src/core/npu/kernels/q8gemm`), for the towers and the d1 head. |
-| `d1_prefill*` | (d1 GGUFs, instead of the files above) the bidirectional prefill programs, their scratch and weights. |
+d1 prompts are one forward pass from position 0 (`npu/d1.cpp`). Full
+attention is bidirectional with question groups: a state row sees and is seen
+by every row; a question row sees the state rows and its own group
+(`npu/grouped_attention.hpp`). Convolutions and sliding attention stay causal.
+The answer rows' final hidden states go through the LM head.
 
-## Runtime
+## Towers
 
-- `npu/runtime.cpp` prefills a fresh prompt of up to 1024 rows in one dispatch. It then copies the KV caches and convolution states into the decode state and decodes one token per dispatch.
-- Each token's decode stream is generated while the previous token runs, then patched with the token id (`gufo::npu::DiffInstructions`).
-- `npu/engine.cpp` shares the runtime between sessions. Inputs that need no logits wait for the next pass that needs logits. A long continuation prefills the whole history again when that is cheaper than decoding it row by row.
+The audio encoder, depth decoder and codec, and the VL vision encoder, do
+their matrix products on `Q8Gemm` (`npu/dense.cpp`, `npu/stack.cpp`):
 
-Measured on LFM3-1.7B Q8_0:
+- Q8_0 weights keep their codes.
+- Other weights (the BF16 vision projector) are two Q8_0 planes, a code and
+  its residual, about 2^-15 of each block's largest weight.
 
-| Workload | Time |
-|---|---:|
-| Prefill, 1024 tokens | 245 ms |
-| Prefill, up to 128 tokens | 62 ms |
-| Decode | 27.4 tok/s |
+## Performance
 
-Against the GPU Q8 model, teacher-forced top-5 KL is 3.2e-2, and the top token matches in 163 of 185 positions.
-
-LFM3-Audio-2B with the GPU off (`HIP_VISIBLE_DEVICES=-1`):
+As of November 2026, on Strix Halo with Gufo's NPU programs:
 
 | Workload | Time |
-|---|---:|
-| TTS first audio | 96–108 ms |
-| TTS real-time factor | 0.82 |
-| ASR, 3.5 s clip | 397 ms (encoder 86 ms) |
-| Live transcription, first text | ~430 ms |
-| Voice, first audio | ~860 ms |
+| --- | ---: |
+| LFM3-1.7B Q8_0, prefill of 1024 tokens | 275 ms (3729 tok/s) |
+| LFM3-1.7B Q8_0, decode | 22.4 tok/s |
+| LFM3-Audio-2B, ASR of a 3.5 s clip | 494 ms |
+| LFM3-Audio-2B, TTS first audio | 93–110 ms |
+| LFM3-Audio-2B, TTS real-time factor | 0.83 |
 
-The limits are about 84 µs per GEMM dispatch, the CPU row operations between dispatches, and a ~3 ms switch between the backbone and GEMM programs at each audio frame.
+Against the GPU Q8_0 model, teacher-forced top-5 KL over 185 positions is
+8.2e-3, and the top token matches in 180. d1 passes every case of
+`tests/functional/d1.py` against the GPU within the 0.02 probability gate.
+
+`GUFO_LFM3_NPU_TIMING=1` prints the upload time and, per forward pass, its
+products, attention and convolution time.

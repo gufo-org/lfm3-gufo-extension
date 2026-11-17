@@ -179,7 +179,7 @@ std::unique_ptr<Vision> Vision::Load(const std::string& path,
   }
   m.npu = !npu_bundle.empty();
   if (m.npu)
-    lfm3::npu::Dense::Open(npu_bundle);
+    lfm3::npu::Dense::Open();
   if (m.npu) {
     m.patch_host = patch;
     m.patch = {m.patch_host.data(), GgmlType::kF32, 768, 1024,

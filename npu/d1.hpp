@@ -1,12 +1,10 @@
 #pragma once
-// d1 decision prompts on the XDNA NPU: one bidirectional prefill per prompt
-// (npu/iron/prefill, kinds "d1": full attention sees the whole prompt, with
+// d1 decision prompts on the XDNA NPU: one bidirectional forward pass per
+// prompt through npu::Backbone (full attention sees the whole prompt, with
 // question groups; convolutions and sliding attention stay causal), then the
-// LM head at the answer positions through npu::Dense. The bundle is the one
-// `npu/iron/build.sh` writes for a d1 GGUF.
+// LM head at the answer positions.
 
 #include <cstdint>
-#include <filesystem>
 #include <memory>
 #include <span>
 
@@ -16,10 +14,10 @@ namespace gufo::models::lfm3::npu {
 
 class Decider {
 public:
-  // Throws gufo::npu::Error or std::runtime_error.
-  Decider(const std::filesystem::path& bundle, const Weights& weights);
+  // Borrows `weights`. Throws gufo::npu::Error or std::runtime_error.
+  explicit Decider(const Weights& weights);
   ~Decider();
-  // The longest prompt (rows of one prefill).
+  // The longest prompt (rows of one forward pass).
   std::uint32_t max_rows() const;
   // One prompt from position 0: rows [n][hidden] (token embeddings or media
   // rows), groups (n entries, -1 for state rows; empty: one bidirectional

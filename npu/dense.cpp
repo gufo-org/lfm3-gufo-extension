@@ -17,18 +17,30 @@ Dense* g_dense{};
 struct Dense::Impl {
   gufo::npu::Device device = gufo::npu::Device::Open();
   gufo::npu::Q8Gemm gemm;
+  gufo::npu::BfpGemm bfp;
+  std::mutex bfp_open;
 };
 
 Dense::Dense() : impl_(std::make_unique<Impl>()) {}
 Dense::~Dense() = default;
 
-void Dense::Open(const std::filesystem::path& bundle) {
+void Dense::Open() {
   std::lock_guard lock(g_open);
   if (g_dense)
     return;
   auto* d = new Dense();  // lives for the process, like the NPU context
-  d->impl_->gemm = gufo::npu::Q8Gemm::Open(d->impl_->device, bundle / "gemm");
+  // The backbone (about 1.9 GB of Q8_0 with its head) and the towers.
+  d->impl_->gemm = gufo::npu::Q8Gemm::Open(
+      d->impl_->device, gufo::npu::FindDesign("q8gemm"), std::size_t(3) << 30);
   g_dense = d;
+}
+
+gufo::npu::BfpGemm& Dense::Bfp() {
+  std::lock_guard lock(impl_->bfp_open);
+  if (!impl_->bfp)
+    impl_->bfp = gufo::npu::BfpGemm::Open(
+        impl_->device, gufo::npu::FindDesign("bfpgemm"), std::size_t(2) << 30);
+  return impl_->bfp;
 }
 
 Dense& Dense::Shared() {

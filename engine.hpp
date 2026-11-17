@@ -20,8 +20,8 @@ public:
   static constexpr std::uint32_t kModelContext = ~0U;
   // A nonzero session_context (kModelContext: the model's own) allocates
   // the state of the first session of that context while weights load.
-  // npu_bundle: the directory npu/iron/bundle.py wrote for this model, to
-  // run the backbone on the NPU; empty for the GPU.
+  // npu_bundle: when not empty (--npu), the backbone runs on the NPU; empty
+  // for the GPU.
   static std::shared_ptr<Model> Load(const std::string& path,
                                      std::string* error = nullptr,
                                      std::uint32_t session_context = 0,
