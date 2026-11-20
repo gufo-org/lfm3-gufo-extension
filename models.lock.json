@@ -1,0 +1,132 @@
+{
+  "schema": 1,
+  "models": {
+    "lfm3-1.7b": {
+      "weights": {
+        "source": {
+          "hf": "LiquidAI/LFM3-1.7B-GGUF",
+          "revision": "b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf"
+        },
+        "include": [
+          "LFM3-1.7B-Q8_0.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "LFM3-1.7B-Q8_0.gguf",
+            "size": 1846238496,
+            "sha256": "8f6b24182258205e9e01e21f1f24a1f208c1e8115578825d202ce39976af20b6"
+          }
+        ]
+      }
+    },
+    "lfm3-vl-2b": {
+      "weights": {
+        "source": {
+          "hf": "LiquidAI/LFM3-VL-2B-GGUF",
+          "revision": "b36554cfd35854b06429900131730cd80f092cdb"
+        },
+        "include": [
+          "LFM3-VL-2B-Q8_0.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "LFM3-VL-2B-Q8_0.gguf",
+            "size": 1846238496,
+            "sha256": "e138e54189a751d90ea8c0b236360490613ecd465d28d68fa6094d3db7fa6727"
+          }
+        ]
+      },
+      "mmproj": {
+        "source": {
+          "hf": "LiquidAI/LFM3-VL-2B-GGUF",
+          "revision": "b36554cfd35854b06429900131730cd80f092cdb"
+        },
+        "include": [
+          "mmproj-LFM3-VL-2B-BF16.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "mmproj-LFM3-VL-2B-BF16.gguf",
+            "size": 378996032,
+            "sha256": "8e75a88afc0e6a3bcd637becbe720447ea0794934b7b417a1f42d5cfe0d9c288"
+          }
+        ]
+      }
+    },
+    "lfm3-audio-2b": {
+      "weights": {
+        "source": {
+          "hf": "LiquidAI/LFM3-Audio-2B-GGUF",
+          "revision": "02355c1a141e464a064f2ab2c276638dbcb7f38a"
+        },
+        "include": [
+          "LFM3-Audio-2B-Q8_0.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "LFM3-Audio-2B-Q8_0.gguf",
+            "size": 1846236704,
+            "sha256": "d4e36902ba8f0ee7b333596030a59d650f88ac76660b4d9ba5ff77c3c2258fc0"
+          }
+        ]
+      },
+      "mmproj": {
+        "source": {
+          "hf": "LiquidAI/LFM3-Audio-2B-GGUF",
+          "revision": "02355c1a141e464a064f2ab2c276638dbcb7f38a"
+        },
+        "include": [
+          "mmproj-LFM3-Audio-2B-BF16.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "mmproj-LFM3-Audio-2B-BF16.gguf",
+            "size": 570846400,
+            "sha256": "683b3648484cb5b0bf06185eac8be37b1a9bff03591360641248bd482119afc1"
+          }
+        ]
+      }
+    },
+    "d1-omni-2b": {
+      "weights": {
+        "source": {
+          "hf": "LiquidAI/d1-Omni-2B-GGUF",
+          "revision": "c53ae0b1f92b17065e9158d34019c9ca1ea5bcf8"
+        },
+        "include": [
+          "d1-Omni-2B-Q8_0.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "d1-Omni-2B-Q8_0.gguf",
+            "size": 1846241184,
+            "sha256": "aedf1a7c341b4281979423dbc39e9c3d3ad1da8834156c8e75af5399ca3b0861"
+          }
+        ]
+      },
+      "mmproj": {
+        "source": {
+          "hf": "LiquidAI/d1-Omni-2B-GGUF",
+          "revision": "c53ae0b1f92b17065e9158d34019c9ca1ea5bcf8"
+        },
+        "include": [
+          "mmproj-d1-Omni-2B-BF16.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "mmproj-d1-Omni-2B-BF16.gguf",
+            "size": 609956896,
+            "sha256": "52dbb25ce1b6f6302654cd0636d3171d6605022eb2fafab8477bad0dfc3687c6"
+          }
+        ]
+      }
+    }
+  }
+}

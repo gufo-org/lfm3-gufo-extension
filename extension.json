@@ -7,6 +7,124 @@
   "platforms": ["linux", "windows"],
   "entry": "lfm3_register",
   "registration_target": "gufo_lfm3",
+  "models": [
+    {
+      "id": "lfm3-1.7b",
+      "provider": "lfm3",
+      "license": "lfm-open-license",
+      "description": "LFM3-1.7B, Q8_0 GGUF",
+      "components": [
+        {
+          "role": "weights",
+          "option": "--model",
+          "install": "required",
+          "source": {
+            "hf": "LiquidAI/LFM3-1.7B-GGUF",
+            "revision": "b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf"
+          },
+          "include": [
+            "LFM3-1.7B-Q8_0.gguf"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lfm3-vl-2b",
+      "provider": "lfm3",
+      "license": "lfm-open-license",
+      "description": "LFM3-VL-2B, Q8_0 GGUF with BF16 multimodal projector",
+      "components": [
+        {
+          "role": "weights",
+          "option": "--model",
+          "install": "required",
+          "source": {
+            "hf": "LiquidAI/LFM3-VL-2B-GGUF",
+            "revision": "b36554cfd35854b06429900131730cd80f092cdb"
+          },
+          "include": [
+            "LFM3-VL-2B-Q8_0.gguf"
+          ]
+        },
+        {
+          "role": "mmproj",
+          "option": "--mmproj",
+          "install": "default",
+          "source": {
+            "hf": "LiquidAI/LFM3-VL-2B-GGUF",
+            "revision": "b36554cfd35854b06429900131730cd80f092cdb"
+          },
+          "include": [
+            "mmproj-LFM3-VL-2B-BF16.gguf"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lfm3-audio-2b",
+      "provider": "lfm3-audio-asr",
+      "license": "lfm-open-license",
+      "description": "LFM3-Audio-2B, Q8_0 GGUF with BF16 audio encoder and decoder for ASR and TTS",
+      "components": [
+        {
+          "role": "weights",
+          "option": "--model",
+          "install": "required",
+          "source": {
+            "hf": "LiquidAI/LFM3-Audio-2B-GGUF",
+            "revision": "02355c1a141e464a064f2ab2c276638dbcb7f38a"
+          },
+          "include": [
+            "LFM3-Audio-2B-Q8_0.gguf"
+          ]
+        },
+        {
+          "role": "mmproj",
+          "option": "--mmproj",
+          "install": "required",
+          "source": {
+            "hf": "LiquidAI/LFM3-Audio-2B-GGUF",
+            "revision": "02355c1a141e464a064f2ab2c276638dbcb7f38a"
+          },
+          "include": [
+            "mmproj-LFM3-Audio-2B-BF16.gguf"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "d1-omni-2b",
+      "provider": "d1",
+      "license": "lfm-open-license",
+      "description": "d1-Omni-2B, Q8_0 GGUF with BF16 multimodal projector",
+      "components": [
+        {
+          "role": "weights",
+          "option": "--model",
+          "install": "required",
+          "source": {
+            "hf": "LiquidAI/d1-Omni-2B-GGUF",
+            "revision": "c53ae0b1f92b17065e9158d34019c9ca1ea5bcf8"
+          },
+          "include": [
+            "d1-Omni-2B-Q8_0.gguf"
+          ]
+        },
+        {
+          "role": "mmproj",
+          "option": "--mmproj",
+          "install": "default",
+          "source": {
+            "hf": "LiquidAI/d1-Omni-2B-GGUF",
+            "revision": "c53ae0b1f92b17065e9158d34019c9ca1ea5bcf8"
+          },
+          "include": [
+            "mmproj-d1-Omni-2B-BF16.gguf"
+          ]
+        }
+      ]
+    }
+  ],
   "targets": {
     "gufo_lfm3": { "requires": [] },
     "gufo_lfm3_hip": { "requires": ["hip"] },
