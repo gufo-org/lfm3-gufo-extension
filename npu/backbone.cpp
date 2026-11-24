@@ -45,8 +45,9 @@ struct Backbone::Layer {
   std::uint32_t kv_heads{};
   Dense::Matrix q8[kCount];
   int bfp[kCount]{-1, -1, -1, -1};
-  std::vector<float> conv;  // [hidden][conv_width - 1], oldest first
-  std::vector<float> k, v;  // [position][kv_heads * head_dim]
+  std::vector<float> conv;    // [hidden][conv_width - 1], oldest first
+  std::vector<float> conv_t;  // [conv_width][hidden], transposed for SIMD
+  std::vector<float> k, v;    // [position][kv_heads * head_dim]
 };
 
 Backbone::Backbone(const Weights& w, int max_length) : w_(w) {
@@ -91,6 +92,11 @@ Backbone::Backbone(const Weights& w, int max_length) : w_(w) {
       in = {&lw.in_proj};
       out = {&lw.out_proj};
       l.conv.assign(std::size_t(c.hidden) * (c.conv_width - 1), 0.0f);
+      l.conv_t.resize(std::size_t(c.conv_width) * c.hidden);
+      const float* cw = F(lw.conv);
+      for (std::size_t ch = 0; ch < c.hidden; ++ch)
+        for (std::size_t j = 0; j < c.conv_width; ++j)
+          l.conv_t[j * c.hidden + ch] = cw[ch * c.conv_width + j];
     } else {
       in = {&lw.q, &lw.k, &lw.v, &lw.attn_gate};
       out = {&lw.attn_out};
@@ -204,7 +210,7 @@ void Backbone::Forward(float* x, int n, std::span<const std::int32_t> groups) {
       const int r0 = int(std::int64_t(n) * j / chunks),
                 r1 = int(std::int64_t(n) * (j + 1) / chunks);
       runs.push_back(std::async(std::launch::async, [&, j, r0, r1] {
-        host::SharePool share(unsigned(j), unsigned(chunks));
+        host::SharePool share{unsigned(j), unsigned(chunks)};
         return Rows(x + std::size_t(r0) * c.hidden, r1 - r0, start + r0, {},
                     &sync, j);
       }));
@@ -267,7 +273,7 @@ Backbone::Times Backbone::Rows(float* x, int n, int start,
       const auto tc = Clock::now();
       // p rows [B | C | x]: a = C * conv(B * x), causal over the history.
       // bx [L - 1 + rows][hidden] holds the history, then B * x.
-      const float* weight = F(lw.conv);
+      const float* weight_t = l.conv_t.data();
       bx.resize((L - 1 + rows) * H);
       host::ParallelFor(H, 256, [&](std::size_t c0, std::size_t c1) {
         for (std::size_t j = 0; j + 1 < L; ++j)
@@ -282,13 +288,18 @@ Backbone::Times Backbone::Rows(float* x, int n, int start,
         for (std::size_t t = 0; t < rows; ++t) {
           const float* pt = p.data() + t * 3 * H;
           float* out = a.data() + t * H;
-          for (std::size_t ch = c0; ch < c1; ++ch) {
-            const float* wc = weight + ch * L;
-            float sum = 0;
-            for (std::size_t j = 0; j < L; ++j)
-              sum += wc[j] * bx[(t + j) * H + ch];
-            out[ch] = sum * pt[H + ch];
+          const float* b0 = bx.data() + t * H;
+          const float* w0 = weight_t;
+          for (std::size_t ch = c0; ch < c1; ++ch)
+            out[ch] = w0[ch] * b0[ch];
+          for (std::size_t j = 1; j < L; ++j) {
+            const float* bj = bx.data() + (t + j) * H;
+            const float* wj = weight_t + j * H;
+            for (std::size_t ch = c0; ch < c1; ++ch)
+              out[ch] += wj[ch] * bj[ch];
           }
+          for (std::size_t ch = c0; ch < c1; ++ch)
+            out[ch] *= pt[H + ch];
         }
         for (std::size_t j = 0; j + 1 < L; ++j)
           for (std::size_t ch = c0; ch < c1; ++ch)

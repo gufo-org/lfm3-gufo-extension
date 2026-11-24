@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "lfm3",
   "api_version": ">= 0.3.20",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "depends": [],
   "platforms": ["linux", "windows"],
   "entry": "lfm3_register",

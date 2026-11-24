@@ -57,7 +57,7 @@ As of November 2026, on Strix Halo with Gufo's NPU programs:
 
 | Workload | Time |
 | --- | ---: |
-| LFM3-1.7B Q8_0, prefill of 1024 tokens | 275 ms (3729 tok/s) |
+| LFM3-1.7B Q8_0, prefill of 1024 tokens | 255 ms (4021 tok/s) |
 | LFM3-1.7B Q8_0, decode | 22.4 tok/s |
 | LFM3-Audio-2B, ASR of a 3.5 s clip | 494 ms |
 | LFM3-Audio-2B, TTS first audio | 93–110 ms |
