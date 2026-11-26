@@ -192,3 +192,19 @@ after 71 ms. A second turn is transcribed ("Set the volume to 30, please.")
 and deleted. A typed "And what about Italy?" is then answered "The capital of
 Italy is Rome." `male` is refused. Timings are observations without a matched
 baseline.
+
+November 26, 2026, with Gufo response options (extension API 0.3.51): spoken
+replies stream speech when the session lists tools. A spoken reply now starts
+with `<tool_call>` or `<|mixed_start|>`; before, the constraint never applied
+and replies with tools were text without audio. `open-webui-call` now keeps
+Open WebUI's `generate_chat_completion` tool and its chat snapshots (system
+items, one deleted). The spoken question is delegated to the tool. After the
+function output, the reply says "The capital of France is Paris." in speech
+(first audio after 82 ms), and an out-of-band status line says "Still working
+on it." without entering the conversation. All 12 cases of `realtime_voice.py`
+pass. Through Gufo's `owui_realtime_replay.py` (gufo-org/gufo#1424), every
+reply after the function call has speech. The status line sometimes reads
+Open WebUI's "Say this briefly in the user's language" as a translation
+request ("I can't translate the response because I don't know the user's
+language."; 3 of 4 replays). Timings are observations without a matched
+baseline.

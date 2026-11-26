@@ -212,19 +212,34 @@ public:
       Check(!open_, "commit or clear the audio buffer before a response");
       BeginTurn(false);
       Check(!turns_.empty(), "the conversation has no input");
-      last_reply_.reset();
-      last_frames_.clear();
+      // An out-of-band reply leaves the context when it ends; the last reply
+      // stays the one a client truncates.
+      const bool out_of_band = settings.out_of_band;
+      if (!out_of_band) {
+        last_reply_.reset();
+        last_frames_.clear();
+      }
+      const auto start = generator_->Position();
+      reply_begin_ = start;
+      // The reply's own instructions follow the conversation as a system
+      // turn, which stays with an in-band reply.
+      if (!settings.response_instructions.empty()) {
+        const audio::ChatMessage message{
+            out_of_band ? "user" : "system",
+            {{false, settings.response_instructions, {}}}};
+        Check(
+            generator_->Append(audio::MessagePieces(message), nullptr, error));
+      }
       const auto begin = generator_->Position();
       // Model card prefills: <|mixed_start|> for speech, <think> or
       // <think></think> for text; with tools the model chooses.
       std::string prefix;
-      const bool tools = !tools_.empty();
+      const bool tools = !tools_.empty() && settings.call_tools;
       if (!tools)
         prefix = settings.audio_output ? "<|mixed_start|>"
                  : settings.reasoning  ? "<think>"
                                        : "<think></think>";
       Template("<|im_start|>assistant\n" + prefix);
-      reply_begin_ = begin;
       audio::GenerateOptions options;
       const auto room = generator_->Context() - generator_->Position();
       Check(room > 8, "the conversation context is full");
@@ -239,12 +254,15 @@ public:
           if (const auto id = model_->tokenizer().Encode(tag, true);
               id.size() == 1)
             options.suppress_tokens.push_back(id[0]);
-          else if (tools) {
-            // A spoken reply starts with a call or with interleaved speech.
-            const auto call = model_->tokenizer().Encode("<tool_call>", true);
-            Check(call.size() == 1, "tokenizer lacks <tool_call>");
-            options.first_tokens = {call[0], model_->tokens().mixed_start};
-          }
+      if (!tools_.empty()) {
+        const auto call = model_->tokenizer().Encode("<tool_call>", true);
+        Check(call.size() == 1, "tokenizer lacks <tool_call>");
+        if (!tools)
+          options.suppress_tokens.push_back(call[0]);  // tool_choice none
+        else if (settings.audio_output)
+          // A spoken reply starts with a call or with interleaved speech.
+          options.first_tokens = {call[0], model_->tokens().mixed_start};
+      }
       audio::ReplyParser parser(prefix == "<think>");
       audio::GenerateCallbacks hooks;
       hooks.cancelled = callbacks.cancelled;
@@ -268,14 +286,21 @@ public:
       send(parser.Finish(&calls));
       // The reply stays in the context, closed like a template turn.
       Template("<|im_end|>\n");
-      turns_.push_back({begin, generator_->Position()});
-      last_frames_.clear();
-      for (auto row : result.frame_positions)
-        last_frames_.push_back(row - begin);
-      last_reply_ = turns_.size() - 1;
+      if (out_of_band) {
+        Replace(start, generator_->Position(), {});
+      } else {
+        if (begin != start)
+          turns_.push_back({start, begin});
+        turns_.push_back({begin, generator_->Position()});
+        last_frames_.clear();
+        for (auto row : result.frame_positions)
+          last_frames_.push_back(row - begin);
+        last_reply_ = turns_.size() - 1;
+      }
       // Earlier reasoning leaves the context once the user speaks again, as
       // the template renders it.
-      if (!parser.reasoning().empty() || prefix == "<think>") {
+      if (!out_of_band &&
+          (!parser.reasoning().empty() || prefix == "<think>")) {
         std::vector<audio::PromptPiece> pieces{
             {audio::PromptPiece::Kind::kTemplate,
              "<|im_start|>assistant\n",
@@ -326,6 +351,7 @@ public:
   // 180 Hz for `female` and 97 Hz for `male`), whatever the system prompt
   // asks; no other voice can be selected.
   std::vector<std::string> voices() const override { return {"female"}; }
+  bool supports_response_options() const override { return true; }
   // Gufo deletes the latest user turn only when nothing followed it; the
   // conversation checks again. Reasoning that the turn removed from earlier
   // replies stays removed, as the next user turn would remove it.
