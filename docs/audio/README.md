@@ -170,13 +170,14 @@ generation uses the remaining capacity.
 
 | Client event | Effect |
 | --- | --- |
-| `session.update` | `instructions`, `output_modalities` (`["audio"]` or `["text"]`), `tools` (function tools; `tool_choice` `auto`), `max_output_tokens`, `audio.input.turn_detection` (null or `server_vad`), and for text replies the Gufo extension `reasoning: {"effort": "none" \| "low" \| "medium" \| "high"}` |
+| `session.update` | `instructions`, `output_modalities` (`["audio"]`, `["audio", "text"]` or `["text"]`), `tools` (function tools; `tool_choice` `auto`), `max_output_tokens`, `audio.input.turn_detection` (null or `server_vad`), `audio.input.transcription` (`model` names the served model; `language`), `audio.output.voice` (`female`, the only voice replies speak), and for text replies the Gufo extension `reasoning: {"effort": "none" \| "low" \| "medium" \| "high"}` |
 | `input_audio_buffer.append` | Opens a user turn and prefills its audio while the user speaks |
-| `input_audio_buffer.commit` / `.clear` | Closes the turn (`input_audio_buffer.committed`, `conversation.item.created`) or drops it |
+| `input_audio_buffer.commit` / `.clear` | Closes the turn (`input_audio_buffer.committed`, `conversation.item.created`, and with transcription `conversation.item.input_audio_transcription.delta` and `.completed` before any reply) or drops it |
 | `conversation.item.create` | A user message of `input_text` or one `input_audio` part, or a `function_call_output` |
 | `response.create` | Optional `output_modalities` and `max_output_tokens`; the reply streams `response.output_audio_transcript.delta` and `response.output_audio.delta` (base64 PCM16, 24 kHz), or `response.output_text.delta` (and `response.reasoning_text.delta`), then `function_call` items and `response.done` |
 | `response.cancel` | Stops the reply within one generation step (`status: cancelled`) |
 | `conversation.item.truncate` | Keeps `audio_end_ms` of the latest reply's speech in the context (`conversation.item.truncated`) |
+| `conversation.item.delete` | Removes the latest item when it is a user message that nothing followed (`conversation.item.deleted`) |
 
 Without instructions the session uses the model card's prompt for its output
 and tools; changing instructions, tools or the session's output modality
@@ -186,9 +187,16 @@ official template renders history. Events sent during a reply are handled
 after it; at most four realtime sessions (transcription or conversation) run
 at once, each on its own context beside the HTTP requests.
 
-Not supported: semantic turn detection, WebRTC, transcription of the user's
-audio inside a conversation session, speech voices other than the model's
-own in conversations, and Q4 backbones. The VL and d1-Omni checkpoints are
+Replies speak the voice of `serve tts`'s `female` whatever the prompt asks
+([measurement](QUALITY.md#conversation-voice)), so `audio.output.voice`
+accepts only `female`. Turn transcripts come from the model's offline ASR on
+its own context; `transcription.prompt` is ignored. The `session.update` of
+an Open WebUI 0.13.3 voice call (voice `female`, transcription and server turn
+detection without `create_response`) is accepted as sent.
+
+Not supported: semantic turn detection, WebRTC, transcripts of spoken
+`conversation.item.create` messages, speech voices other than `female` in
+conversations, and Q4 backbones. The VL and d1-Omni checkpoints are
 separate models of this extension ([LFM3-VL](../vl/README.md),
 [d1](../d1/README.md)). Digital silence transcribes as a short word ("Okay."), as in the
 FP32 reference.

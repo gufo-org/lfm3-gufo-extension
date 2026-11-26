@@ -1,0 +1,111 @@
+{
+ "schema": 1,
+ "description": "Median F0 (40 ms autocorrelation frames, voiced by energy and periodicity) of gufo speak TTS voices and of realtime conversation replies to two typed questions under each system prompt",
+ "model": "LFM3-Audio-2B-Q8_0.gguf + mmproj-LFM3-Audio-2B-BF16.gguf",
+ "gufo": "132429fb",
+ "extension": "a2135d8a + this change",
+ "date": "2026-11-26",
+ "prompts": {
+  "default": "Respond with interleaved text and audio.",
+  "female-suffix": "Respond with interleaved text and audio using a female voice.",
+  "male-suffix": "Respond with interleaved text and audio using a male voice.",
+  "female-us": "Respond with interleaved text and audio. Use the US female voice.",
+  "male-us": "Respond with interleaved text and audio. Use the US male voice."
+ },
+ "results": [
+  {
+   "kind": "tts",
+   "voice": "female",
+   "median_f0_hz": 180.5,
+   "voiced_frames": 239,
+   "seconds": 4.64
+  },
+  {
+   "kind": "tts",
+   "voice": "male",
+   "median_f0_hz": 96.6,
+   "voiced_frames": 204,
+   "seconds": 4.96
+  },
+  {
+   "kind": "chat",
+   "prompt": "default",
+   "q": 0,
+   "median_f0_hz": 180.5,
+   "voiced_frames": 830,
+   "seconds": 15.28
+  },
+  {
+   "kind": "chat",
+   "prompt": "default",
+   "q": 1,
+   "median_f0_hz": 187.5,
+   "voiced_frames": 537,
+   "seconds": 10.4
+  },
+  {
+   "kind": "chat",
+   "prompt": "female-suffix",
+   "q": 0,
+   "median_f0_hz": 184.6,
+   "voiced_frames": 566,
+   "seconds": 10.56
+  },
+  {
+   "kind": "chat",
+   "prompt": "female-suffix",
+   "q": 1,
+   "median_f0_hz": 180.5,
+   "voiced_frames": 553,
+   "seconds": 10.0
+  },
+  {
+   "kind": "chat",
+   "prompt": "female-us",
+   "q": 0,
+   "median_f0_hz": 190.5,
+   "voiced_frames": 1241,
+   "seconds": 22.96
+  },
+  {
+   "kind": "chat",
+   "prompt": "female-us",
+   "q": 1,
+   "median_f0_hz": 179.1,
+   "voiced_frames": 441,
+   "seconds": 8.64
+  },
+  {
+   "kind": "chat",
+   "prompt": "male-suffix",
+   "q": 0,
+   "median_f0_hz": 177.8,
+   "voiced_frames": 514,
+   "seconds": 10.56
+  },
+  {
+   "kind": "chat",
+   "prompt": "male-suffix",
+   "q": 1,
+   "median_f0_hz": 183.2,
+   "voiced_frames": 266,
+   "seconds": 5.76
+  },
+  {
+   "kind": "chat",
+   "prompt": "male-us",
+   "q": 0,
+   "median_f0_hz": 165.5,
+   "voiced_frames": 1009,
+   "seconds": 18.16
+  },
+  {
+   "kind": "chat",
+   "prompt": "male-us",
+   "q": 1,
+   "median_f0_hz": 187.5,
+   "voiced_frames": 464,
+   "seconds": 8.8
+  }
+ ]
+}
