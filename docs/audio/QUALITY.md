@@ -171,3 +171,24 @@ usage, per-case timings, binary/model hashes and server logs remain under
 matched audio speed claim.
 
 [Retained capacity and voice metrics](artifacts/context32k.json).
+
+## Conversation voice
+
+November 26, 2026 (Gufo `132429fb`, Q8_0 backbone, BF16 mmproj, `gpu-test`):
+conversation replies speak the voice of TTS `female` whatever the system
+prompt asks. Median F0 of `gufo speak` is 180 Hz for `female` and 97 Hz for
+`male`. Replies to two typed questions measure 180 and 188 Hz with the model
+card's prompt, and 165-191 Hz when the prompt adds "using a male voice", "Use
+the US male voice" or their female forms. Conversations therefore list
+`female` as their only voice. [Measurements](artifacts/conversation-voice.json).
+
+The same build passes all 12 cases of `realtime_voice.py`, including
+`open-webui-call`: the `session.update` of an Open WebUI 0.13.3 voice call
+(voice `female`, input transcription, server turn detection without
+`create_response`) is accepted. A spoken "What is the capital of France?"
+transcribes exactly before any reply, and the reply waits for
+`response.create`: "The capital of France is Paris." in speech, first audio
+after 71 ms. A second turn is transcribed ("Set the volume to 30, please.")
+and deleted. A typed "And what about Italy?" is then answered "The capital of
+Italy is Rome." `male` is refused. Timings are observations without a matched
+baseline.

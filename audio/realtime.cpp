@@ -159,7 +159,7 @@ public:
         return false;
       }
       Template("<|im_end|>\n");
-      turns_.push_back({turn_begin_, generator_->Position()});
+      turns_.push_back({turn_begin_, generator_->Position(), true});
       open_ = false;
       input_.reset();
       return true;
@@ -182,6 +182,7 @@ public:
       BeginTurn(true);
       audio::ChatMessage message{"user", {{false, std::string(text), {}}}};
       Message(message, error);
+      turns_.back().user = true;
       return true;
     } catch (const std::exception& e) {
       *error = e.what();
@@ -321,6 +322,28 @@ public:
     }
   }
 
+  // Replies speak the voice of TTS `female` (median F0 177-191 Hz against
+  // 180 Hz for `female` and 97 Hz for `male`), whatever the system prompt
+  // asks; no other voice can be selected.
+  std::vector<std::string> voices() const override { return {"female"}; }
+  // Gufo deletes the latest user turn only when nothing followed it; the
+  // conversation checks again. Reasoning that the turn removed from earlier
+  // replies stays removed, as the next user turn would remove it.
+  bool DeleteUserTurn(std::string* error) override {
+    try {
+      Check(!open_, "commit or clear the audio buffer first");
+      Check(!turns_.empty() && turns_.back().user,
+            "the latest turn is not a user turn");
+      const auto turn = turns_.back();
+      Replace(turn.begin, turn.end, {});
+      turns_.pop_back();
+      return true;
+    } catch (const std::exception& e) {
+      *error = e.what();
+      return false;
+    }
+  }
+
   bool TruncateReply(std::size_t samples, std::string* error) override {
     try {
       Check(last_reply_ && *last_reply_ < turns_.size(),
@@ -348,6 +371,7 @@ public:
 private:
   struct Turn {
     std::uint32_t begin, end;
+    bool user{false};  // a user message, spoken or typed
   };
   struct Rewrite {
     std::size_t turn;

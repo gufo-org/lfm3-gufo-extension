@@ -3,7 +3,7 @@
 Model-owned HTTP and CLI checks for this extension, from the Gufo `lfm3`
 branch (`500df164`) with a reduced harness ([run.py](run.py) keeps only the
 owned-server lifecycle and provenance of Gufo's `tests/functional/run.py`).
-They need a Gufo built with this extension (extension API 0.1.19 or newer),
+They need a Gufo built with this extension (extension API 0.3.50 or newer),
 real weights and a GPU; missing weights are failures, not skips. Run them
 with the Gufo development shell's Python (`nix develop -c python3 ...` in a
 Gufo checkout). Each creates a fresh evidence directory.
@@ -33,7 +33,9 @@ python3 d1.py --candidate http://127.0.0.1:18886 \
 
 - `realtime_voice.py`: `/v1/realtime` live transcription, server turn
   detection, spoken and typed conversation turns, reply speech transcribed
-  back, a spoken tool call, cancellation, reasoning and rejections; with
+  back, an Open WebUI 0.13.3 voice call (turn transcripts, deleted turns,
+  voice `female`), a spoken tool call, cancellation, reasoning and
+  rejections; with
   `--browser`, the `/voice` page in headless Chromium.
 - `lfm3_audio_context.py`: 32K conversation history, audio after long text,
   eviction and an input near the 32768-slot boundary.

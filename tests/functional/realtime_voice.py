@@ -404,6 +404,79 @@ def main():
                 save_events(output, 'hands-free', ws)
                 ws.close()
 
+            with evidence.case('open-webui-call') as row:
+                # Open WebUI 0.13.3 voice calls (routers/audio/realtime.py):
+                # a transcript per turn, then the client asks for the reply;
+                # turns it rejects are deleted.
+                ws = WebSocket(port, '/v1/realtime?model=functional-voice')
+                ws.until('session.created')
+                ws.send({'type': 'session.update', 'session': {
+                    'type': 'realtime', 'output_modalities': ['audio'],
+                    'instructions': 'You are a helpful voice assistant. Answer briefly.',
+                    'audio': {
+                        'input': {'format': {'type': 'audio/pcm', 'rate': RATE},
+                                  'transcription': {'model': 'functional-voice'},
+                                  'turn_detection': {'type': 'server_vad',
+                                                     'interrupt_response': False,
+                                                     'create_response': False}},
+                        'output': {'format': {'type': 'audio/pcm', 'rate': RATE},
+                                   'voice': 'female'}},
+                    'tools': [{'type': 'function', 'name': 'generate_chat_completion',
+                               'description': 'Ask the chat model of the conversation.',
+                               'parameters': {'type': 'object', 'properties': {
+                                   'prompt': {'type': 'string'}}, 'required': ['prompt']}}],
+                    'tool_choice': 'auto'}})
+                updated = ws.until('session.updated')['session']
+                assert updated['audio']['output']['voice'] == 'female', updated
+                # Its tools would make the model call them; the reply is checked
+                # without them.
+                ws.send({'type': 'session.update', 'session': {'tools': []}})
+                ws.until('session.updated')
+
+                def turn(pcm):
+                    since = time.perf_counter()
+                    stream(ws, silence(0.5) + pcm + silence(1.0), pace=0.25)
+                    stopped = seen(ws, 'input_audio_buffer.speech_stopped', since)
+                    item = seen(ws, 'input_audio_buffer.committed', since)['item_id']
+                    done = seen(ws, 'conversation.item.input_audio_transcription.completed',
+                                stopped['_received'])
+                    assert done['item_id'] == item, (done, item)
+                    return item, done
+
+                item, done = turn(question)
+                row['transcript'] = done['transcript']
+                assert words(done['transcript']) == words(prompts['question']), done
+                # With create_response false nothing starts by itself.
+                assert ws.receive(timeout=1.0) is None, ws.events[-1]
+                reply = respond(ws)
+                row.update(reply=reply['transcript'], first_ms=reply['first_ms'])
+                assert reply['response']['status'] == 'completed', reply['response']
+                assert 'paris' in words(reply['transcript']), reply['transcript']
+                assert len(reply['audio']) > RATE, 'reply speech is shorter than 0.5 s'
+                # A rejected turn leaves the conversation; the earlier one stays.
+                item, done = turn(volume)
+                row['deleted_transcript'] = done['transcript']
+                ws.send({'type': 'conversation.item.delete', 'item_id': item})
+                assert ws.until('conversation.item.deleted')['item_id'] == item
+                ws.send({'type': 'conversation.item.create', 'item': {
+                    'type': 'message', 'role': 'user',
+                    'content': [{'type': 'input_text', 'text': 'And what about Italy?'}]}})
+                ws.until('conversation.item.created')
+                follow = respond(ws)
+                row['after_delete'] = follow['transcript']
+                assert follow['response']['status'] == 'completed', follow['response']
+                assert 'rome' in words(follow['transcript']), follow['transcript']
+                assert 'volume' not in words(follow['transcript']), follow['transcript']
+                # The conversation speaks one voice; the TTS voice male is refused.
+                ws.send({'type': 'session.update', 'session': {
+                    'audio': {'output': {'voice': 'male'}}}})
+                row['male'] = ws.until('error')['error']['message']
+                assert 'female' in row['male'], row
+                save_events(output, 'open-webui-call', ws)
+                errors = [e for e in ws.events if e['type'] == 'error']
+                assert len(errors) == 1, errors
+                ws.close()
+
             if args.browser:
                 with evidence.case('voice-page') as row:
                     mic = output / 'page-microphone.wav'
